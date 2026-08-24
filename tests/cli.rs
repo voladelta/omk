@@ -415,6 +415,191 @@ fn cli_literal_search_and_observer_errors_are_agent_safe() {
 }
 
 #[test]
+fn cli_prewrite_failures_preserve_idempotency_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("memory.db");
+    success_json(&db, &["init"]);
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "user:recovery",
+            "--kind",
+            "user",
+            "--idempotency-key",
+            "scope-key",
+        ],
+    );
+
+    let missing_file = directory.path().join("missing-content.txt");
+    let missing_file = missing_file.to_str().unwrap();
+    let failed_file_read = omk(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:recovery",
+            "--stream",
+            "stream",
+            "--kind",
+            "user-message",
+            "--content-file",
+            missing_file,
+            "--idempotency-key",
+            "missing-file-key",
+        ],
+    );
+    assert!(!failed_file_read.status.success());
+    let error: Value = serde_json::from_slice(&failed_file_read.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_input");
+    assert_eq!(error["error"]["sameKeyReusable"], true);
+    let corrected_file_read = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:recovery",
+            "--stream",
+            "stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "corrected",
+            "--idempotency-key",
+            "missing-file-key",
+        ],
+    );
+    assert_eq!(corrected_file_read["operation"]["replayed"], false);
+
+    let missing_scope = omk(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "project:later",
+            "--stream",
+            "later-stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "waiting for scope",
+            "--idempotency-key",
+            "missing-scope-key",
+        ],
+    );
+    assert!(!missing_scope.status.success());
+    let error: Value = serde_json::from_slice(&missing_scope.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "not_found");
+    assert_eq!(error["error"]["sameKeyReusable"], true);
+    assert!(error["error"]["nextAction"].as_str().is_some());
+
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "project:later",
+            "--kind",
+            "project",
+            "--parent",
+            "user:recovery",
+            "--idempotency-key",
+            "later-scope-key",
+        ],
+    );
+    let corrected_scope = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "project:later",
+            "--stream",
+            "later-stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "waiting for scope",
+            "--idempotency-key",
+            "missing-scope-key",
+        ],
+    );
+    assert_eq!(corrected_scope["operation"]["replayed"], false);
+
+    success_json(
+        &db,
+        &[
+            "claim",
+            "remember",
+            "--scope",
+            "user:recovery",
+            "--kind",
+            "fact",
+            "--subject",
+            "agent",
+            "--predicate",
+            "mode",
+            "--value",
+            "one",
+            "--idempotency-key",
+            "single-claim-key",
+        ],
+    );
+    let cardinality_mismatch = omk(
+        &db,
+        &[
+            "claim",
+            "remember",
+            "--scope",
+            "user:recovery",
+            "--kind",
+            "fact",
+            "--cardinality",
+            "set",
+            "--subject",
+            "agent",
+            "--predicate",
+            "mode",
+            "--value",
+            "two",
+            "--idempotency-key",
+            "cardinality-key",
+        ],
+    );
+    assert!(!cardinality_mismatch.status.success());
+    let error: Value = serde_json::from_slice(&cardinality_mismatch.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_input");
+    assert_eq!(error["error"]["sameKeyReusable"], true);
+
+    let corrected_cardinality = success_json(
+        &db,
+        &[
+            "claim",
+            "remember",
+            "--scope",
+            "user:recovery",
+            "--kind",
+            "fact",
+            "--subject",
+            "agent",
+            "--predicate",
+            "mode",
+            "--value",
+            "two",
+            "--idempotency-key",
+            "cardinality-key",
+        ],
+    );
+    assert_eq!(corrected_cardinality["operation"]["replayed"], false);
+}
+
+#[test]
 fn cli_help_exposes_agent_critical_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("memory.db");
@@ -479,6 +664,12 @@ fn cli_help_exposes_agent_critical_contracts() {
     assert!(!append_help.contains("private"));
     assert!(append_help.contains("--metadata-file"));
     assert!(append_help.contains("Secret content must come from stdin or --content-file"));
+
+    let explain_help = omk(&db, &["recall", "explain-claim", "--help"]);
+    assert!(explain_help.status.success());
+    let explain_help = String::from_utf8(explain_help.stdout).unwrap();
+    assert!(explain_help.contains("exact source events"));
+    assert!(!explain_help.contains("source observations"));
 
     let empty_stdin = omk_with_stdin(
         &db,
