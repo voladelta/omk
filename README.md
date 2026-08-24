@@ -17,6 +17,7 @@ cargo build --release
 ```
 
 The default database is `.omk/memory.db`. Set `OMK_DB` or pass `--db` to use another path.
+Running `omk` without a subcommand prints the top-level help and exits successfully. `omk help <command>` and `<command> --help` provide command-specific help.
 
 ## JSON contract
 
@@ -71,20 +72,18 @@ omk event append \
 
 Every write requires a request-stable, globally unique idempotency key. Use the same key only for an identical retry.
 
-Append privacy-sensitive evidence with `--sensitivity`:
+Append privacy-sensitive evidence with `--sensitivity`. Pass secret content through stdin or `--content-file`, never `--content`, so it does not enter shell history or process listings:
 
 ```sh
-omk event append \
+printf '%s' 'credential material' | omk event append \
   --scope thread:build \
   --stream codex-thread-1 \
   --kind tool-result \
-  --content 'credential material' \
-  --metadata '{"provider":"example"}' \
   --sensitivity secret \
   --idempotency-key codex-thread-1-secret-1
 ```
 
-Secret append and replay envelopes return a redacted content tombstone and empty metadata. Exact content is available only through the explicit local evidence commands described under Privacy. Use `do-not-store` when neither content nor metadata may be persisted.
+Use `--metadata-file` for secret metadata. A single command cannot read both content and metadata from stdin; provide one of them through a file. Secret append and replay envelopes return a redacted content tombstone and empty metadata. Exact content is available only through the explicit local evidence commands described under Privacy. Use `do-not-store` when neither content nor metadata may be persisted.
 
 Plan an observation batch. A ready result keeps the stable `.data.runId` and `.data.events[].id` paths needed for strict provenance:
 

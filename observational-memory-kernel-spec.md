@@ -2,6 +2,8 @@
 
 ## Design and Implementation Contract for Codex
 
+Reference implementation: OMK 0.4.0, Rust 2024 edition, SQLite schema v3.
+
 ### Objective
 
 Build a framework-neutral, local-first memory kernel for a personal agent system. It must preserve long-running conversational continuity without treating summaries as truth, and it must remain easy to customize at every boundary: storage, models, prompts, scope rules, reconciliation, retrieval, privacy, and context rendering.
@@ -16,7 +18,7 @@ The system is complete when it can:
 6. Support user, project, thread, and task scopes without cross-scope leakage.
 7. Replace any model, prompt, storage adapter, or policy without changing the kernel.
 
-Target the reference implementation at TypeScript with strict mode and SQLite. Keep the core independent of any agent framework or model provider.
+Target the reference implementation at Rust 2024 with SQLite. Keep the core independent of any agent framework or model provider. Data-model snippets below use TypeScript-shaped pseudocode only as compact, language-neutral schema notation; the Rust types and serialized camelCase JSON are the executable interfaces.
 
 ---
 
@@ -60,9 +62,9 @@ Do not build these initially:
 - Autonomous forgetting based only on age.
 - Framework-specific agent lifecycle logic in the core.
 - A distributed worker system before the SQLite implementation is correct.
-- A multi-package monorepo with one package per interface.
+- A multi-crate workspace with one crate per interface.
 
-Implement one clean package with internal ports. Extract packages only after a second implementation genuinely requires it.
+Implement one clean crate with internal ports. Extract crates only after a second implementation genuinely requires it.
 
 ---
 
@@ -589,27 +591,60 @@ Model routing belongs inside observer and reflector implementations. Scheduling 
 
 ## 12. Public kernel API
 
-```ts
-export interface MemoryKernel {
-  append(scopeId: string, events: NewMemoryEvent[]): Promise<MemoryEvent[]>;
+The Rust crate exports `MemoryStore`, the model types, and `SCHEMA_VERSION`. `MemoryStore` owns SQLite state and provides operations for:
 
-  planObservation(scopeId: string): Promise<ObservationPlan | null>;
-  runObservation(plan: ObservationPlan): Promise<ObservationRunResult>;
-  reconcile(scopeId: string): Promise<ReconciliationSummary>;
-  reflect(scopeId: string, kind?: ViewKind): Promise<MemoryView | null>;
-
-  composeContext(request: ContextRequest): Promise<ContextBundle>;
-  recall(request: RecallRequest): Promise<RecallResult>;
-
-  applyMemoryCommand(command: MemoryCommand): Promise<MemoryCommandResult>;
-}
+```text
+scope create/list/get/visibility
+event append/get/range recall/purge
+observation plan/commit/fail/get/list/status
+claim remember/propose/confirm/correct/rescope/reject/forget/purge/reconcile
+view create/list
+context composition
+literal and explicit-FTS search
+claim and observation explanation
 ```
 
-Every mutating method accepts an idempotency key.
+Every mutating method accepts an idempotency key and returns a mutation result that distinguishes a newly created result from an identical replay. Model execution and scheduling remain outside `MemoryStore`; callers plan work, run the model, and commit validated output.
 
 ---
 
-## 13. SQLite schema
+## 13. Agent CLI contract
+
+The `omk` binary is an agent-first, non-interactive interface over the kernel.
+
+### Output and discovery
+
+- Machine-readable JSON is the default for command results.
+- Successful output goes to stdout. Command runtime errors use structured JSON on stderr with a nonzero exit status; command-line syntax errors use clap's concise usage diagnostics on stderr.
+- Errors contain stable `code`, `message`, `retryable`, and `sameKeyReusable` fields and include `nextAction` when a concrete recovery action exists.
+- `--format markdown` is an explicit exception for human-oriented context rendering.
+- Running `omk` with no subcommand prints top-level help to stdout and exits successfully.
+- Support `-h`, `--help`, `help <command>`, and `--version` without opening the database.
+- Top-level help and agent-critical command help include copyable examples. Help must document privacy-sensitive input restrictions where they apply.
+- The database path resolves from `--db`, then `OMK_DB`, then `.omk/memory.db`.
+
+### Input and retry behavior
+
+- Every write requires a non-empty, request-stable, globally unique idempotency key.
+- An identical retry returns the original result with `operation.replayed: true`.
+- Reusing a recorded key with changed input returns `idempotency_conflict` and `sameKeyReusable: false`.
+- Validation that occurs before recording an operation returns `sameKeyReusable: true`.
+- Event content may come from `--content`, `--content-file`, or stdin when neither option is supplied. `--content-file -` explicitly selects stdin.
+- Event metadata may come from `--metadata` or `--metadata-file`; `--metadata-file -` selects stdin. Omitted metadata is `{}`.
+- One append command cannot consume both content and metadata from stdin.
+- If required stdin is attached to a terminal or is empty, fail immediately with `missing_input`; never wait indefinitely for an agent to type input.
+
+### Secret boundary
+
+- For `sensitivity=secret`, reject inline `--content` and inline `--metadata` before recording the operation. Secret content must use stdin or `--content-file`; secret metadata must use `--metadata-file`.
+- Do not echo secret values in help, errors, logs, append results, or idempotent replay results.
+- Secret append and replay results contain a redaction tombstone and empty metadata.
+- Exact stored secret evidence is available only through the explicit local event-get and recall commands. Observer plans, context, and full-text search must never expose it.
+- `do-not-store` persists only a sequence-preserving tombstone and discards metadata.
+
+---
+
+## 14. SQLite schema
 
 While the kernel is pre-1.0, initialize one current schema and reject incompatible nonzero schema versions before writes. Do not carry forward migrations without a real compatibility requirement. Use WAL mode and avoid coupling the core to a particular ORM.
 
@@ -626,6 +661,7 @@ Required tables:
 9. `memory_views`
 10. `view_sources`
 11. `memory_fts`
+12. `memory_operations`
 
 Important constraints:
 
@@ -641,60 +677,28 @@ Use FTS5 over event text, observation content, and claim text. Keep embeddings o
 
 ---
 
-## 14. Reference source layout
+## 15. Reference source layout
 
 ```text
+Cargo.toml
 src/
-├── core/
-│   ├── types.ts
-│   ├── errors.ts
-│   ├── kernel.ts
-│   └── ports.ts
-├── events/
-│   ├── append.ts
-│   └── normalization.ts
-├── observation/
-│   ├── planner.ts
-│   ├── runner.ts
-│   ├── validator.ts
-│   └── commit.ts
-├── claims/
-│   ├── reconcile.ts
-│   ├── rules.ts
-│   └── commands.ts
-├── reflection/
-│   ├── planner.ts
-│   ├── runner.ts
-│   └── validator.ts
-├── context/
-│   ├── composer.ts
-│   ├── budget.ts
-│   └── renderer.ts
-├── retrieval/
-│   ├── recall.ts
-│   ├── full-text.ts
-│   └── semantic-port.ts
-├── privacy/
-│   ├── redaction.ts
-│   └── purge.ts
-├── storage/sqlite/
-│   ├── sqlite-store.ts
-│   └── repositories/
-├── adapters/
-│   └── generic-agent-adapter.ts
-├── prompts/
-│   ├── observer.v1.md
-│   └── reflector.v1.md
-├── inspector/
-│   └── cli.ts
-└── evals/
-    ├── fixtures/
-    └── memory-evals.test.ts
+├── lib.rs       # public crate surface
+├── model.rs     # serialized records and command inputs
+├── store.rs     # SQLite schema, invariants, and kernel operations
+└── main.rs      # clap-based agent CLI and JSON error boundary
+prompts/
+├── observer.v1.md
+└── reflector.v1.md
+tests/
+├── kernel.rs    # storage, lifecycle, privacy, and recovery integration tests
+└── cli.rs       # process-level CLI contract tests
 ```
+
+Keep this compact layout while ownership remains clear. Split modules only when file-level boundaries become materially easier to test or reason about.
 
 ---
 
-## 15. Implementation sequence
+## 16. Implementation sequence
 
 ### Milestone 1 — Ledger and exact recall
 
@@ -763,8 +767,9 @@ Implement:
 
 - Real observer and reflector model adapters.
 - Secret redaction.
+- Secret-safe file and stdin ingress.
 - Cancellation and timeout handling.
-- Inspector CLI.
+- Agent-first CLI with JSON results, structured runtime errors, discoverable help, and immediate missing-input failures.
 - Metrics and structured logs.
 - End-to-end evaluation fixtures.
 
@@ -772,7 +777,7 @@ Exit criterion: the system survives crashes, retries, contradictory updates, sco
 
 ---
 
-## 16. Required tests
+## 17. Required tests
 
 ### Correctness
 
@@ -788,6 +793,10 @@ Exit criterion: the system survives crashes, retries, contradictory updates, sco
 - Raw evidence remains recallable after multiple reflections.
 - Context composition does not duplicate observations already represented by raw events.
 - Secret content never enters observer or reflector input.
+- Inline secret content and metadata are rejected without being echoed.
+- Secret append and replay envelopes contain only redacted content and empty metadata.
+- Empty or interactive required stdin fails immediately with `missing_input`.
+- No-argument invocation, `--help`, and `help <command>` expose the agent-critical contract without opening a database.
 
 ### Semantic fixtures
 
@@ -818,7 +827,7 @@ Every interruption must have an explicit idempotent recovery path.
 
 ---
 
-## 17. Definition of done
+## 18. Definition of done
 
 The implementation is done when all of the following are true:
 
@@ -832,10 +841,11 @@ The implementation is done when all of the following are true:
 8. Exact raw history remains available.
 9. No model output becomes authoritative without reconciliation.
 10. All invariants and recovery tests pass.
+11. An agent can discover, invoke, retry, and recover CLI operations without parsing prose command output or waiting on interactive input.
 
 ---
 
-## 18. Final implementation rule
+## 19. Final implementation rule
 
 Keep this distinction visible in code, storage, prompts, and user-facing inspection:
 

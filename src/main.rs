@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -18,8 +18,10 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(
     name = "omk",
     version,
+    arg_required_else_help = true,
     about = "Local-first observational memory for agents",
-    long_about = "Store immutable agent history, derive source-backed observations and claims, compose bounded context, and recover exact evidence. All command output is JSON unless --format markdown is selected."
+    long_about = "Store immutable agent history, derive source-backed observations and claims, compose bounded context, and recover exact evidence. All command output is JSON unless --format markdown is selected.",
+    after_help = "Examples:\n  omk init\n  omk event append --scope thread:build --stream codex-1 --kind user-message --content 'Continue the implementation' --idempotency-key codex-1-event-42\n  omk observe plan --scope thread:build --stream codex-1 --model codex --idempotency-key codex-1-plan-1"
 )]
 struct Cli {
     /// SQLite database path.
@@ -99,7 +101,7 @@ enum ScopeCommand {
 #[derive(Debug, Subcommand)]
 enum EventCommand {
     #[command(
-        after_help = "Example:\n  omk event append --scope thread:build --stream codex-1 --kind user-message --content 'Continue the implementation' --idempotency-key codex-1-event-42"
+        after_help = "Examples:\n  omk event append --scope thread:build --stream codex-1 --kind user-message --content 'Continue the implementation' --idempotency-key codex-1-event-42\n  printf '%s' 'credential material' | omk event append --scope thread:build --stream codex-1 --kind tool-result --sensitivity secret --idempotency-key codex-1-secret-1\n\nSecret content must come from stdin or --content-file. Secret metadata must come from --metadata-file."
     )]
     Append {
         #[arg(long)]
@@ -124,9 +126,12 @@ enum EventCommand {
         #[arg(long, default_value = "normal")]
         /// Storage/privacy mode: normal, private, secret, or do-not-store.
         sensitivity: Sensitivity,
-        /// JSON object metadata. Secret output redacts it; do-not-store discards it.
-        #[arg(long, default_value = "{}")]
-        metadata: String,
+        /// JSON object metadata. Do not use this flag for secret metadata.
+        #[arg(long, conflicts_with = "metadata_file")]
+        metadata: Option<String>,
+        /// File containing JSON object metadata; use - for stdin.
+        #[arg(long)]
+        metadata_file: Option<PathBuf>,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -421,7 +426,9 @@ fn main() {
         Err(error)
             if matches!(
                 error.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    | ErrorKind::DisplayVersion
             ) =>
         {
             print!("{error}");
@@ -486,12 +493,39 @@ fn run(cli: Cli) -> Result<()> {
                 token_count,
                 sensitivity,
                 metadata,
+                metadata_file,
                 idempotency_key,
             } => {
+                if sensitivity == Sensitivity::Secret {
+                    ensure!(
+                        content.is_none(),
+                        "secret content must be read from stdin or --content-file"
+                    );
+                    ensure!(
+                        metadata.is_none(),
+                        "secret metadata must be read from --metadata-file"
+                    );
+                }
+                let content_uses_stdin = content.is_none()
+                    && content_file
+                        .as_deref()
+                        .is_none_or(|path| path == Path::new("-"));
+                let metadata_uses_stdin = metadata_file.as_deref() == Some(Path::new("-"));
+                ensure!(
+                    !(content_uses_stdin && metadata_uses_stdin),
+                    "content and metadata cannot both be read from stdin"
+                );
                 let raw = read_inline_or_file(content, content_file.as_deref())?;
                 let content = parse_json_or_string(&raw);
-                let metadata: Value =
-                    serde_json::from_str(&metadata).context("--metadata must be valid JSON")?;
+                let raw_metadata = if let Some(metadata) = metadata {
+                    metadata
+                } else if let Some(path) = metadata_file.as_deref() {
+                    read_path_or_stdin(Some(path))?
+                } else {
+                    "{}".to_owned()
+                };
+                let metadata: Value = serde_json::from_str(&raw_metadata)
+                    .context("event metadata must be valid JSON")?;
                 print_json(
                     &store.append_event(NewEvent {
                         scope_id: scope,
@@ -746,6 +780,10 @@ fn read_path_or_stdin(path: Option<&Path>) -> Result<String> {
         Some(path) if path != Path::new("-") => fs::read_to_string(path)
             .with_context(|| format!("reading input file {}", path.display())),
         _ => {
+            ensure!(
+                !io::stdin().is_terminal(),
+                "stdin is interactive; pipe input or pass a file option"
+            );
             let mut input = String::new();
             io::stdin().read_to_string(&mut input)?;
             ensure!(!input.is_empty(), "stdin was empty");
@@ -887,6 +925,13 @@ fn classify_error(message: &str) -> (&'static str, bool, bool, Option<&'static s
             false,
             true,
             Some("use literal search or correct --fts-query syntax"),
+        )
+    } else if message.contains("stdin is interactive") || message.contains("stdin was empty") {
+        (
+            "missing_input",
+            false,
+            true,
+            Some("pipe input on stdin or pass the command's file option"),
         )
     } else if message.contains("ObserverResult")
         || message.contains("source event")

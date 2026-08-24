@@ -115,7 +115,7 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
     assert_eq!(error["error"]["retryable"], false);
     assert_eq!(error["error"]["sameKeyReusable"], false);
 
-    let secret = success_json(
+    let inline_secret = omk(
         &db,
         &[
             "event",
@@ -128,8 +128,81 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
             "tool-result",
             "--content",
             "secret-response-marker",
+            "--sensitivity",
+            "secret",
+            "--idempotency-key",
+            "inline-secret-key",
+        ],
+    );
+    assert!(!inline_secret.status.success());
+    let inline_error: Value = serde_json::from_slice(&inline_secret.stderr).unwrap();
+    assert_eq!(inline_error["error"]["code"], "invalid_input");
+    assert_eq!(inline_error["error"]["sameKeyReusable"], true);
+    assert!(
+        inline_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret content must be read from stdin or --content-file")
+    );
+    assert!(!String::from_utf8_lossy(&inline_secret.stderr).contains("secret-response-marker"));
+
+    let secret_content = directory.path().join("secret-content.txt");
+    let secret_metadata = directory.path().join("secret-metadata.json");
+    std::fs::write(&secret_content, "secret-response-marker").unwrap();
+    std::fs::write(
+        &secret_metadata,
+        r#"{"credential":"secret-metadata-marker"}"#,
+    )
+    .unwrap();
+    let secret_content = secret_content.to_str().unwrap();
+    let secret_metadata = secret_metadata.to_str().unwrap();
+    let inline_metadata = omk(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "secret-stream",
+            "--kind",
+            "tool-result",
+            "--content-file",
+            secret_content,
             "--metadata",
             r#"{"credential":"secret-metadata-marker"}"#,
+            "--sensitivity",
+            "secret",
+            "--idempotency-key",
+            "inline-secret-metadata-key",
+        ],
+    );
+    assert!(!inline_metadata.status.success());
+    let metadata_error: Value = serde_json::from_slice(&inline_metadata.stderr).unwrap();
+    assert_eq!(metadata_error["error"]["code"], "invalid_input");
+    assert!(
+        metadata_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret metadata must be read from --metadata-file")
+    );
+    assert!(!String::from_utf8_lossy(&inline_metadata.stderr).contains("secret-metadata-marker"));
+
+    let secret = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "secret-stream",
+            "--kind",
+            "tool-result",
+            "--content-file",
+            secret_content,
+            "--metadata-file",
+            secret_metadata,
             "--sensitivity",
             "secret",
             "--idempotency-key",
@@ -155,10 +228,10 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
             "secret-stream",
             "--kind",
             "tool-result",
-            "--content",
-            "secret-response-marker",
-            "--metadata",
-            r#"{"credential":"secret-metadata-marker"}"#,
+            "--content-file",
+            secret_content,
+            "--metadata-file",
+            secret_metadata,
             "--sensitivity",
             "secret",
             "--idempotency-key",
@@ -170,6 +243,36 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
         !serde_json::to_string(&replayed_secret)
             .unwrap()
             .contains("secret-response-marker")
+    );
+
+    let stdin_secret = omk_with_stdin(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "stdin-secret-stream",
+            "--kind",
+            "tool-result",
+            "--sensitivity",
+            "secret",
+            "--idempotency-key",
+            "stdin-secret-key",
+        ],
+        b"stdin-secret-marker",
+    );
+    assert!(stdin_secret.status.success());
+    let stdin_secret: Value = serde_json::from_slice(&stdin_secret.stdout).unwrap();
+    assert_eq!(
+        stdin_secret["data"]["content"],
+        serde_json::json!({"redacted": true, "reason": "secret"})
+    );
+    assert!(
+        !serde_json::to_string(&stdin_secret)
+            .unwrap()
+            .contains("stdin-secret-marker")
     );
 }
 
@@ -309,6 +412,14 @@ fn cli_help_exposes_agent_critical_contracts() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("memory.db");
 
+    let no_args = Command::new(env!("CARGO_BIN_EXE_omk")).output().unwrap();
+    assert!(no_args.status.success());
+    assert!(no_args.stderr.is_empty());
+    let no_args = String::from_utf8(no_args.stdout).unwrap();
+    assert!(no_args.contains("Usage: omk"));
+    assert!(no_args.contains("Examples:"));
+    assert!(no_args.contains("omk observe plan"));
+
     let purge_help = omk(&db, &["event", "purge", "--help"]);
     assert!(purge_help.status.success());
     let purge_help = String::from_utf8(purge_help.stdout).unwrap();
@@ -326,4 +437,31 @@ fn cli_help_exposes_agent_critical_contracts() {
     let append_help = String::from_utf8(append_help.stdout).unwrap();
     assert!(append_help.contains("Storage/privacy mode"));
     assert!(append_help.contains("do-not-store"));
+    assert!(append_help.contains("--metadata-file"));
+    assert!(append_help.contains("Secret content must come from stdin or --content-file"));
+
+    let empty_stdin = omk_with_stdin(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "stream",
+            "--kind",
+            "user-message",
+            "--idempotency-key",
+            "empty-stdin-key",
+        ],
+        b"",
+    );
+    assert!(!empty_stdin.status.success());
+    let empty_error: Value = serde_json::from_slice(&empty_stdin.stderr).unwrap();
+    assert_eq!(empty_error["error"]["code"], "missing_input");
+    assert_eq!(empty_error["error"]["sameKeyReusable"], true);
+    assert_eq!(
+        empty_error["error"]["nextAction"],
+        "pipe input on stdin or pass the command's file option"
+    );
 }
