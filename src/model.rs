@@ -122,6 +122,14 @@ pub enum ClaimKind {
     Hypothesis,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimCardinality {
+    #[default]
+    Single,
+    Set,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimModality {
@@ -155,11 +163,14 @@ pub enum ClaimAuthority {
 #[serde(rename_all = "camelCase")]
 pub struct Claim {
     pub id: String,
+    pub origin_run_id: Option<String>,
     pub scope_id: String,
     pub kind: ClaimKind,
     pub subject: String,
     pub predicate: String,
+    pub cardinality: ClaimCardinality,
     pub value: Value,
+    pub value_hash: String,
     pub modality: ClaimModality,
     pub status: ClaimStatus,
     pub authority: ClaimAuthority,
@@ -181,6 +192,7 @@ pub enum ViewKind {
 pub struct MemoryView {
     pub id: String,
     pub scope_id: String,
+    pub stream_id: String,
     pub kind: ViewKind,
     pub generation: i64,
     pub content: String,
@@ -276,6 +288,8 @@ pub struct ClaimDraft {
     pub kind: ClaimKind,
     pub subject: String,
     pub predicate: String,
+    #[serde(default)]
+    pub cardinality: ClaimCardinality,
     pub value: Value,
     pub modality: ClaimModality,
     pub confidence: f64,
@@ -359,6 +373,7 @@ pub struct OmittedItem {
 pub struct ContextBundle {
     pub claims: Vec<Claim>,
     pub pending_claims: Vec<Claim>,
+    pub continuation: Option<ContinuationDraft>,
     pub continuity_views: Vec<MemoryView>,
     pub observations: Vec<Observation>,
     pub recent_events: Vec<MemoryEvent>,
@@ -374,6 +389,22 @@ pub struct SearchHit {
     pub scope_id: String,
     pub text: String,
     pub rank: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadAccess {
+    pub anchor_scope_id: String,
+    pub reveal_secrets: bool,
+}
+
+impl ReadAccess {
+    pub fn agent(anchor_scope_id: impl Into<String>) -> Self {
+        Self {
+            anchor_scope_id: anchor_scope_id.into(),
+            reveal_secrets: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

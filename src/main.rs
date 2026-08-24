@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use omk::{
-    ClaimKind, ClaimStatus, EventKind, MemoryStore, MutationResult, NewEvent, ObserverResult,
-    SCHEMA_VERSION, ScopeKind, Sensitivity, ViewKind, store::CreateView,
+    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, MemoryStore, MutationResult, NewEvent,
+    ObserverResult, ReadAccess, SCHEMA_VERSION, ScopeKind, Sensitivity, ViewKind,
+    store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -128,10 +129,14 @@ enum EventCommand {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Return one exact local event by UUID, including stored secret content.
+    /// Return one scope-visible event by UUID; secrets are redacted by default.
     Get {
         #[arg(long)]
+        scope: String,
+        #[arg(long)]
         id: String,
+        #[arg(long)]
+        reveal_secret: bool,
     },
     /// Privacy-purge an event and report every affected derived record type.
     Purge {
@@ -169,7 +174,7 @@ enum ObserveCommand {
     },
     /// Validate and atomically commit a strict ObserverResult JSON object.
     #[command(
-        after_help = "Read the run UUID from observe plan output at .data.runId. The input is this exact JSON shape; do not include runId in the object:\n\n  {\n    \"observations\": [{\n      \"kind\": \"decision\",\n      \"content\": \"Concrete source-backed statement\",\n      \"importance\": 0.9,\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"],\n      \"eventTimeFrom\": null,\n      \"eventTimeTo\": null\n    }],\n    \"claims\": [{\n      \"kind\": \"decision\",\n      \"subject\": \"subject\",\n      \"predicate\": \"predicate\",\n      \"value\": \"any JSON value\",\n      \"modality\": \"explicit-assertion\",\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"]\n    }],\n    \"continuation\": {\n      \"currentTask\": null,\n      \"completed\": [],\n      \"blockers\": [],\n      \"nextActions\": [],\n      \"unresolvedQuestions\": []\n    },\n    \"ambiguities\": [],\n    \"emptyReason\": null\n  }\n\nAllowed observation kinds: event, decision, outcome, failure, constraint, preference, open-loop, relationship, continuation.\nAllowed claim kinds: fact, preference, decision, goal, commitment, constraint, open-loop, entity-alias, relationship, hypothesis.\nAllowed modalities: explicit-assertion, accepted-decision, proposal, inference, observation.\n\nEvery observation, claim, and ambiguity must cite one or more event UUIDs from the plan. For a non-empty result, continuation completely replaces the previous snapshot. If observations, claims, and ambiguities are all empty, send the empty continuation shown above and a concrete non-empty emptyReason; the kernel then preserves the previous continuation."
+        after_help = "Read the run UUID from observe plan output at .data.runId. The input is this exact JSON shape; do not include runId in the object:\n\n  {\n    \"observations\": [{\n      \"kind\": \"decision\",\n      \"content\": \"Concrete source-backed statement\",\n      \"importance\": 0.9,\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"],\n      \"eventTimeFrom\": null,\n      \"eventTimeTo\": null\n    }],\n    \"claims\": [{\n      \"kind\": \"decision\",\n      \"subject\": \"subject\",\n      \"predicate\": \"predicate\",\n      \"cardinality\": \"single\",\n      \"value\": \"any JSON value\",\n      \"modality\": \"explicit-assertion\",\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"]\n    }],\n    \"continuation\": {\n      \"currentTask\": null,\n      \"completed\": [],\n      \"blockers\": [],\n      \"nextActions\": [],\n      \"unresolvedQuestions\": []\n    },\n    \"ambiguities\": [],\n    \"emptyReason\": null\n  }\n\nAllowed observation kinds: event, decision, outcome, failure, constraint, preference, open-loop, relationship, continuation.\nAllowed claim kinds: fact, preference, decision, goal, commitment, constraint, open-loop, entity-alias, relationship, hypothesis.\nAllowed claim cardinalities: single, set.\nAllowed modalities: explicit-assertion, accepted-decision, proposal, inference, observation.\n\nEvery observation, claim, and ambiguity must cite one or more event UUIDs from the plan. Observer claims always remain pending until an explicit claim command changes them. For a non-empty result, continuation completely replaces the previous snapshot. If observations, claims, and ambiguities are all empty, send the empty continuation shown above and a concrete non-empty emptyReason; the kernel then preserves the previous continuation."
     )]
     Commit {
         #[arg(long)]
@@ -193,12 +198,14 @@ enum ObserveCommand {
     /// Inspect one observation run, including failure and ambiguity details.
     Get {
         #[arg(long)]
+        scope: String,
+        #[arg(long)]
         run: String,
     },
     /// List observation runs by scope, stream, or lifecycle status.
     List {
         #[arg(long)]
-        scope: Option<String>,
+        scope: String,
         #[arg(long)]
         stream: Option<String>,
         #[arg(long)]
@@ -206,6 +213,8 @@ enum ObserveCommand {
     },
     /// Inspect a stream cursor, sequence allocator, and its observation runs.
     Status {
+        #[arg(long)]
+        scope: String,
         #[arg(long)]
         stream: String,
     },
@@ -218,6 +227,9 @@ struct ClaimValueArgs {
     scope: String,
     #[arg(long)]
     kind: ClaimKind,
+    /// Whether this logical slot has one active value or a set of active values.
+    #[arg(long, default_value = "single")]
+    cardinality: ClaimCardinality,
     /// Stable logical subject.
     #[arg(long)]
     subject: String,
@@ -312,32 +324,7 @@ enum ClaimCommand {
 #[derive(Debug, Subcommand)]
 enum ViewCommand {
     /// Create the next append-only generation of a supported view kind.
-    Create {
-        #[arg(long)]
-        scope: String,
-        #[arg(long)]
-        kind: ViewKind,
-        /// View text. Reads stdin when omitted.
-        #[arg(long, conflicts_with = "content_file")]
-        content: Option<String>,
-        #[arg(long)]
-        content_file: Option<PathBuf>,
-        #[arg(long)]
-        from: i64,
-        #[arg(long)]
-        through: i64,
-        #[arg(long = "source-observation")]
-        source_observations: Vec<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        prompt_version: Option<String>,
-        /// Conservative token-count hint; OMK never accepts less than its own estimate.
-        #[arg(long)]
-        token_count: Option<i64>,
-        #[arg(long)]
-        idempotency_key: String,
-    },
+    Create(Box<ViewCreateArgs>),
     /// List all view generations owned by a scope.
     List {
         #[arg(long)]
@@ -345,21 +332,62 @@ enum ViewCommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct ViewCreateArgs {
+    #[arg(long)]
+    scope: String,
+    #[arg(long)]
+    stream: String,
+    #[arg(long)]
+    kind: ViewKind,
+    /// View text. Reads stdin when omitted.
+    #[arg(long, conflicts_with = "content_file")]
+    content: Option<String>,
+    #[arg(long)]
+    content_file: Option<PathBuf>,
+    #[arg(long)]
+    from: i64,
+    #[arg(long)]
+    through: i64,
+    #[arg(long = "source-observation")]
+    source_observations: Vec<String>,
+    /// Latest continuity view used to produce this result; omit only for generation one.
+    #[arg(long)]
+    expected_previous_view: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    prompt_version: Option<String>,
+    /// Conservative token-count hint; OMK never accepts less than its own estimate.
+    #[arg(long)]
+    token_count: Option<i64>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
 #[derive(Debug, Subcommand)]
 enum RecallCommand {
     /// Return an observation together with its exact source events.
     Observation {
         #[arg(long)]
+        scope: String,
+        #[arg(long)]
         id: String,
+        #[arg(long)]
+        reveal_secret: bool,
     },
     /// Return exact local events for an inclusive stream sequence range.
     EventRange {
+        #[arg(long)]
+        scope: String,
         #[arg(long)]
         stream: String,
         #[arg(long)]
         from: i64,
         #[arg(long)]
         to: i64,
+        #[arg(long)]
+        reveal_secret: bool,
     },
     #[command(
         after_help = "Queries are literal phrases by default. Use --fts-query only for intentional SQLite FTS5 syntax."
@@ -378,7 +406,11 @@ enum RecallCommand {
     /// Return a claim with all source observations and exact source events.
     ExplainClaim {
         #[arg(long)]
+        scope: String,
+        #[arg(long)]
         id: String,
+        #[arg(long)]
+        reveal_secret: bool,
     },
 }
 
@@ -509,7 +541,17 @@ fn run(cli: Cli) -> Result<()> {
                     idempotency_key,
                 })?)?;
             }
-            EventCommand::Get { id } => print_json(&store.get_event(&id)?)?,
+            EventCommand::Get {
+                scope,
+                id,
+                reveal_secret,
+            } => print_json(&store.get_event(
+                &ReadAccess {
+                    anchor_scope_id: scope,
+                    reveal_secrets: reveal_secret,
+                },
+                &id,
+            )?)?,
             EventCommand::Purge {
                 id,
                 idempotency_key,
@@ -546,37 +588,39 @@ fn run(cli: Cli) -> Result<()> {
                 reason,
                 idempotency_key,
             } => print_json(&store.fail_observation(&run, &reason, &idempotency_key)?)?,
-            ObserveCommand::Get { run } => {
-                print_json(&store.get_observation_run(&run)?)?;
+            ObserveCommand::Get { scope, run } => {
+                print_json(&store.get_observation_run(&ReadAccess::agent(scope), &run)?)?;
             }
             ObserveCommand::List {
                 scope,
                 stream,
                 status,
             } => print_json(&store.list_observation_runs(
-                scope.as_deref(),
+                &ReadAccess::agent(scope),
                 stream.as_deref(),
                 status.as_deref(),
             )?)?,
-            ObserveCommand::Status { stream } => {
-                print_json(&store.stream_status(&stream)?)?;
+            ObserveCommand::Status { scope, stream } => {
+                print_json(&store.stream_status(&ReadAccess::agent(scope), &stream)?)?;
             }
         },
         Command::Claim { command } => match command {
-            ClaimCommand::Remember(args) => print_json(&store.remember_claim(
+            ClaimCommand::Remember(args) => print_json(&store.remember_claim_with_cardinality(
                 &args.scope,
                 args.kind,
                 &args.subject,
                 &args.predicate,
+                args.cardinality,
                 parse_json_or_string(&args.value),
                 &args.source_events,
                 &args.idempotency_key,
             )?)?,
-            ClaimCommand::Propose(args) => print_json(&store.propose_claim(
+            ClaimCommand::Propose(args) => print_json(&store.propose_claim_with_cardinality(
                 &args.scope,
                 args.kind,
                 &args.subject,
                 &args.predicate,
+                args.cardinality,
                 parse_json_or_string(&args.value),
                 &args.source_events,
                 &args.idempotency_key,
@@ -624,27 +668,32 @@ fn run(cli: Cli) -> Result<()> {
             } => print_json(&store.list_claims(&scope, ancestors, status)?)?,
         },
         Command::View { command } => match command {
-            ViewCommand::Create {
-                scope,
-                kind,
-                content,
-                content_file,
-                from,
-                through,
-                source_observations,
-                model,
-                prompt_version,
-                token_count,
-                idempotency_key,
-            } => {
+            ViewCommand::Create(args) => {
+                let ViewCreateArgs {
+                    scope,
+                    stream,
+                    kind,
+                    content,
+                    content_file,
+                    from,
+                    through,
+                    source_observations,
+                    expected_previous_view,
+                    model,
+                    prompt_version,
+                    token_count,
+                    idempotency_key,
+                } = *args;
                 let content = read_inline_or_file(content, content_file.as_deref())?;
                 print_json(&store.create_view(CreateView {
                     scope_id: scope,
+                    stream_id: stream,
                     kind,
                     content,
                     source_from_sequence: from,
                     source_through_sequence: through,
                     source_observation_ids: source_observations,
+                    expected_previous_view_id: expected_previous_view,
                     model,
                     prompt_version,
                     token_count,
@@ -656,12 +705,34 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Recall { command } => match command {
-            RecallCommand::Observation { id } => {
-                print_json(&store.explain_observation(&id)?)?;
+            RecallCommand::Observation {
+                scope,
+                id,
+                reveal_secret,
+            } => {
+                print_json(&store.explain_observation(
+                    &ReadAccess {
+                        anchor_scope_id: scope,
+                        reveal_secrets: reveal_secret,
+                    },
+                    &id,
+                )?)?;
             }
-            RecallCommand::EventRange { stream, from, to } => {
-                print_json(&store.recall_event_range(&stream, from, to)?)?
-            }
+            RecallCommand::EventRange {
+                scope,
+                stream,
+                from,
+                to,
+                reveal_secret,
+            } => print_json(&store.recall_event_range(
+                &ReadAccess {
+                    anchor_scope_id: scope,
+                    reveal_secrets: reveal_secret,
+                },
+                &stream,
+                from,
+                to,
+            )?)?,
             RecallCommand::Search {
                 scope,
                 query,
@@ -675,8 +746,18 @@ fn run(cli: Cli) -> Result<()> {
                 };
                 print_json(&hits)?;
             }
-            RecallCommand::ExplainClaim { id } => {
-                print_json(&store.explain_claim(&id)?)?;
+            RecallCommand::ExplainClaim {
+                scope,
+                id,
+                reveal_secret,
+            } => {
+                print_json(&store.explain_claim(
+                    &ReadAccess {
+                        anchor_scope_id: scope,
+                        reveal_secrets: reveal_secret,
+                    },
+                    &id,
+                )?)?;
             }
         },
         Command::Context(args) => {
@@ -740,6 +821,15 @@ fn classify_error(message: &str) -> (&'static str, bool, bool, Option<&'static s
             false,
             true,
             Some("increase the token budget and retry with the same key"),
+        )
+    } else if message.contains("view is stale") {
+        (
+            "stale_view",
+            false,
+            true,
+            Some(
+                "read the latest continuity view, rerun reflection from it, and retry with the same key",
+            ),
         )
     } else if message.contains(" is stale") {
         (
@@ -815,4 +905,23 @@ fn print_error(
         "{}",
         serde_json::to_string(&error).expect("serializing an error envelope cannot fail")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_error;
+
+    #[test]
+    fn stale_view_errors_have_view_specific_recovery() {
+        let classified =
+            classify_error("view is stale: expected previous view None, found Some(\"view-id\")");
+        assert_eq!(classified.0, "stale_view");
+        assert!(!classified.1);
+        assert!(classified.2);
+        assert!(
+            classified
+                .3
+                .is_some_and(|action| action.contains("continuity view"))
+        );
+    }
 }

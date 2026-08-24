@@ -82,7 +82,9 @@ CREATE TABLE IF NOT EXISTS claims (
     kind TEXT NOT NULL,
     subject TEXT NOT NULL,
     predicate TEXT NOT NULL,
+    cardinality TEXT NOT NULL CHECK (cardinality IN ('single','set')),
     value_json TEXT NOT NULL,
+    value_hash TEXT NOT NULL,
     modality TEXT NOT NULL,
     status TEXT NOT NULL,
     authority TEXT NOT NULL,
@@ -92,11 +94,25 @@ CREATE TABLE IF NOT EXISTS claims (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS claim_slots (
+    scope_id TEXT NOT NULL REFERENCES memory_scopes(id),
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    cardinality TEXT NOT NULL CHECK (cardinality IN ('single','set')),
+    PRIMARY KEY(scope_id, kind, subject, predicate)
+);
+
 CREATE INDEX IF NOT EXISTS claims_logical_key
 ON claims(scope_id, kind, subject, predicate, status);
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_claim_per_logical_key
-ON claims(scope_id, kind, subject, predicate) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_single_claim_per_logical_key
+ON claims(scope_id, kind, subject, predicate)
+WHERE status = 'active' AND cardinality = 'single';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_set_claim_per_value
+ON claims(scope_id, kind, subject, predicate, value_hash)
+WHERE status = 'active' AND cardinality = 'set';
 
 CREATE TABLE IF NOT EXISTS claim_sources (
     claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
@@ -107,17 +123,18 @@ CREATE TABLE IF NOT EXISTS claim_sources (
 CREATE TABLE IF NOT EXISTS memory_views (
     id TEXT PRIMARY KEY,
     scope_id TEXT NOT NULL REFERENCES memory_scopes(id),
+    stream_id TEXT NOT NULL REFERENCES memory_streams(id),
     kind TEXT NOT NULL,
     generation INTEGER NOT NULL,
     content TEXT NOT NULL,
     source_from_sequence INTEGER NOT NULL,
     source_through_sequence INTEGER NOT NULL,
-    previous_view_id TEXT REFERENCES memory_views(id) ON DELETE SET NULL,
+    previous_view_id TEXT REFERENCES memory_views(id) ON DELETE CASCADE,
     model TEXT,
     prompt_version TEXT,
     token_count INTEGER NOT NULL CHECK (token_count >= 0),
     created_at TEXT NOT NULL,
-    UNIQUE(scope_id, kind, generation)
+    UNIQUE(stream_id, kind, generation)
 );
 
 CREATE TABLE IF NOT EXISTS view_sources (
@@ -136,7 +153,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
-    request_hash TEXT NOT NULL,
+    request_hash TEXT,
     result_json TEXT
 );
 "#;

@@ -399,10 +399,18 @@ fn cli_literal_search_and_observer_errors_are_agent_safe() {
     assert_eq!(caught_up["data"]["observedThroughSequence"], 1);
     assert!(caught_up["data"]["nextAction"].is_string());
 
-    let run = success_json(&db, &["observe", "get", "--run", run_id]);
+    let run = success_json(
+        &db,
+        &["observe", "get", "--scope", "user:cli", "--run", run_id],
+    );
     assert_eq!(run["status"], "committed");
     assert_eq!(run["sourceIntegrity"], "intact");
-    let status = success_json(&db, &["observe", "status", "--stream", "stream"]);
+    let status = success_json(
+        &db,
+        &[
+            "observe", "status", "--scope", "user:cli", "--stream", "stream",
+        ],
+    );
     assert_eq!(status["observedThroughSequence"], 1);
 }
 

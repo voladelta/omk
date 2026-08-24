@@ -5,6 +5,10 @@ impl MemoryStore {
         validate_nonempty("view content", &input.content)?;
         validate_nonempty("idempotency key", &input.idempotency_key)?;
         ensure!(
+            input.kind == ViewKind::Continuity,
+            "continuation views are created only by observation commit"
+        );
+        ensure!(
             input.source_from_sequence > 0
                 && input.source_through_sequence >= input.source_from_sequence,
             "view source sequence range is invalid"
@@ -18,12 +22,38 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(prior));
         }
         ensure_scope_exists(&tx, &input.scope_id)?;
+        let stream_scope: String = tx
+            .query_row(
+                "SELECT scope_id FROM memory_streams WHERE id=?1",
+                [&input.stream_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("stream {} does not exist", input.stream_id))?;
+        ensure!(
+            stream_scope == input.scope_id,
+            "stream {} belongs to scope {stream_scope}, not {}",
+            input.stream_id,
+            input.scope_id
+        );
+        let latest = latest_view(&tx, &input.stream_id, "continuity")?;
+        ensure!(
+            latest.as_ref().map(|view| view.id.as_str())
+                == input.expected_previous_view_id.as_deref(),
+            "view is stale: expected previous view {:?}, found {:?}",
+            input.expected_previous_view_id,
+            latest.as_ref().map(|view| view.id.as_str())
+        );
         for observation_id in &input.source_observation_ids {
-            let (source_scope, source_start, source_end): (String, i64, i64) = tx
+            let (source_scope, source_stream, source_start, source_end):
+                (String, String, i64, i64) = tx
                 .query_row(
-                    "SELECT scope_id,source_start_sequence,source_end_sequence FROM observations WHERE id=?1",
+                    "SELECT observation.scope_id,run.stream_id,observation.source_start_sequence,observation.source_end_sequence
+                     FROM observations observation
+                     JOIN observation_runs run ON run.id=observation.run_id
+                     WHERE observation.id=?1",
                     [observation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?
                 .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
@@ -31,6 +61,11 @@ impl MemoryStore {
                 source_scope == input.scope_id,
                 "observation {observation_id} belongs to scope {source_scope}, not {}",
                 input.scope_id
+            );
+            ensure!(
+                source_stream == input.stream_id,
+                "observation {observation_id} belongs to stream {source_stream}, not {}",
+                input.stream_id
             );
             ensure!(
                 source_start >= input.source_from_sequence
@@ -45,6 +80,7 @@ impl MemoryStore {
         let view = insert_next_view(
             &tx,
             &input.scope_id,
+            &input.stream_id,
             input.kind,
             &input.content,
             input.source_from_sequence,
@@ -73,28 +109,43 @@ impl MemoryStore {
     pub fn list_views(&self, scope_id: &str) -> Result<Vec<MemoryView>> {
         ensure_scope_exists(&self.conn, scope_id)?;
         let mut statement = self.conn.prepare(
-            "SELECT id,scope_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
-             FROM memory_views WHERE scope_id=?1 ORDER BY kind,generation",
+            "SELECT id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
+             FROM memory_views WHERE scope_id=?1 ORDER BY stream_id,kind,generation",
         )?;
         collect_rows(statement.query_map([scope_id], row_view)?)
     }
 
-    pub fn recall_by_observation(&self, observation_id: &str) -> Result<Vec<MemoryEvent>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM observations WHERE id=?1)",
-            [observation_id],
-            |row| row.get(0),
-        )?;
-        ensure!(exists, "observation {observation_id} does not exist");
+    pub fn recall_by_observation(
+        &self,
+        access: &ReadAccess,
+        observation_id: &str,
+    ) -> Result<Vec<MemoryEvent>> {
+        let scope_id: String = self
+            .conn
+            .query_row(
+                "SELECT scope_id FROM observations WHERE id=?1",
+                [observation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
+        ensure_read_scope(&self.conn, access, &scope_id)?;
         let mut statement = self.conn.prepare(
             "SELECT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
              FROM memory_events e JOIN observation_sources s ON s.event_id=e.id
              WHERE s.observation_id=?1 ORDER BY e.stream_id,e.sequence",
         )?;
-        collect_rows(statement.query_map([observation_id], row_event)?)
+        collect_rows(statement.query_map([observation_id], row_event)?)?
+            .into_iter()
+            .map(|event| apply_read_access(&self.conn, access, event))
+            .collect()
     }
 
-    pub fn explain_observation(&self, observation_id: &str) -> Result<ObservationExplanation> {
+    pub fn explain_observation(
+        &self,
+        access: &ReadAccess,
+        observation_id: &str,
+    ) -> Result<ObservationExplanation> {
         let observation = self
             .conn
             .query_row(
@@ -105,21 +156,26 @@ impl MemoryStore {
             )
             .optional()?
             .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
+        ensure_read_scope(&self.conn, access, &observation.scope_id)?;
         Ok(ObservationExplanation {
             observation,
-            source_events: self.recall_by_observation(observation_id)?,
+            source_events: self.recall_by_observation(access, observation_id)?,
         })
     }
 
-    pub fn explain_claim(&self, claim_id: &str) -> Result<ClaimExplanation> {
+    pub fn explain_claim(&self, access: &ReadAccess, claim_id: &str) -> Result<ClaimExplanation> {
         let claim = query_claim(&self.conn, claim_id)?;
+        ensure_read_scope(&self.conn, access, &claim.scope_id)?;
         let mut events_statement = self.conn.prepare(
             "SELECT DISTINCT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
              FROM memory_events e JOIN claim_sources source ON source.event_id=e.id
              WHERE source.claim_id=?1
              ORDER BY e.stream_id,e.sequence",
         )?;
-        let source_events = collect_rows(events_statement.query_map([claim_id], row_event)?)?;
+        let source_events = collect_rows(events_statement.query_map([claim_id], row_event)?)?
+            .into_iter()
+            .map(|event| apply_read_access(&self.conn, access, event))
+            .collect::<Result<Vec<_>>>()?;
         Ok(ClaimExplanation {
             claim,
             source_events,
@@ -213,13 +269,14 @@ impl MemoryStore {
         };
 
         let mut continuity_views = Vec::new();
-        for visible_scope in visible.iter().rev() {
-            let Some(view) = latest_view(&self.conn, visible_scope, "continuation")? else {
-                continue;
-            };
+        let mut continuation = None;
+        if let Some(view) = latest_view(&self.conn, stream_id, "continuation")? {
             if diagnostics.estimated_tokens + view.token_count <= max_tokens {
                 diagnostics.estimated_tokens += view.token_count;
-                continuity_views.push(view);
+                continuation = Some(
+                    serde_json::from_str(&view.content)
+                        .context("reading structured continuation view")?,
+                );
             } else {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: view.id,
@@ -267,10 +324,7 @@ impl MemoryStore {
             .collect();
 
         let mut selected_continuity_ids = Vec::new();
-        for visible_scope in &visible {
-            let Some(view) = latest_view(&self.conn, visible_scope, "continuity")? else {
-                continue;
-            };
+        if let Some(view) = latest_view(&self.conn, stream_id, "continuity")? {
             if diagnostics.estimated_tokens + view.token_count <= max_tokens {
                 diagnostics.estimated_tokens += view.token_count;
                 selected_continuity_ids.push(view.id.clone());
@@ -283,14 +337,19 @@ impl MemoryStore {
             }
         }
 
-        let mut candidates = query_observations_for_scopes(&self.conn, &visible)?;
+        let mut observation_scopes = visible.clone();
+        if !observation_scopes.contains(&stream_scope) {
+            observation_scopes.push(stream_scope);
+        }
+        let mut candidates = query_observations_for_scopes(&self.conn, &observation_scopes)?;
         candidates.sort_by(|left, right| {
             right
                 .importance
                 .total_cmp(&left.importance)
                 .then_with(|| left.created_at.cmp(&right.created_at))
         });
-        let sources_by_observation = query_observation_source_ids_for_scopes(&self.conn, &visible)?;
+        let sources_by_observation =
+            query_observation_source_ids_for_scopes(&self.conn, &observation_scopes)?;
         let represented_observation_ids =
             query_view_observation_ids(&self.conn, &selected_continuity_ids)?;
         let mut observations = Vec::new();
@@ -302,7 +361,7 @@ impl MemoryStore {
                         !source_ids.is_empty()
                             && source_ids
                                 .iter()
-                                .all(|source_id| recent_event_ids.contains(source_id.as_str()))
+                                .any(|source_id| recent_event_ids.contains(source_id.as_str()))
                     });
             let represented_by_view = represented_observation_ids.contains(&observation.id);
             if duplicated_by_raw || represented_by_view {
@@ -331,15 +390,16 @@ impl MemoryStore {
         observations.sort_by(|left, right| left.created_at.cmp(&right.created_at));
 
         let mut recalled_evidence = Vec::new();
+        let read_access = ReadAccess::agent(scope_id);
         if let Some(query) = query {
             let retrieval_scopes = retrieval_scope_ids(&self.conn, scope_id)?;
             let hits = search_fts(&self.conn, &retrieval_scopes, &literal_fts_query(query), 10)?;
             let mut recalled_ids = HashSet::new();
             for hit in hits {
                 let evidence = match hit.record_type.as_str() {
-                    "event" => vec![self.get_event(&hit.id)?],
-                    "observation" => self.recall_by_observation(&hit.id)?,
-                    "claim" => self.explain_claim(&hit.id)?.source_events,
+                    "event" => vec![self.get_event(&read_access, &hit.id)?],
+                    "observation" => self.recall_by_observation(&read_access, &hit.id)?,
+                    "claim" => self.explain_claim(&read_access, &hit.id)?.source_events,
                     record_type => bail!("unsupported full-text record type {record_type}"),
                 };
                 for event in evidence {
@@ -364,6 +424,7 @@ impl MemoryStore {
         Ok(ContextBundle {
             claims,
             pending_claims: selected_pending_claims,
+            continuation,
             continuity_views,
             observations,
             recent_events,

@@ -12,11 +12,36 @@ impl MemoryStore {
         source_event_ids: &[String],
         idempotency_key: &str,
     ) -> Result<MutationResult<Claim>> {
+        self.remember_claim_with_cardinality(
+            scope_id,
+            kind,
+            subject,
+            predicate,
+            ClaimCardinality::Single,
+            value,
+            source_event_ids,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_claim_with_cardinality(
+        &mut self,
+        scope_id: &str,
+        kind: ClaimKind,
+        subject: &str,
+        predicate: &str,
+        cardinality: ClaimCardinality,
+        value: Value,
+        source_event_ids: &[String],
+        idempotency_key: &str,
+    ) -> Result<MutationResult<Claim>> {
         self.create_direct_claim(
             scope_id,
             kind,
             subject,
             predicate,
+            cardinality,
             value,
             ClaimModality::ExplicitAssertion,
             ClaimStatus::Active,
@@ -38,11 +63,36 @@ impl MemoryStore {
         source_event_ids: &[String],
         idempotency_key: &str,
     ) -> Result<MutationResult<Claim>> {
+        self.propose_claim_with_cardinality(
+            scope_id,
+            kind,
+            subject,
+            predicate,
+            ClaimCardinality::Single,
+            value,
+            source_event_ids,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_claim_with_cardinality(
+        &mut self,
+        scope_id: &str,
+        kind: ClaimKind,
+        subject: &str,
+        predicate: &str,
+        cardinality: ClaimCardinality,
+        value: Value,
+        source_event_ids: &[String],
+        idempotency_key: &str,
+    ) -> Result<MutationResult<Claim>> {
         self.create_direct_claim(
             scope_id,
             kind,
             subject,
             predicate,
+            cardinality,
             value,
             ClaimModality::Proposal,
             ClaimStatus::Pending,
@@ -60,6 +110,7 @@ impl MemoryStore {
         kind: ClaimKind,
         subject: &str,
         predicate: &str,
+        cardinality: ClaimCardinality,
         value: Value,
         modality: ClaimModality,
         requested_status: ClaimStatus,
@@ -78,6 +129,7 @@ impl MemoryStore {
             "kind": kind,
             "subject": subject,
             "predicate": predicate,
+            "cardinality": cardinality,
             "value": value,
             "modality": modality,
             "requestedStatus": requested_status,
@@ -95,12 +147,22 @@ impl MemoryStore {
         validate_claim_event_sources(&tx, scope_id, source_event_ids)?;
         let command_event = insert_memory_command_event(&tx, scope_id, operation, &request)?;
 
+        let value_hash = hash_json(&value);
         let kind_text = enum_text(&kind);
-        let active = query_active_logical_claim(&tx, scope_id, &kind_text, subject, predicate)?;
+        let active = query_active_claim_member(
+            &tx,
+            scope_id,
+            &kind_text,
+            subject,
+            predicate,
+            &cardinality,
+            &value_hash,
+        )?;
         if requested_status == ClaimStatus::Active
             && let Some(existing) = &active
             && existing.value == value
         {
+            set_command_event_owner(&tx, &command_event.id, &existing.id)?;
             attach_event_sources(&tx, &existing.id, source_event_ids)?;
             attach_event_sources(&tx, &existing.id, std::slice::from_ref(&command_event.id))?;
             save_operation(&tx, idempotency_key, operation, &request_hash, existing)?;
@@ -115,11 +177,14 @@ impl MemoryStore {
         let timestamp = now();
         let claim = Claim {
             id: Uuid::new_v4().to_string(),
+            origin_run_id: None,
             scope_id: scope_id.to_owned(),
             kind,
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
+            cardinality,
             value,
+            value_hash,
             modality,
             status,
             authority,
@@ -128,7 +193,11 @@ impl MemoryStore {
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
-        insert_claim(&tx, &claim, None)?;
+        if claim.status == ClaimStatus::Active {
+            ensure_claim_slot(&tx, &claim)?;
+        }
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
+        insert_claim(&tx, &claim)?;
         attach_event_sources(&tx, &claim.id, source_event_ids)?;
         attach_event_sources(&tx, &claim.id, std::slice::from_ref(&command_event.id))?;
         index_claim(&tx, &claim)?;
@@ -159,11 +228,41 @@ impl MemoryStore {
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.confirm", &request)?;
+        ensure_claim_slot(&tx, &claim)?;
+        if let Some(existing) = query_active_claim_member(
+            &tx,
+            &claim.scope_id,
+            &enum_text(&claim.kind),
+            &claim.subject,
+            &claim.predicate,
+            &claim.cardinality,
+            &claim.value_hash,
+        )?
+        .filter(|existing| existing.value == claim.value)
+        {
+            set_command_event_owner(&tx, &command_event.id, &existing.id)?;
+            copy_claim_sources(&tx, &claim.id, &existing.id)?;
+            attach_event_sources(&tx, &existing.id, std::slice::from_ref(&command_event.id))?;
+            tx.execute(
+                "UPDATE claims SET status='rejected',updated_at=?2 WHERE id=?1",
+                params![claim.id, now()],
+            )?;
+            save_operation(
+                &tx,
+                idempotency_key,
+                "claim.confirm",
+                &request_hash,
+                &existing,
+            )?;
+            tx.commit()?;
+            return Ok(MutationResult::created(existing));
+        }
         supersede_other_active_claims(&tx, &claim, Some(&claim.id))?;
         claim.status = ClaimStatus::Active;
         claim.modality = ClaimModality::AcceptedDecision;
         claim.authority = ClaimAuthority::ExplicitUser;
         claim.updated_at = now();
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
         tx.execute(
             "UPDATE claims SET status='active',modality='accepted-decision',authority='explicit-user',updated_at=?2 WHERE id=?1",
             params![claim.id, claim.updated_at],
@@ -196,34 +295,65 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(prior));
         }
         let old = query_claim(&tx, claim_id)?;
+        let old_id = old.id.clone();
         validate_claim_event_sources(&tx, &old.scope_id, source_event_ids)?;
         let command_event =
             insert_memory_command_event(&tx, &old.scope_id, "claim.correct", &request)?;
         let timestamp = now();
-        tx.execute(
-            "UPDATE claims SET status='superseded',updated_at=?1 WHERE scope_id=?2 AND kind=?3 AND subject=?4 AND predicate=?5 AND status='active'",
-            params![timestamp, old.scope_id, enum_text(&old.kind), old.subject, old.predicate],
-        )?;
+        if old.cardinality == ClaimCardinality::Single {
+            tx.execute(
+                "UPDATE claims SET status='superseded',updated_at=?1 WHERE scope_id=?2 AND kind=?3 AND subject=?4 AND predicate=?5 AND cardinality='single' AND status='active'",
+                params![timestamp, old.scope_id, enum_text(&old.kind), old.subject, old.predicate],
+            )?;
+        }
         tx.execute(
             "UPDATE claims SET status='superseded',updated_at=?2 WHERE id=?1",
             params![old.id, timestamp],
         )?;
         let claim = Claim {
             id: Uuid::new_v4().to_string(),
+            origin_run_id: None,
             scope_id: old.scope_id,
             kind: old.kind,
             subject: old.subject,
             predicate: old.predicate,
+            cardinality: old.cardinality,
+            value_hash: hash_json(&value),
             value,
             modality: ClaimModality::ExplicitAssertion,
             status: ClaimStatus::Active,
             authority: ClaimAuthority::ExplicitUser,
             confidence: 1.0,
-            supersedes_id: Some(old.id),
+            supersedes_id: Some(old_id.clone()),
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
-        insert_claim(&tx, &claim, None)?;
+        ensure_claim_slot(&tx, &claim)?;
+        if let Some(existing) = query_active_claim_member(
+            &tx,
+            &claim.scope_id,
+            &enum_text(&claim.kind),
+            &claim.subject,
+            &claim.predicate,
+            &claim.cardinality,
+            &claim.value_hash,
+        )? {
+            set_command_event_owner(&tx, &command_event.id, &existing.id)?;
+            copy_claim_sources(&tx, &old_id, &existing.id)?;
+            attach_event_sources(&tx, &existing.id, source_event_ids)?;
+            attach_event_sources(&tx, &existing.id, std::slice::from_ref(&command_event.id))?;
+            save_operation(
+                &tx,
+                idempotency_key,
+                "claim.correct",
+                &request_hash,
+                &existing,
+            )?;
+            tx.commit()?;
+            return Ok(MutationResult::created(existing));
+        }
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
+        insert_claim(&tx, &claim)?;
         attach_event_sources(&tx, &claim.id, source_event_ids)?;
         attach_event_sources(&tx, &claim.id, std::slice::from_ref(&command_event.id))?;
         index_claim(&tx, &claim)?;
@@ -250,6 +380,10 @@ impl MemoryStore {
         }
         ensure_scope_exists(&tx, new_scope_id)?;
         let old = query_claim(&tx, claim_id)?;
+        ensure!(
+            new_scope_id == old.scope_id || scope_is_ancestor(&tx, new_scope_id, &old.scope_id)?,
+            "claim rescope target must be the current scope or one of its ancestors"
+        );
         validate_existing_claim_sources_visible(&tx, claim_id, new_scope_id)?;
         let command_event =
             insert_memory_command_event(&tx, new_scope_id, "claim.rescope", &request)?;
@@ -272,9 +406,33 @@ impl MemoryStore {
             ..old
         };
         if claim.status == ClaimStatus::Active {
+            ensure_claim_slot(&tx, &claim)?;
+            if let Some(existing) = query_active_claim_member(
+                &tx,
+                &claim.scope_id,
+                &enum_text(&claim.kind),
+                &claim.subject,
+                &claim.predicate,
+                &claim.cardinality,
+                &claim.value_hash,
+            )? {
+                set_command_event_owner(&tx, &command_event.id, &existing.id)?;
+                copy_claim_sources(&tx, claim_id, &existing.id)?;
+                attach_event_sources(&tx, &existing.id, std::slice::from_ref(&command_event.id))?;
+                save_operation(
+                    &tx,
+                    idempotency_key,
+                    "claim.rescope",
+                    &request_hash,
+                    &existing,
+                )?;
+                tx.commit()?;
+                return Ok(MutationResult::created(existing));
+            }
             supersede_other_active_claims(&tx, &claim, None)?;
         }
-        insert_claim(&tx, &claim, None)?;
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
+        insert_claim(&tx, &claim)?;
         copy_claim_sources(&tx, claim_id, &claim.id)?;
         attach_event_sources(&tx, &claim.id, std::slice::from_ref(&command_event.id))?;
         index_claim(&tx, &claim)?;
@@ -305,6 +463,7 @@ impl MemoryStore {
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.reject", &request)?;
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
         claim.status = ClaimStatus::Rejected;
         claim.updated_at = now();
         tx.execute(
@@ -342,6 +501,7 @@ impl MemoryStore {
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.forget", &request)?;
+        set_command_event_owner(&tx, &command_event.id, &claim.id)?;
         claim.status = ClaimStatus::Expired;
         claim.updated_at = now();
         tx.execute(
@@ -396,23 +556,27 @@ impl MemoryStore {
             left_pending: Vec::new(),
         };
         for claim in pending {
-            if matches!(
-                claim.modality,
-                ClaimModality::Proposal | ClaimModality::Inference | ClaimModality::Observation
-            ) || !claim_has_user_event_source(&tx, &claim.id)?
+            if claim.origin_run_id.is_some()
+                || matches!(
+                    claim.modality,
+                    ClaimModality::Proposal | ClaimModality::Inference | ClaimModality::Observation
+                )
             {
                 summary.left_pending.push(claim.id);
                 continue;
             }
-            let active = query_active_logical_claim(
+            let active = query_active_claim_member(
                 &tx,
                 &claim.scope_id,
                 &enum_text(&claim.kind),
                 &claim.subject,
                 &claim.predicate,
+                &claim.cardinality,
+                &claim.value_hash,
             )?;
             match active {
                 None => {
+                    ensure_claim_slot(&tx, &claim)?;
                     tx.execute(
                         "UPDATE claims SET status='active',authority='trusted-source',updated_at=?2 WHERE id=?1",
                         params![claim.id, now()],

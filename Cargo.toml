@@ -1,6 +1,6 @@
 [package]
 name = "omk"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Local-first observational memory kernel and agent CLI"
 license = "MIT"

@@ -43,7 +43,9 @@ The operation fields tell you how to recover:
 - `sameKeyReusable` means validation failed before OMK recorded the operation
 - `nextAction` tells you what to do before you retry
 
-An identical retry returns the original data with `replayed: true`. OMK rejects a reused key if any input has changed.
+An identical retry returns the original data with `replayed: true`. OMK rejects a reused key if any input changes.
+
+`do-not-store` is the exception. It replays requests when only the payload, metadata or token hint changes. OMK keeps no fingerprint derived from that data.
 
 Failures are JSON on standard error:
 
@@ -98,7 +100,9 @@ printf '%s' 'credential material' | omk event append \
 
 Use `--metadata-file` for secret metadata. One command cannot read content and metadata from standard input. Put one value in a file.
 
-Secret append and replay results contain redacted content and empty metadata. Only explicit local evidence commands return the exact content. Use `do-not-store` when OMK must not persist the content or metadata.
+Secret append and replay results contain redacted content and empty metadata. Read commands also redact secrets by default.
+
+Pass the intended `--scope` and `--reveal-secret` only when the agent needs exact local evidence. Use `do-not-store` when OMK must not save the content or metadata.
 
 ## Observe new events
 
@@ -154,7 +158,7 @@ The result must include `observations`, `claims`, `continuation` and `ambiguitie
 
 For a non-empty result, `continuation` replaces the previous snapshot. Include all state that still applies from `previousContinuation`.
 
-Commit the result, then reconcile pending claims:
+Commit the result, then review every pending observer claim. The response lists claim IDs in `nextRequiredAction`. Confirm or reject each one:
 
 ```sh
 omk observe commit \
@@ -162,19 +166,21 @@ omk observe commit \
   --input observer-result.json \
   --idempotency-key codex-thread-1-observe-commit-1
 
-omk claim reconcile \
-  --scope thread:build \
-  --idempotency-key codex-thread-1-reconcile-1
+omk claim confirm --id CLAIM_ID --idempotency-key codex-thread-1-confirm-1
+# or
+omk claim reject --id CLAIM_ID --idempotency-key codex-thread-1-reject-1
 ```
+
+`claim reconcile` can classify trusted non-observer pending state, but it intentionally never promotes observer-origin claims.
 
 ## Recover observation work
 
 Inspect runs and stream progress:
 
 ```sh
-omk observe get --run RUN_ID
-omk observe list --stream codex-thread-1 --status pending
-omk observe status --stream codex-thread-1
+omk observe get --scope thread:build --run RUN_ID
+omk observe list --scope thread:build --stream codex-thread-1 --status pending
+omk observe status --scope thread:build --stream codex-thread-1
 omk observe fail --run RUN_ID --reason model-timeout --idempotency-key observe-failure-1
 ```
 
@@ -220,12 +226,18 @@ omk event purge      Delete an event and dependent records.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
+Claims default to `--cardinality single`. This allows one active value for each scope, kind, subject and predicate.
+
+Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident.
+
+Observer-produced claims stay pending, even if the model labels one as an accepted decision. Use a claim command to confirm it. You can promote it only to an ancestor scope.
+
 Recall interpretations and exact evidence:
 
 ```sh
-omk recall explain-claim --id CLAIM_ID
-omk recall observation --id OBSERVATION_ID
-omk recall event-range --stream codex-thread-1 --from 1 --to 20
+omk recall explain-claim --scope thread:build --id CLAIM_ID
+omk recall observation --scope thread:build --id OBSERVATION_ID
+omk recall event-range --scope thread:build --stream codex-thread-1 --from 1 --to 20
 ```
 
 `recall observation` returns the observation and its raw source events.
@@ -247,26 +259,32 @@ Search includes the target scope, its ancestors and its descendants. Context inh
 OMK applies these privacy rules:
 
 - `secret` content and metadata stay out of plans, context and full-text search
-- exact `event get` and event-range recall can return stored secrets at an explicit local evidence boundary
+- read commands require an explicit anchor scope and redact stored secrets unless `--reveal-secret` is also present
 - `do-not-store` creates a sequence marker and discards the content and metadata
 - redacted events cannot support observations or claims
 - event purge removes dependent records and keeps sequence allocation monotonic
 - purged operation results become tombstones, so retries cannot restore deleted data
 - event purge reports `dependentViews`, `dependentViewIds` and `affectedRunIds`
 - event purge also reports affected observations and claims
-- claim purge removes any orphaned command event that contains the request
+- claim and event purge remove owned command events and records derived from them
 
 ## Use the current schema
 
-OMK is pre-1.0 and has no database migrations. It creates and reopens schema v5 databases.
+OMK 0.6 uses schema v6. Existing schema v6 databases reopen without changes.
 
-OMK rejects any other nonzero schema version before it writes schema changes. Use a fresh database path when the development schema changes.
+OMK does not provide migrations before 1.0. It rejects any other nonzero schema version before writing changes. Use a fresh database path for an older schema.
 
 ## Create continuity views
 
-Run an external reflector with the [reflector prompt](prompts/reflector.v1.md). Commit the result with `omk view create --kind continuity`.
+Run an external reflector with the [reflector prompt](prompts/reflector.v1.md). Commit the result with `omk view create --kind continuity --stream STREAM --expected-previous-view VIEW_ID`.
 
-Each view is a new generation linked to the previous view. A failed reflection writes nothing, so the previous view stays active.
+Omit `--expected-previous-view` only for generation 1.
+
+Each stream has its own view chain. Every view links to the exact previous view. A stale commit fails without writing. The previous view stays active after a failed reflection.
+
+OMK 0.6 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure.
+
+`--scope` states the agent's intent and prevents accidental scope leaks. It does not authenticate a process that can choose another scope or read the database.
 
 ## Check the implementation
 

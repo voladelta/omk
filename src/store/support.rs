@@ -150,6 +150,37 @@ pub(super) fn redact_for_agent(mut event: MemoryEvent) -> MemoryEvent {
     event
 }
 
+pub(super) fn apply_read_access(
+    conn: &Connection,
+    access: &ReadAccess,
+    event: MemoryEvent,
+) -> Result<MemoryEvent> {
+    let visible = retrieval_scope_ids(conn, &access.anchor_scope_id)?;
+    ensure!(
+        visible.contains(&event.scope_id),
+        "record is not visible from scope {}",
+        access.anchor_scope_id
+    );
+    Ok(if access.reveal_secrets {
+        event
+    } else {
+        redact_for_agent(event)
+    })
+}
+
+pub(super) fn ensure_read_scope(
+    conn: &Connection,
+    access: &ReadAccess,
+    record_scope_id: &str,
+) -> Result<()> {
+    ensure!(
+        retrieval_scope_ids(conn, &access.anchor_scope_id)?.contains(&record_scope_id.to_owned()),
+        "record is not visible from scope {}",
+        access.anchor_scope_id
+    );
+    Ok(())
+}
+
 pub(super) fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -196,7 +227,7 @@ pub(super) fn prior_result<T: DeserializeOwned>(
     expected_operation: &str,
     expected_request_hash: &str,
 ) -> Result<Option<T>> {
-    let prior: Option<(String, String, Option<String>)> = conn
+    let prior: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT operation,request_hash,result_json FROM memory_operations WHERE idempotency_key=?1",
             [key],
@@ -212,6 +243,8 @@ pub(super) fn prior_result<T: DeserializeOwned>(
     );
     let result_json = result_json
         .ok_or_else(|| anyhow!("the prior result for this idempotency key was privacy-purged"))?;
+    let request_hash = request_hash
+        .ok_or_else(|| anyhow!("the prior request for this idempotency key was privacy-purged"))?;
     ensure!(
         request_hash == expected_request_hash,
         "idempotency conflict: this key was already used with different request input"
@@ -245,10 +278,30 @@ pub(super) fn operation_request_hash(operation: &str, request: &impl Serialize) 
 
 pub(super) fn scrub_operations_referencing(conn: &Connection, record_id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE memory_operations SET result_json=NULL WHERE instr(result_json,?1)>0",
+        "UPDATE memory_operations SET request_hash=NULL,result_json=NULL WHERE instr(result_json,?1)>0",
         [record_id],
     )?;
     Ok(())
+}
+
+pub(super) fn view_successor_ids(conn: &Connection, view_ids: &[String]) -> Result<Vec<String>> {
+    if view_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", view_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH RECURSIVE successors(id) AS (
+            SELECT id FROM memory_views WHERE id IN ({placeholders})
+            UNION
+            SELECT view.id
+            FROM memory_views view
+            JOIN successors parent ON view.previous_view_id=parent.id
+         ) SELECT id FROM successors"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    collect_rows(statement.query_map(rusqlite::params_from_iter(view_ids), |row| row.get(0))?)
 }
 
 pub(super) fn generated_command_source_ids(
@@ -261,35 +314,26 @@ pub(super) fn generated_command_source_ids(
          JOIN claim_sources source ON source.event_id=e.id
          WHERE source.claim_id=?1
            AND e.kind='memory-command'
-           AND json_extract(e.metadata_json,'$.generatedBy')='omk'",
+           AND json_extract(e.metadata_json,'$.generatedBy')='omk'
+           AND json_extract(e.metadata_json,'$.ownerClaimId')=?1",
     )?;
     collect_rows(statement.query_map([claim_id], |row| row.get(0))?)
 }
 
-pub(super) fn purge_orphaned_command_events(
+pub(super) fn set_command_event_owner(
     conn: &Connection,
-    event_ids: &[String],
-) -> Result<usize> {
-    let mut purged = 0;
-    for event_id in event_ids {
-        let referenced: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM claim_sources WHERE event_id=?1)
-                    OR EXISTS(SELECT 1 FROM observation_sources WHERE event_id=?1)",
-            [event_id],
-            |row| row.get(0),
-        )?;
-        if referenced {
-            continue;
-        }
-        conn.execute(
-            "DELETE FROM memory_fts WHERE record_type='event' AND record_id=?1",
-            [event_id],
-        )?;
-        conn.execute("DELETE FROM memory_events WHERE id=?1", [event_id])?;
-        scrub_operations_referencing(conn, event_id)?;
-        purged += 1;
-    }
-    Ok(purged)
+    event_id: &str,
+    claim_id: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE memory_events
+         SET metadata_json=json_set(metadata_json,'$.ownerClaimId',?2)
+         WHERE id=?1 AND kind='memory-command'
+           AND json_extract(metadata_json,'$.generatedBy')='omk'",
+        params![event_id, claim_id],
+    )?;
+    ensure!(changed == 1, "generated command event owner update failed");
+    Ok(())
 }
 
 pub(super) fn insert_fts(
@@ -488,22 +532,20 @@ pub(super) fn insert_memory_command_event(
     Ok(event)
 }
 
-pub(super) fn insert_claim(
-    conn: &Connection,
-    claim: &Claim,
-    origin_run_id: Option<&str>,
-) -> Result<()> {
+pub(super) fn insert_claim(conn: &Connection, claim: &Claim) -> Result<()> {
     conn.execute(
-        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             claim.id,
-            origin_run_id,
+            claim.origin_run_id,
             claim.scope_id,
             enum_text(&claim.kind),
             claim.subject,
             claim.predicate,
+            enum_text(&claim.cardinality),
             claim.value.to_string(),
+            claim.value_hash,
             enum_text(&claim.modality),
             enum_text(&claim.status),
             enum_text(&claim.authority),
@@ -535,6 +577,7 @@ pub(super) fn index_claim(conn: &Connection, claim: &Claim) -> Result<()> {
 pub(super) fn insert_next_view(
     conn: &Connection,
     scope_id: &str,
+    stream_id: &str,
     kind: ViewKind,
     content: &str,
     source_from_sequence: i64,
@@ -544,10 +587,11 @@ pub(super) fn insert_next_view(
     token_count: i64,
 ) -> Result<MemoryView> {
     let kind_text = enum_text(&kind);
-    let previous = latest_view(conn, scope_id, &kind_text)?;
+    let previous = latest_view(conn, stream_id, &kind_text)?;
     let view = MemoryView {
         id: Uuid::new_v4().to_string(),
         scope_id: scope_id.to_owned(),
+        stream_id: stream_id.to_owned(),
         kind,
         generation: previous.as_ref().map_or(1, |view| view.generation + 1),
         content: content.to_owned(),
@@ -560,11 +604,12 @@ pub(super) fn insert_next_view(
         created_at: now(),
     };
     conn.execute(
-        "INSERT INTO memory_views(id,scope_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        "INSERT INTO memory_views(id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             view.id,
             view.scope_id,
+            view.stream_id,
             kind_text,
             view.generation,
             view.content,
@@ -582,14 +627,14 @@ pub(super) fn insert_next_view(
 
 pub(super) fn latest_view(
     conn: &Connection,
-    scope_id: &str,
+    stream_id: &str,
     kind: &str,
 ) -> Result<Option<MemoryView>> {
     Ok(conn
         .query_row(
-            "SELECT id,scope_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
-             FROM memory_views WHERE scope_id=?1 AND kind=?2 ORDER BY generation DESC LIMIT 1",
-            params![scope_id, kind],
+            "SELECT id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
+             FROM memory_views WHERE stream_id=?1 AND kind=?2 ORDER BY generation DESC LIMIT 1",
+            params![stream_id, kind],
             row_view,
         )
         .optional()?)
@@ -607,7 +652,7 @@ pub(super) fn query_claims_for_scopes(
         .collect::<Vec<_>>()
         .join(",");
     let mut sql = format!(
-        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE scope_id IN ({placeholders})"
+        "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE scope_id IN ({placeholders})"
     );
     let mut values = scope_ids.to_vec();
     if let Some(status) = status {
@@ -621,7 +666,7 @@ pub(super) fn query_claims_for_scopes(
 
 pub(super) fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
     conn.query_row(
-        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE id=?1",
+        "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE id=?1",
         [id],
         row_claim,
     )
@@ -629,19 +674,22 @@ pub(super) fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
     .ok_or_else(|| anyhow!("claim {id} does not exist"))
 }
 
-pub(super) fn query_active_logical_claim(
+pub(super) fn query_active_claim_member(
     conn: &Connection,
     scope_id: &str,
     kind: &str,
     subject: &str,
     predicate: &str,
+    cardinality: &ClaimCardinality,
+    value_hash: &str,
 ) -> Result<Option<Claim>> {
     Ok(conn
         .query_row(
-            "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at
-             FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4 AND status='active'
+            "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at
+             FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4
+               AND cardinality=?5 AND (cardinality='single' OR value_hash=?6) AND status='active'
              ORDER BY updated_at DESC LIMIT 1",
-            params![scope_id, kind, subject, predicate],
+            params![scope_id, kind, subject, predicate, enum_text(cardinality), value_hash],
             row_claim,
         )
         .optional()?)
@@ -652,6 +700,9 @@ pub(super) fn supersede_other_active_claims(
     claim: &Claim,
     excluded_id: Option<&str>,
 ) -> Result<()> {
+    if claim.cardinality == ClaimCardinality::Set {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE claims SET status='superseded',updated_at=?1
          WHERE scope_id=?2 AND kind=?3 AND subject=?4 AND predicate=?5 AND status='active'
@@ -665,6 +716,36 @@ pub(super) fn supersede_other_active_claims(
             excluded_id,
         ],
     )?;
+    Ok(())
+}
+
+pub(super) fn ensure_claim_slot(conn: &Connection, claim: &Claim) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO claim_slots(scope_id,kind,subject,predicate,cardinality)
+         VALUES (?1,?2,?3,?4,?5)",
+        params![
+            claim.scope_id,
+            enum_text(&claim.kind),
+            claim.subject,
+            claim.predicate,
+            enum_text(&claim.cardinality),
+        ],
+    )?;
+    let cardinality: String = conn.query_row(
+        "SELECT cardinality FROM claim_slots
+         WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4",
+        params![
+            claim.scope_id,
+            enum_text(&claim.kind),
+            claim.subject,
+            claim.predicate,
+        ],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        cardinality == enum_text(&claim.cardinality),
+        "claim slot already uses {cardinality} cardinality"
+    );
     Ok(())
 }
 
@@ -744,19 +825,6 @@ pub(super) fn copy_claim_sources(
         params![from_claim_id, to_claim_id],
     )?;
     Ok(())
-}
-
-pub(super) fn claim_has_user_event_source(conn: &Connection, claim_id: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM claim_sources s
-            JOIN memory_events e ON e.id=s.event_id
-            WHERE s.claim_id=?1 AND e.kind='user-message'
-              AND e.sensitivity='normal'
-        )",
-        [claim_id],
-        |row| row.get(0),
-    )?)
 }
 
 pub(super) fn query_observations_for_scopes(

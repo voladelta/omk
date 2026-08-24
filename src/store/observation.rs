@@ -96,7 +96,7 @@ impl MemoryStore {
         let visible = visible_scope_ids(&tx, scope_id)?;
         let mut active_claims = query_claims_for_scopes(&tx, &visible, Some("active"))?;
         sort_claims_by_scope(&mut active_claims, &visible);
-        let previous_continuation = latest_view(&tx, scope_id, "continuation")?;
+        let previous_continuation = latest_view(&tx, stream_id, "continuation")?;
         let plan = ObservationPlan {
             run_id,
             scope,
@@ -216,11 +216,14 @@ impl MemoryStore {
         for draft in &result.claims {
             let claim = Claim {
                 id: Uuid::new_v4().to_string(),
+                origin_run_id: Some(run_id.to_owned()),
                 scope_id: run.scope_id.clone(),
                 kind: draft.kind.clone(),
                 subject: draft.subject.trim().to_owned(),
                 predicate: draft.predicate.trim().to_owned(),
+                cardinality: draft.cardinality.clone(),
                 value: draft.value.clone(),
+                value_hash: hash_json(&draft.value),
                 modality: draft.modality.clone(),
                 status: ClaimStatus::Pending,
                 authority: ClaimAuthority::ModelInference,
@@ -229,7 +232,7 @@ impl MemoryStore {
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
             };
-            insert_claim(&tx, &claim, Some(run_id))?;
+            insert_claim(&tx, &claim)?;
             for event_id in &draft.source_event_ids {
                 tx.execute(
                     "INSERT INTO claim_sources(claim_id,event_id) VALUES (?1,?2)",
@@ -242,7 +245,7 @@ impl MemoryStore {
 
         let preserve_continuation = observer_result_is_completely_empty(&result);
         let previous_continuation = preserve_continuation
-            .then(|| latest_view(&tx, &run.scope_id, "continuation"))
+            .then(|| latest_view(&tx, &run.stream_id, "continuation"))
             .transpose()?
             .flatten();
         let (continuation_view, continuation_action) = if let Some(previous) = previous_continuation
@@ -253,6 +256,7 @@ impl MemoryStore {
             let view = insert_next_view(
                 &tx,
                 &run.scope_id,
+                &run.stream_id,
                 ViewKind::Continuation,
                 &continuation_content,
                 run.from_sequence,
@@ -283,6 +287,16 @@ impl MemoryStore {
             "UPDATE observation_runs SET status='committed',ambiguities_json=?2,updated_at=?3,error=NULL WHERE id=?1",
             params![run_id, ambiguities_json, now()],
         )?;
+        let next_required_action = (!claims.is_empty()).then(|| {
+            let claim_ids = claims
+                .iter()
+                .map(|claim| claim.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "review observer claims [{claim_ids}]; explicitly run `omk claim confirm --id <claim-id> --idempotency-key <key>` or `omk claim reject --id <claim-id> --idempotency-key <key>` for each"
+            )
+        });
         let commit = ObservationCommit {
             run_id: run_id.to_owned(),
             observations,
@@ -290,12 +304,7 @@ impl MemoryStore {
             continuation_view,
             continuation_action,
             ambiguities: result.ambiguities,
-            next_required_action: (!result.claims.is_empty()).then(|| {
-                format!(
-                    "omk claim reconcile --scope {} --idempotency-key <key>",
-                    run.scope_id
-                )
-            }),
+            next_required_action,
         };
         save_operation(
             &tx,
@@ -351,8 +360,12 @@ impl MemoryStore {
         Ok(MutationResult::created(result))
     }
 
-    pub fn get_observation_run(&self, run_id: &str) -> Result<ObservationRunInfo> {
-        self.conn
+    pub fn get_observation_run(
+        &self,
+        access: &ReadAccess,
+        run_id: &str,
+    ) -> Result<ObservationRunInfo> {
+        let run = self.conn
             .query_row(
                 "SELECT id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,source_integrity,observer_model,prompt_version,ambiguities_json,error,created_at,updated_at
                  FROM observation_runs WHERE id=?1",
@@ -360,12 +373,14 @@ impl MemoryStore {
                 row_observation_run_info,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("observation run {run_id} does not exist"))
+            .ok_or_else(|| anyhow!("observation run {run_id} does not exist"))?;
+        ensure_read_scope(&self.conn, access, &run.scope_id)?;
+        Ok(run)
     }
 
     pub fn list_observation_runs(
         &self,
-        scope_id: Option<&str>,
+        access: &ReadAccess,
         stream_id: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<ObservationRunInfo>> {
@@ -378,18 +393,20 @@ impl MemoryStore {
         let mut statement = self.conn.prepare(
             "SELECT id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,source_integrity,observer_model,prompt_version,ambiguities_json,error,created_at,updated_at
              FROM observation_runs
-             WHERE (?1 IS NULL OR scope_id=?1)
-               AND (?2 IS NULL OR stream_id=?2)
-               AND (?3 IS NULL OR status=?3)
+             WHERE (?1 IS NULL OR stream_id=?1)
+               AND (?2 IS NULL OR status=?2)
              ORDER BY created_at,id",
         )?;
-        collect_rows(statement.query_map(
-            params![scope_id, stream_id, status],
-            row_observation_run_info,
-        )?)
+        let visible = retrieval_scope_ids(&self.conn, &access.anchor_scope_id)?;
+        Ok(collect_rows(
+            statement.query_map(params![stream_id, status], row_observation_run_info)?,
+        )?
+        .into_iter()
+        .filter(|run| visible.contains(&run.scope_id))
+        .collect())
     }
 
-    pub fn stream_status(&self, stream_id: &str) -> Result<StreamStatus> {
+    pub fn stream_status(&self, access: &ReadAccess, stream_id: &str) -> Result<StreamStatus> {
         let (scope_id, observed_through_sequence, next_sequence): (String, i64, i64) = self
             .conn
             .query_row(
@@ -399,6 +416,7 @@ impl MemoryStore {
             )
             .optional()?
             .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+        ensure_read_scope(&self.conn, access, &scope_id)?;
         let last_sequence = self.conn.query_row(
             "SELECT MAX(sequence) FROM memory_events WHERE stream_id=?1",
             [stream_id],
@@ -410,7 +428,7 @@ impl MemoryStore {
             observed_through_sequence,
             next_sequence,
             last_sequence,
-            runs: self.list_observation_runs(None, Some(stream_id), None)?,
+            runs: self.list_observation_runs(access, Some(stream_id), None)?,
         })
     }
 }

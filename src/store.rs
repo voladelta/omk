@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::model::*;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 mod claim;
 mod context;
@@ -33,11 +33,13 @@ pub struct MemoryStore {
 #[serde(rename_all = "camelCase")]
 pub struct CreateView {
     pub scope_id: String,
+    pub stream_id: String,
     pub kind: ViewKind,
     pub content: String,
     pub source_from_sequence: i64,
     pub source_through_sequence: i64,
     pub source_observation_ids: Vec<String>,
+    pub expected_previous_view_id: Option<String>,
     pub model: Option<String>,
     pub prompt_version: Option<String>,
     pub token_count: Option<i64>,
@@ -161,7 +163,22 @@ impl MemoryStore {
                 .context("occurred-at must be an RFC 3339 timestamp")?;
         }
 
-        let request_hash = operation_request_hash("event.append", &event)?;
+        let request_hash = if event.sensitivity == Sensitivity::DoNotStore {
+            operation_request_hash(
+                "event.append",
+                &json!({
+                    "scopeId": event.scope_id,
+                    "streamId": event.stream_id,
+                    "kind": event.kind,
+                    "actorId": event.actor_id,
+                    "occurredAt": event.occurred_at,
+                    "sensitivity": event.sensitivity,
+                    "idempotencyKey": event.idempotency_key,
+                }),
+            )?
+        } else {
+            operation_request_hash("event.append", &event)?
+        };
         let tx = self.immediate()?;
         if let Some(prior) =
             prior_result::<MemoryEvent>(&tx, &event.idempotency_key, "event.append", &request_hash)?
@@ -266,6 +283,7 @@ impl MemoryStore {
 
     pub fn recall_event_range(
         &self,
+        access: &ReadAccess,
         stream_id: &str,
         from_sequence: i64,
         to_sequence: i64,
@@ -275,18 +293,32 @@ impl MemoryStore {
             to_sequence >= from_sequence,
             "to sequence must be at least from sequence"
         );
-        query_events_range(&self.conn, stream_id, from_sequence, to_sequence)
+        let stream_scope: String = self
+            .conn
+            .query_row(
+                "SELECT scope_id FROM memory_streams WHERE id=?1",
+                [stream_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+        ensure_read_scope(&self.conn, access, &stream_scope)?;
+        query_events_range(&self.conn, stream_id, from_sequence, to_sequence)?
+            .into_iter()
+            .map(|event| apply_read_access(&self.conn, access, event))
+            .collect()
     }
 
-    pub fn get_event(&self, event_id: &str) -> Result<MemoryEvent> {
-        self.conn
+    pub fn get_event(&self, access: &ReadAccess, event_id: &str) -> Result<MemoryEvent> {
+        let event = self.conn
             .query_row(
                 "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json FROM memory_events WHERE id=?1",
                 [event_id],
                 row_event,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("event {event_id} does not exist"))
+            .ok_or_else(|| anyhow!("event {event_id} does not exist"))?;
+        apply_read_access(&self.conn, access, event)
     }
 
     fn immediate(&mut self) -> Result<Transaction<'_>> {
