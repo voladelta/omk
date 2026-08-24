@@ -269,14 +269,7 @@ impl MemoryStore {
     }
 
     pub fn get_scope(&self, id: &str) -> Result<Scope> {
-        self.conn
-            .query_row(
-                "SELECT id,kind,parent_id,name,created_at FROM memory_scopes WHERE id=?1",
-                [id],
-                row_scope,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("scope {id} does not exist"))
+        query_scope(&self.conn, id)
     }
 
     pub fn visible_scope_ids(&self, scope_id: &str) -> Result<Vec<String>> {
@@ -411,13 +404,7 @@ impl MemoryStore {
             to_sequence >= from_sequence,
             "to sequence must be at least from sequence"
         );
-        let mut statement = self.conn.prepare(
-            "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json
-             FROM memory_events WHERE stream_id=?1 AND sequence BETWEEN ?2 AND ?3 ORDER BY sequence",
-        )?;
-        collect_rows(
-            statement.query_map(params![stream_id, from_sequence, to_sequence], row_event)?,
-        )
+        query_events_range(&self.conn, stream_id, from_sequence, to_sequence)
     }
 
     pub fn get_event(&self, event_id: &str) -> Result<MemoryEvent> {
@@ -1282,10 +1269,6 @@ impl MemoryStore {
     }
 
     pub fn create_view(&mut self, input: CreateView) -> Result<MutationResult<MemoryView>> {
-        ensure!(
-            matches!(input.kind, ViewKind::Continuity | ViewKind::Continuation),
-            "the first implementation supports only continuity and continuation views"
-        );
         validate_nonempty("view content", &input.content)?;
         validate_nonempty("idempotency key", &input.idempotency_key)?;
         ensure!(
@@ -1326,7 +1309,6 @@ impl MemoryStore {
         let token_count = input.token_count.map_or(estimated_token_count, |count| {
             count.max(estimated_token_count)
         });
-        ensure!(token_count >= 0, "view token count cannot be negative");
         let view = insert_next_view(
             &tx,
             &input.scope_id,
@@ -1705,13 +1687,11 @@ impl MemoryStore {
             "SELECT observation_id FROM observation_sources WHERE event_id=?1",
             event_id,
         )?;
-        let mut claim_ids = query_string_column(
+        let claim_ids = query_string_column(
             &tx,
             "SELECT claim_id FROM claim_sources WHERE event_id=?1",
             event_id,
         )?;
-        claim_ids.sort();
-        claim_ids.dedup();
         let mut purged_view_ids = HashSet::new();
         for claim_id in &claim_ids {
             tx.execute(
