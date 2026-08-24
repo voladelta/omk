@@ -3,16 +3,13 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use omk::{
-    ClaimKind, ClaimStatus, ContextBundle, EventKind, MemoryStore, MutationResult, NewEvent,
-    ObserverResult, SCHEMA_VERSION, ScopeKind, Sensitivity, ViewKind, store::CreateView,
+    ClaimKind, ClaimStatus, EventKind, MemoryStore, MutationResult, NewEvent, ObserverResult,
+    SCHEMA_VERSION, ScopeKind, Sensitivity, ViewKind, store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,17 +17,13 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
     version,
     arg_required_else_help = true,
     about = "Local-first observational memory for agents",
-    long_about = "Store immutable agent history, derive source-backed observations and claims, compose bounded context, and recover exact evidence. All command output is JSON unless --format markdown is selected.",
+    long_about = "Store immutable agent history, derive source-backed observations and claims, compose bounded context, and recover exact evidence. All command output is compact JSON.",
     after_help = "Examples:\n  omk init\n  omk event append --scope thread:build --stream codex-1 --kind user-message --content 'Continue the implementation' --idempotency-key codex-1-event-42\n  omk observe plan --scope thread:build --stream codex-1 --model codex --idempotency-key codex-1-plan-1"
 )]
 struct Cli {
     /// SQLite database path.
     #[arg(long, env = "OMK_DB", default_value = ".omk/memory.db", global = true)]
     db: PathBuf,
-
-    /// Emit compact JSON instead of indented JSON.
-    #[arg(long, global = true)]
-    compact: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -124,7 +117,7 @@ enum EventCommand {
         #[arg(long)]
         token_count: Option<i64>,
         #[arg(long, default_value = "normal")]
-        /// Storage/privacy mode: normal, private, secret, or do-not-store.
+        /// Storage/privacy mode: normal, secret, or do-not-store.
         sensitivity: Sensitivity,
         /// JSON object metadata. Do not use this flag for secret metadata.
         #[arg(long, conflicts_with = "metadata_file")]
@@ -134,15 +127,6 @@ enum EventCommand {
         metadata_file: Option<PathBuf>,
         #[arg(long)]
         idempotency_key: String,
-    },
-    /// Return exact local evidence for an inclusive stream sequence range.
-    Range {
-        #[arg(long)]
-        stream: String,
-        #[arg(long)]
-        from: i64,
-        #[arg(long)]
-        to: i64,
     },
     /// Return one exact local event by UUID, including stored secret content.
     Get {
@@ -185,7 +169,7 @@ enum ObserveCommand {
     },
     /// Validate and atomically commit a strict ObserverResult JSON object.
     #[command(
-        after_help = "Input must match prompts/observer.v1.md. Read runId from observe plan output at .data.runId."
+        after_help = "Read the run UUID from observe plan output at .data.runId. The input is this exact JSON shape; do not include runId in the object:\n\n  {\n    \"observations\": [{\n      \"kind\": \"decision\",\n      \"content\": \"Concrete source-backed statement\",\n      \"importance\": 0.9,\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"],\n      \"eventTimeFrom\": null,\n      \"eventTimeTo\": null\n    }],\n    \"claims\": [{\n      \"kind\": \"decision\",\n      \"subject\": \"subject\",\n      \"predicate\": \"predicate\",\n      \"value\": \"any JSON value\",\n      \"modality\": \"explicit-assertion\",\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"]\n    }],\n    \"continuation\": {\n      \"currentTask\": null,\n      \"completed\": [],\n      \"blockers\": [],\n      \"nextActions\": [],\n      \"unresolvedQuestions\": []\n    },\n    \"ambiguities\": [],\n    \"emptyReason\": null\n  }\n\nAllowed observation kinds: event, decision, outcome, failure, constraint, preference, open-loop, relationship, continuation.\nAllowed claim kinds: fact, preference, decision, goal, commitment, constraint, open-loop, entity-alias, relationship, hypothesis.\nAllowed modalities: explicit-assertion, accepted-decision, proposal, inference, observation.\n\nEvery observation, claim, and ambiguity must cite one or more event UUIDs from the plan. For a non-empty result, continuation completely replaces the previous snapshot. If observations, claims, and ambiguities are all empty, send the empty continuation shown above and a concrete non-empty emptyReason; the kernel then preserves the previous continuation."
     )]
     Commit {
         #[arg(long)]
@@ -398,12 +382,6 @@ enum RecallCommand {
     },
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-enum OutputFormat {
-    Json,
-    Markdown,
-}
-
 #[derive(Debug, Args)]
 struct ContextArgs {
     #[arg(long)]
@@ -416,8 +394,6 @@ struct ContextArgs {
     recent_raw_tokens: i64,
     #[arg(long)]
     query: Option<String>,
-    #[arg(long, default_value = "json")]
-    format: OutputFormat,
 }
 
 fn main() {
@@ -456,12 +432,9 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     let mut store = MemoryStore::open(&cli.db)?;
     match cli.command {
-        Command::Init => print_json(
-            &MutationResult::created(
-                json!({"database": cli.db, "schemaVersion": SCHEMA_VERSION, "ready": true}),
-            ),
-            cli.compact,
-        )?,
+        Command::Init => print_json(&MutationResult::created(
+            json!({"database": cli.db, "schemaVersion": SCHEMA_VERSION, "ready": true}),
+        ))?,
         Command::Scope { command } => match command {
             ScopeCommand::Add {
                 id,
@@ -469,17 +442,14 @@ fn run(cli: Cli) -> Result<()> {
                 parent,
                 name,
                 idempotency_key,
-            } => print_json(
-                &store.create_scope(
-                    &id,
-                    kind,
-                    parent.as_deref(),
-                    name.as_deref(),
-                    &idempotency_key,
-                )?,
-                cli.compact,
-            )?,
-            ScopeCommand::List => print_json(&store.list_scopes()?, cli.compact)?,
+            } => print_json(&store.create_scope(
+                &id,
+                kind,
+                parent.as_deref(),
+                name.as_deref(),
+                &idempotency_key,
+            )?)?,
+            ScopeCommand::List => print_json(&store.list_scopes()?)?,
         },
         Command::Event { command } => match command {
             EventCommand::Append {
@@ -526,30 +496,24 @@ fn run(cli: Cli) -> Result<()> {
                 };
                 let metadata: Value = serde_json::from_str(&raw_metadata)
                     .context("event metadata must be valid JSON")?;
-                print_json(
-                    &store.append_event(NewEvent {
-                        scope_id: scope,
-                        stream_id: stream,
-                        kind,
-                        actor_id: actor,
-                        occurred_at,
-                        content,
-                        token_count,
-                        sensitivity,
-                        metadata,
-                        idempotency_key,
-                    })?,
-                    cli.compact,
-                )?;
+                print_json(&store.append_event(NewEvent {
+                    scope_id: scope,
+                    stream_id: stream,
+                    kind,
+                    actor_id: actor,
+                    occurred_at,
+                    content,
+                    token_count,
+                    sensitivity,
+                    metadata,
+                    idempotency_key,
+                })?)?;
             }
-            EventCommand::Range { stream, from, to } => {
-                print_json(&store.recall_event_range(&stream, from, to)?, cli.compact)?
-            }
-            EventCommand::Get { id } => print_json(&store.get_event(&id)?, cli.compact)?,
+            EventCommand::Get { id } => print_json(&store.get_event(&id)?)?,
             EventCommand::Purge {
                 id,
                 idempotency_key,
-            } => print_json(&store.purge_event(&id, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.purge_event(&id, &idempotency_key)?)?,
         },
         Command::Observe { command } => match command {
             ObserveCommand::Plan {
@@ -559,17 +523,14 @@ fn run(cli: Cli) -> Result<()> {
                 model,
                 prompt_version,
                 idempotency_key,
-            } => print_json(
-                &store.plan_observation(
-                    &scope,
-                    &stream,
-                    max_tokens,
-                    &model,
-                    &prompt_version,
-                    &idempotency_key,
-                )?,
-                cli.compact,
-            )?,
+            } => print_json(&store.plan_observation(
+                &scope,
+                &stream,
+                max_tokens,
+                &model,
+                &prompt_version,
+                &idempotency_key,
+            )?)?,
             ObserveCommand::Commit {
                 run,
                 input,
@@ -578,110 +539,89 @@ fn run(cli: Cli) -> Result<()> {
                 let raw = read_path_or_stdin(input.as_deref())?;
                 let result: ObserverResult =
                     serde_json::from_str(&raw).context("parsing strict ObserverResult JSON")?;
-                print_json(
-                    &store.commit_observation(&run, result, &idempotency_key)?,
-                    cli.compact,
-                )?;
+                print_json(&store.commit_observation(&run, result, &idempotency_key)?)?;
             }
             ObserveCommand::Fail {
                 run,
                 reason,
                 idempotency_key,
-            } => print_json(
-                &store.fail_observation(&run, &reason, &idempotency_key)?,
-                cli.compact,
-            )?,
+            } => print_json(&store.fail_observation(&run, &reason, &idempotency_key)?)?,
             ObserveCommand::Get { run } => {
-                print_json(&store.get_observation_run(&run)?, cli.compact)?;
+                print_json(&store.get_observation_run(&run)?)?;
             }
             ObserveCommand::List {
                 scope,
                 stream,
                 status,
-            } => print_json(
-                &store.list_observation_runs(
-                    scope.as_deref(),
-                    stream.as_deref(),
-                    status.as_deref(),
-                )?,
-                cli.compact,
-            )?,
+            } => print_json(&store.list_observation_runs(
+                scope.as_deref(),
+                stream.as_deref(),
+                status.as_deref(),
+            )?)?,
             ObserveCommand::Status { stream } => {
-                print_json(&store.stream_status(&stream)?, cli.compact)?;
+                print_json(&store.stream_status(&stream)?)?;
             }
         },
         Command::Claim { command } => match command {
-            ClaimCommand::Remember(args) => print_json(
-                &store.remember_claim(
-                    &args.scope,
-                    args.kind,
-                    &args.subject,
-                    &args.predicate,
-                    parse_json_or_string(&args.value),
-                    &args.source_events,
-                    &args.idempotency_key,
-                )?,
-                cli.compact,
-            )?,
-            ClaimCommand::Propose(args) => print_json(
-                &store.propose_claim(
-                    &args.scope,
-                    args.kind,
-                    &args.subject,
-                    &args.predicate,
-                    parse_json_or_string(&args.value),
-                    &args.source_events,
-                    &args.idempotency_key,
-                )?,
-                cli.compact,
-            )?,
+            ClaimCommand::Remember(args) => print_json(&store.remember_claim(
+                &args.scope,
+                args.kind,
+                &args.subject,
+                &args.predicate,
+                parse_json_or_string(&args.value),
+                &args.source_events,
+                &args.idempotency_key,
+            )?)?,
+            ClaimCommand::Propose(args) => print_json(&store.propose_claim(
+                &args.scope,
+                args.kind,
+                &args.subject,
+                &args.predicate,
+                parse_json_or_string(&args.value),
+                &args.source_events,
+                &args.idempotency_key,
+            )?)?,
             ClaimCommand::Confirm {
                 id,
                 idempotency_key,
-            } => print_json(&store.confirm_claim(&id, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.confirm_claim(&id, &idempotency_key)?)?,
             ClaimCommand::Correct {
                 id,
                 value,
                 source_events,
                 idempotency_key,
-            } => print_json(
-                &store.correct_claim(
-                    &id,
-                    parse_json_or_string(&value),
-                    &source_events,
-                    &idempotency_key,
-                )?,
-                cli.compact,
-            )?,
+            } => print_json(&store.correct_claim(
+                &id,
+                parse_json_or_string(&value),
+                &source_events,
+                &idempotency_key,
+            )?)?,
             ClaimCommand::Rescope {
                 id,
                 scope,
                 idempotency_key,
-            } => print_json(
-                &store.rescope_claim(&id, &scope, &idempotency_key)?,
-                cli.compact,
-            )?,
+            } => print_json(&store.rescope_claim(&id, &scope, &idempotency_key)?)?,
             ClaimCommand::Reject {
                 id,
                 idempotency_key,
-            } => print_json(&store.reject_claim(&id, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.reject_claim(&id, &idempotency_key)?)?,
             ClaimCommand::Forget {
                 id,
                 idempotency_key,
-            } => print_json(&store.forget_claim(&id, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.forget_claim(&id, &idempotency_key)?)?,
             ClaimCommand::Purge {
                 id,
                 idempotency_key,
-            } => print_json(&store.purge_claim(&id, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.purge_claim(&id, &idempotency_key)?)?,
             ClaimCommand::Reconcile {
                 scope,
                 idempotency_key,
-            } => print_json(&store.reconcile(&scope, &idempotency_key)?, cli.compact)?,
+            } => print_json(&store.reconcile(&scope, &idempotency_key)?)?,
             ClaimCommand::List {
                 scope,
                 ancestors,
                 status,
-            } => print_json(&store.list_claims(&scope, ancestors, status)?, cli.compact)?,
+            } => print_json(&store.list_claims(&scope, ancestors, status)?)?,
         },
         Command::View { command } => match command {
             ViewCommand::Create {
@@ -698,32 +638,29 @@ fn run(cli: Cli) -> Result<()> {
                 idempotency_key,
             } => {
                 let content = read_inline_or_file(content, content_file.as_deref())?;
-                print_json(
-                    &store.create_view(CreateView {
-                        scope_id: scope,
-                        kind,
-                        content,
-                        source_from_sequence: from,
-                        source_through_sequence: through,
-                        source_observation_ids: source_observations,
-                        model,
-                        prompt_version,
-                        token_count,
-                        idempotency_key,
-                    })?,
-                    cli.compact,
-                )?;
+                print_json(&store.create_view(CreateView {
+                    scope_id: scope,
+                    kind,
+                    content,
+                    source_from_sequence: from,
+                    source_through_sequence: through,
+                    source_observation_ids: source_observations,
+                    model,
+                    prompt_version,
+                    token_count,
+                    idempotency_key,
+                })?)?;
             }
             ViewCommand::List { scope } => {
-                print_json(&store.list_views(&scope)?, cli.compact)?;
+                print_json(&store.list_views(&scope)?)?;
             }
         },
         Command::Recall { command } => match command {
             RecallCommand::Observation { id } => {
-                print_json(&store.explain_observation(&id)?, cli.compact)?;
+                print_json(&store.explain_observation(&id)?)?;
             }
             RecallCommand::EventRange { stream, from, to } => {
-                print_json(&store.recall_event_range(&stream, from, to)?, cli.compact)?
+                print_json(&store.recall_event_range(&stream, from, to)?)?
             }
             RecallCommand::Search {
                 scope,
@@ -736,10 +673,10 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     store.search_full_text(&scope, &query, limit)?
                 };
-                print_json(&hits, cli.compact)?;
+                print_json(&hits)?;
             }
             RecallCommand::ExplainClaim { id } => {
-                print_json(&store.explain_claim(&id)?, cli.compact)?;
+                print_json(&store.explain_claim(&id)?)?;
             }
         },
         Command::Context(args) => {
@@ -750,21 +687,14 @@ fn run(cli: Cli) -> Result<()> {
                 args.recent_raw_tokens,
                 args.query.as_deref(),
             )?;
-            match args.format {
-                OutputFormat::Json => print_json(&bundle, cli.compact)?,
-                OutputFormat::Markdown => print!("{}", render_markdown(&bundle)),
-            }
+            print_json(&bundle)?;
         }
     }
     Ok(())
 }
 
-fn print_json(value: &impl Serialize, compact: bool) -> Result<()> {
-    if compact {
-        println!("{}", serde_json::to_string(value)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    }
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
     Ok(())
 }
 
@@ -794,91 +724,6 @@ fn read_path_or_stdin(path: Option<&Path>) -> Result<String> {
 
 fn parse_json_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
-}
-
-fn enum_label(value: &impl Serialize) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
-fn render_markdown(bundle: &ContextBundle) -> String {
-    let mut output = String::new();
-    if !bundle.claims.is_empty() {
-        output.push_str("<active-claims>\n");
-        for claim in &bundle.claims {
-            output.push_str(&format!(
-                "- [{}] {} {} {} (claim: {})\n",
-                enum_label(&claim.kind),
-                claim.subject,
-                claim.predicate,
-                claim.value,
-                claim.id
-            ));
-        }
-        output.push_str("</active-claims>\n\n");
-    }
-    if !bundle.pending_claims.is_empty() {
-        output.push_str("<pending-claims>\n");
-        for claim in &bundle.pending_claims {
-            output.push_str(&format!(
-                "- [{}; {}] {} {} {} (claim: {})\n",
-                enum_label(&claim.kind),
-                enum_label(&claim.status),
-                claim.subject,
-                claim.predicate,
-                claim.value,
-                claim.id
-            ));
-        }
-        output.push_str("</pending-claims>\n\n");
-    }
-    for view in &bundle.continuity_views {
-        output.push_str(&format!(
-            "<memory-view kind=\"{}\" id=\"{}\">\n{}\n</memory-view>\n\n",
-            enum_label(&view.kind),
-            view.id,
-            view.content
-        ));
-    }
-    if !bundle.observations.is_empty() {
-        output.push_str("<observations>\n");
-        for observation in &bundle.observations {
-            output.push_str(&format!(
-                "- {} (observation: {})\n",
-                observation.content, observation.id
-            ));
-        }
-        output.push_str("</observations>\n\n");
-    }
-    if !bundle.recent_events.is_empty() {
-        output.push_str("<recent-events>\n");
-        for event in &bundle.recent_events {
-            output.push_str(&format!(
-                "- #{} [{}] {}\n",
-                event.sequence,
-                enum_label(&event.kind),
-                event.content
-            ));
-        }
-        output.push_str("</recent-events>\n\n");
-    }
-    if !bundle.recalled_evidence.is_empty() {
-        output.push_str("<recalled-evidence>\n");
-        for event in &bundle.recalled_evidence {
-            output.push_str(&format!(
-                "- {} #{}: {}\n",
-                event.stream_id, event.sequence, event.content
-            ));
-        }
-        output.push_str("</recalled-evidence>\n\n");
-    }
-    output.push_str(&format!(
-        "<!-- estimated-memory-tokens: {} -->\n",
-        bundle.diagnostics.estimated_tokens
-    ));
-    output
 }
 
 fn classify_error(message: &str) -> (&'static str, bool, bool, Option<&'static str>) {

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::model::*;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memory_scopes (
@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS memory_events (
     token_count INTEGER NOT NULL CHECK (token_count >= 0),
     sensitivity TEXT NOT NULL,
     metadata_json TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL UNIQUE,
     UNIQUE(stream_id, sequence)
 );
 
@@ -56,7 +55,7 @@ CREATE TABLE IF NOT EXISTS observation_runs (
     cursor_at_plan INTEGER NOT NULL DEFAULT 0,
     from_sequence INTEGER NOT NULL,
     to_sequence INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending','running','committed','failed','stale')),
+    status TEXT NOT NULL CHECK (status IN ('pending','committed','failed','stale')),
     source_integrity TEXT NOT NULL DEFAULT 'intact' CHECK (source_integrity IN ('intact','privacy-purged')),
     observer_model TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
@@ -104,9 +103,6 @@ CREATE TABLE IF NOT EXISTS claims (
     status TEXT NOT NULL,
     authority TEXT NOT NULL,
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-    valid_from TEXT,
-    valid_to TEXT,
-    expires_at TEXT,
     supersedes_id TEXT REFERENCES claims(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -117,15 +113,9 @@ ON claims(scope_id, kind, subject, predicate, status);
 
 CREATE TABLE IF NOT EXISTS claim_sources (
     claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
-    observation_id TEXT REFERENCES observations(id) ON DELETE CASCADE,
-    event_id TEXT REFERENCES memory_events(id) ON DELETE CASCADE,
-    CHECK ((observation_id IS NULL) != (event_id IS NULL))
+    event_id TEXT NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
+    PRIMARY KEY(claim_id, event_id)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS unique_claim_observation_source
-ON claim_sources(claim_id, observation_id) WHERE observation_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS unique_claim_event_source
-ON claim_sources(claim_id, event_id) WHERE event_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS memory_views (
     id TEXT PRIMARY KEY,
@@ -160,9 +150,7 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
     request_hash TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    purged INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    result_json TEXT
 );
 "#;
 
@@ -374,8 +362,8 @@ impl MemoryStore {
             metadata: stored_metadata,
         };
         tx.execute(
-            "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json,idempotency_key)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 stored.id,
                 stored.stream_id,
@@ -390,13 +378,9 @@ impl MemoryStore {
                 stored.token_count,
                 enum_text(&stored.sensitivity),
                 stored.metadata.to_string(),
-                event.idempotency_key,
             ],
         )?;
-        if matches!(
-            stored.sensitivity,
-            Sensitivity::Normal | Sensitivity::Private
-        ) {
+        if stored.sensitivity == Sensitivity::Normal {
             insert_fts(
                 &tx,
                 "event",
@@ -588,7 +572,7 @@ impl MemoryStore {
         }
         let run = query_run(&tx, run_id)?;
         ensure!(
-            matches!(run.status.as_str(), "pending" | "running"),
+            run.status == "pending",
             "observation run {run_id} is {}, not pending",
             run.status
         );
@@ -617,11 +601,6 @@ impl MemoryStore {
             .collect();
         validate_provenance(&result, &sources_by_id)?;
         let timestamp = now();
-        tx.execute(
-            "UPDATE observation_runs SET status='running',updated_at=?2 WHERE id=?1",
-            params![run_id, timestamp],
-        )?;
-
         let mut observations = Vec::with_capacity(result.observations.len());
         for draft in &result.observations {
             let mut sequences: Vec<i64> = draft
@@ -676,9 +655,6 @@ impl MemoryStore {
                 status: ClaimStatus::Pending,
                 authority: ClaimAuthority::ModelInference,
                 confidence: draft.confidence,
-                valid_from: draft.valid_from.clone(),
-                valid_to: draft.valid_to.clone(),
-                expires_at: draft.expires_at.clone(),
                 supersedes_id: None,
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
@@ -785,7 +761,7 @@ impl MemoryStore {
         }
         let run = query_run(&tx, run_id)?;
         ensure!(
-            matches!(run.status.as_str(), "pending" | "running"),
+            run.status == "pending",
             "observation run {run_id} is {}, not pending",
             run.status
         );
@@ -825,10 +801,7 @@ impl MemoryStore {
     ) -> Result<Vec<ObservationRunInfo>> {
         if let Some(status) = status {
             ensure!(
-                matches!(
-                    status,
-                    "pending" | "running" | "committed" | "failed" | "stale"
-                ),
+                matches!(status, "pending" | "committed" | "failed" | "stale"),
                 "invalid observation run status {status}"
             );
         }
@@ -1000,9 +973,6 @@ impl MemoryStore {
             status,
             authority,
             confidence: 1.0,
-            valid_from: None,
-            valid_to: None,
-            expires_at: None,
             supersedes_id: None,
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -1098,9 +1068,6 @@ impl MemoryStore {
             status: ClaimStatus::Active,
             authority: ClaimAuthority::ExplicitUser,
             confidence: 1.0,
-            valid_from: None,
-            valid_to: None,
-            expires_at: None,
             supersedes_id: Some(old.id),
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -1431,26 +1398,15 @@ impl MemoryStore {
 
     pub fn explain_claim(&self, claim_id: &str) -> Result<ClaimExplanation> {
         let claim = query_claim(&self.conn, claim_id)?;
-        let mut observations_statement = self.conn.prepare(
-            "SELECT o.id,o.run_id,o.scope_id,o.kind,o.content,o.importance,o.confidence,o.event_time_from,o.event_time_to,o.source_start_sequence,o.source_end_sequence,o.observer_model,o.prompt_version,o.created_at
-             FROM observations o JOIN claim_sources s ON s.observation_id=o.id
-             WHERE s.claim_id=?1 ORDER BY o.created_at,o.id",
-        )?;
-        let source_observations =
-            collect_rows(observations_statement.query_map([claim_id], row_observation)?)?;
         let mut events_statement = self.conn.prepare(
             "SELECT DISTINCT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
-             FROM memory_events e
-             LEFT JOIN claim_sources direct ON direct.event_id=e.id AND direct.claim_id=?1
-             LEFT JOIN observation_sources os ON os.event_id=e.id
-             LEFT JOIN claim_sources via_observation ON via_observation.observation_id=os.observation_id AND via_observation.claim_id=?1
-             WHERE direct.claim_id IS NOT NULL OR via_observation.claim_id IS NOT NULL
+             FROM memory_events e JOIN claim_sources source ON source.event_id=e.id
+             WHERE source.claim_id=?1
              ORDER BY e.stream_id,e.sequence",
         )?;
         let source_events = collect_rows(events_statement.query_map([claim_id], row_event)?)?;
         Ok(ClaimExplanation {
             claim,
-            source_observations,
             source_events,
         })
     }
@@ -1754,13 +1710,6 @@ impl MemoryStore {
             "SELECT claim_id FROM claim_sources WHERE event_id=?1",
             event_id,
         )?;
-        for observation_id in &observation_ids {
-            claim_ids.extend(query_string_column(
-                &tx,
-                "SELECT claim_id FROM claim_sources WHERE observation_id=?1",
-                observation_id,
-            )?);
-        }
         claim_ids.sort();
         claim_ids.dedup();
         let mut purged_view_ids = HashSet::new();
@@ -1824,10 +1773,10 @@ impl MemoryStore {
         };
         tx.execute(
             "UPDATE observation_runs
-             SET status=CASE WHEN status IN ('pending','running') THEN 'stale' ELSE status END,
+             SET status=CASE WHEN status='pending' THEN 'stale' ELSE status END,
                  source_integrity='privacy-purged',
                  ambiguities_json='[]',
-                 error=CASE WHEN status IN ('pending','running') THEN 'source evidence privacy-purged' ELSE error END,
+                 error=CASE WHEN status='pending' THEN 'source evidence privacy-purged' ELSE error END,
                  updated_at=?1
              WHERE stream_id=?2 AND from_sequence<=?3 AND to_sequence>=?3",
             params![now(), event.0, event.1],
@@ -1982,10 +1931,7 @@ fn validate_provenance(
             .get(event_id)
             .ok_or_else(|| anyhow!("source event {event_id} is not in the observation run"))?;
         ensure!(
-            matches!(
-                event.sensitivity,
-                Sensitivity::Normal | Sensitivity::Private
-            ),
+            event.sensitivity == Sensitivity::Normal,
             "redacted event {event_id} cannot source derived memory"
         );
     }
@@ -2056,24 +2002,22 @@ fn prior_result<T: DeserializeOwned>(
     expected_operation: &str,
     expected_request_hash: &str,
 ) -> Result<Option<T>> {
-    let prior: Option<(String, String, String, bool)> = conn
+    let prior: Option<(String, String, Option<String>)> = conn
         .query_row(
-            "SELECT operation,request_hash,result_json,purged FROM memory_operations WHERE idempotency_key=?1",
+            "SELECT operation,request_hash,result_json FROM memory_operations WHERE idempotency_key=?1",
             [key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((operation, request_hash, result_json, purged)) = prior else {
+    let Some((operation, request_hash, result_json)) = prior else {
         return Ok(None);
     };
     ensure!(
         operation == expected_operation,
         "idempotency key was already used for {operation}, not {expected_operation}"
     );
-    ensure!(
-        !purged,
-        "the prior result for this idempotency key was privacy-purged"
-    );
+    let result_json = result_json
+        .ok_or_else(|| anyhow!("the prior result for this idempotency key was privacy-purged"))?;
     ensure!(
         request_hash == expected_request_hash,
         "idempotency conflict: this key was already used with different request input"
@@ -2091,8 +2035,8 @@ fn save_operation<T: Serialize + ?Sized>(
     result: &T,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json,created_at) VALUES (?1,?2,?3,?4,?5)",
-        params![key, operation, request_hash, serde_json::to_string(result)?, now()],
+        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json) VALUES (?1,?2,?3,?4)",
+        params![key, operation, request_hash, serde_json::to_string(result)?],
     )?;
     Ok(())
 }
@@ -2107,7 +2051,7 @@ fn operation_request_hash(operation: &str, request: &impl Serialize) -> Result<S
 
 fn scrub_operations_referencing(conn: &Connection, record_id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE memory_operations SET result_json='{}',purged=1 WHERE instr(result_json,?1)>0",
+        "UPDATE memory_operations SET result_json=NULL WHERE instr(result_json,?1)>0",
         [record_id],
     )?;
     Ok(())
@@ -2308,8 +2252,8 @@ fn insert_memory_command_event(
         metadata: json!({"generatedBy": "omk"}),
     };
     conn.execute(
-        "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json,idempotency_key)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             event.id,
             event.stream_id,
@@ -2324,7 +2268,6 @@ fn insert_memory_command_event(
             event.token_count,
             enum_text(&event.sensitivity),
             event.metadata.to_string(),
-            format!("internal-memory-command:{}", event.id),
         ],
     )?;
     insert_fts(
@@ -2339,8 +2282,8 @@ fn insert_memory_command_event(
 
 fn insert_claim(conn: &Connection, claim: &Claim, origin_run_id: Option<&str>) -> Result<()> {
     conn.execute(
-        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,valid_from,valid_to,expires_at,supersedes_id,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             claim.id,
             origin_run_id,
@@ -2353,9 +2296,6 @@ fn insert_claim(conn: &Connection, claim: &Claim, origin_run_id: Option<&str>) -
             enum_text(&claim.status),
             enum_text(&claim.authority),
             claim.confidence,
-            claim.valid_from,
-            claim.valid_to,
-            claim.expires_at,
             claim.supersedes_id,
             claim.created_at,
             claim.updated_at,
@@ -2452,7 +2392,7 @@ fn query_claims_for_scopes(
         .collect::<Vec<_>>()
         .join(",");
     let mut sql = format!(
-        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,valid_from,valid_to,expires_at,supersedes_id,created_at,updated_at FROM claims WHERE scope_id IN ({placeholders})"
+        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE scope_id IN ({placeholders})"
     );
     let mut values = scope_ids.to_vec();
     if let Some(status) = status {
@@ -2466,7 +2406,7 @@ fn query_claims_for_scopes(
 
 fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
     conn.query_row(
-        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,valid_from,valid_to,expires_at,supersedes_id,created_at,updated_at FROM claims WHERE id=?1",
+        "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE id=?1",
         [id],
         row_claim,
     )
@@ -2483,7 +2423,7 @@ fn query_active_logical_claim(
 ) -> Result<Option<Claim>> {
     Ok(conn
         .query_row(
-            "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,valid_from,valid_to,expires_at,supersedes_id,created_at,updated_at
+            "SELECT id,scope_id,kind,subject,predicate,value_json,modality,status,authority,confidence,supersedes_id,created_at,updated_at
              FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4 AND status='active'
              ORDER BY updated_at DESC LIMIT 1",
             params![scope_id, kind, subject, predicate],
@@ -2533,7 +2473,7 @@ fn validate_claim_event_sources(
             "source event {event_id} from scope {event_scope} is not visible to scope {scope_id}"
         );
         ensure!(
-            matches!(sensitivity.as_str(), "normal" | "private"),
+            sensitivity == "normal",
             "redacted event {event_id} cannot source a claim"
         );
     }
@@ -2551,11 +2491,6 @@ fn validate_existing_claim_sources_visible(
             "SELECT e.scope_id
              FROM claim_sources source
              JOIN memory_events e ON e.id=source.event_id
-             WHERE source.claim_id=?1
-             UNION
-             SELECT observation.scope_id
-             FROM claim_sources source
-             JOIN observations observation ON observation.id=source.observation_id
              WHERE source.claim_id=?1",
         )?;
         collect_rows(statement.query_map([claim_id], |row| row.get::<_, String>(0))?)?
@@ -2581,8 +2516,8 @@ fn attach_event_sources(conn: &Connection, claim_id: &str, event_ids: &[String])
 
 fn copy_claim_sources(conn: &Connection, from_claim_id: &str, to_claim_id: &str) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO claim_sources(claim_id,observation_id,event_id)
-         SELECT ?2,observation_id,event_id FROM claim_sources WHERE claim_id=?1",
+        "INSERT OR IGNORE INTO claim_sources(claim_id,event_id)
+         SELECT ?2,event_id FROM claim_sources WHERE claim_id=?1",
         params![from_claim_id, to_claim_id],
     )?;
     Ok(())
@@ -2594,7 +2529,7 @@ fn claim_has_user_event_source(conn: &Connection, claim_id: &str) -> Result<bool
             SELECT 1 FROM claim_sources s
             JOIN memory_events e ON e.id=s.event_id
             WHERE s.claim_id=?1 AND e.kind='user-message'
-              AND e.sensitivity IN ('normal','private')
+              AND e.sensitivity='normal'
         )",
         [claim_id],
         |row| row.get(0),
@@ -2747,12 +2682,9 @@ fn row_claim(row: &Row<'_>) -> rusqlite::Result<Claim> {
         status: parse_enum(&row.get::<_, String>(7)?)?,
         authority: parse_enum(&row.get::<_, String>(8)?)?,
         confidence: row.get(9)?,
-        valid_from: row.get(10)?,
-        valid_to: row.get(11)?,
-        expires_at: row.get(12)?,
-        supersedes_id: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        supersedes_id: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 

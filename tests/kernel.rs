@@ -4,6 +4,17 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+fn table_columns(connection: &Connection, table: &str) -> Vec<(String, i64, i64)> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(1)?, row.get(3)?, row.get(5)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 struct Fixture {
     _directory: TempDir,
     store: MemoryStore,
@@ -70,9 +81,6 @@ fn observer_result(event_id: &str, value: &str) -> ObserverResult {
             modality: ClaimModality::ExplicitAssertion,
             confidence: 1.0,
             source_event_ids: vec![event_id.to_owned()],
-            valid_from: None,
-            valid_to: None,
-            expires_at: None,
         }],
         continuation: ContinuationDraft {
             current_task: Some("Prepare launch".to_owned()),
@@ -196,6 +204,12 @@ fn observation_commit_is_atomic_idempotent_and_source_backed() {
     assert_eq!(summary.activated, vec![commit.claims[0].id.clone()]);
     let explanation = fixture.store.explain_claim(&commit.claims[0].id).unwrap();
     assert_eq!(explanation.source_events[0].id, event.id);
+    assert!(
+        serde_json::to_value(&explanation)
+            .unwrap()
+            .get("sourceObservations")
+            .is_none()
+    );
     assert_eq!(
         fixture
             .store
@@ -626,7 +640,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
         "user",
         "stream",
         "erase this",
-        Sensitivity::Private,
+        Sensitivity::Normal,
         "event-1",
     );
     let plan = fixture
@@ -688,7 +702,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
                 occurred_at: None,
                 content: json!("erase this"),
                 token_count: Some(2),
-                sensitivity: Sensitivity::Private,
+                sensitivity: Sensitivity::Normal,
                 metadata: json!({}),
                 idempotency_key: "event-1".to_owned(),
             })
@@ -723,7 +737,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
         "user",
         "stream",
         "remove before observing",
-        Sensitivity::Private,
+        Sensitivity::Normal,
         "event-1",
     );
     let stale_plan = fixture
@@ -1130,6 +1144,12 @@ fn observation_and_stream_inspection_are_complete() {
     assert_eq!(status.observed_through_sequence, 1);
     assert_eq!(status.next_sequence, 2);
     assert_eq!(status.runs[0].status, "committed");
+    assert!(
+        fixture
+            .store
+            .list_observation_runs(None, None, Some("running"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -1167,12 +1187,54 @@ fn current_schema_reopens_without_rewriting_data() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+
+    let event_columns = table_columns(&connection, "memory_events");
+    assert!(
+        !event_columns
+            .iter()
+            .any(|(name, _, _)| name == "idempotency_key")
+    );
+    let claim_columns = table_columns(&connection, "claims");
+    for removed in ["valid_from", "valid_to", "expires_at"] {
+        assert!(!claim_columns.iter().any(|(name, _, _)| name == removed));
+    }
+    let claim_source_columns = table_columns(&connection, "claim_sources");
+    assert_eq!(
+        claim_source_columns
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["claim_id", "event_id"]
+    );
+    assert!(
+        claim_source_columns
+            .iter()
+            .all(|(_, not_null, primary_key)| *not_null == 1 && *primary_key > 0)
+    );
+    let operation_columns = table_columns(&connection, "memory_operations");
+    assert!(
+        !operation_columns
+            .iter()
+            .any(|(name, _, _)| name == "purged")
+    );
+    assert!(
+        !operation_columns
+            .iter()
+            .any(|(name, _, _)| name == "created_at")
+    );
+    assert_eq!(
+        operation_columns
+            .iter()
+            .find(|(name, _, _)| name == "result_json")
+            .map(|(_, not_null, _)| *not_null),
+        Some(0)
+    );
 }
 
 #[test]
 fn incompatible_database_versions_are_rejected_without_schema_writes() {
     let directory = tempfile::tempdir().unwrap();
-    for version in [1_i64, 2, 99] {
+    for version in [1_i64, 2, 3, 99] {
         let path = directory.path().join(format!("schema-{version}.db"));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -1187,7 +1249,7 @@ fn incompatible_database_versions_are_rejected_without_schema_writes() {
         assert!(
             error
                 .to_string()
-                .contains("is incompatible with OMK schema version 3")
+                .contains("is incompatible with OMK schema version 4")
         );
         let connection = Connection::open(path).unwrap();
         let table_count: i64 = connection

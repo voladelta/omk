@@ -25,10 +25,7 @@ Return one JSON object matching this shape and no wrapper text:
       "value": "structured JSON value",
       "modality": "explicit-assertion",
       "confidence": 1.0,
-      "sourceEventIds": ["event-id"],
-      "validFrom": null,
-      "validTo": null,
-      "expiresAt": null
+      "sourceEventIds": ["event-id"]
     }
   ],
   "continuation": {

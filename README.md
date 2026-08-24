@@ -21,7 +21,7 @@ Running `omk` without a subcommand prints the top-level help and exits successfu
 
 ## JSON contract
 
-Successful read commands return their data directly. `init` and every idempotent mutation return an operation envelope:
+Every successful data command emits one compact JSON value on stdout. Help and version output remain plain text. Read commands return their data directly. `init` and every idempotent mutation return an operation envelope:
 
 ```json
 {
@@ -131,7 +131,7 @@ When the stream has no pending events, planning succeeds explicitly without a ru
 }
 ```
 
-Apply [prompts/observer.v1.md](prompts/observer.v1.md) to the `.data` object, then commit the strict `ObserverResult`. The four primary sections are required. A completely empty result also requires a non-empty `emptyReason` acknowledgement. Such an acknowledgement preserves the existing continuation view. For any non-empty result, `continuation` is a full replacement snapshot and must carry forward still-valid prior state from `previousContinuation`.
+Apply [prompts/observer.v1.md](prompts/observer.v1.md) to the `.data` object, then commit the strict `ObserverResult`. The same input shape and allowed values are available from `omk observe commit --help`, so a caller needs only the release binary. The four primary sections are required. A completely empty result also requires a non-empty `emptyReason` acknowledgement. Such an acknowledgement preserves the existing continuation view. For any non-empty result, `continuation` is a full replacement snapshot and must carry forward still-valid prior state from `previousContinuation`.
 
 ```sh
 omk observe commit \
@@ -155,7 +155,7 @@ omk observe fail --run RUN_ID --reason model-timeout --idempotency-key observe-f
 
 Failure does not advance the cursor. A new plan retries the same range. Competing plans are allowed, but only one can commit; stale runs return a structured recovery error.
 Runs record `cursorAtPlan`, so privacy-purged sequence gaps remain recoverable without reusing sequence numbers.
-Run inspection also exposes `sourceIntegrity`. A historical committed run remains `committed` after privacy purge but changes from `intact` to `privacy-purged`; its dependent derived records are removed and `nextAction` explains recovery. Pending or running affected runs become stale.
+Run inspection also exposes `sourceIntegrity`. A historical committed run remains `committed` after privacy purge but changes from `intact` to `privacy-purged`; its dependent derived records are removed and `nextAction` explains recovery. Pending affected runs become stale.
 
 Compose hard-bounded context:
 
@@ -164,8 +164,7 @@ omk context \
   --scope thread:build \
   --stream codex-thread-1 \
   --max-tokens 16000 \
-  --recent-raw-tokens 6000 \
-  --format markdown
+  --recent-raw-tokens 6000
 ```
 
 Active state is never silently trimmed. If it cannot fit, the command returns `budget_exceeded` with `minimumRequiredTokens`. Pending and disputed claims appear separately from active claims.
@@ -219,7 +218,7 @@ Add `--fts-query` only when intentionally supplying SQLite FTS5 syntax. Retrieva
 
 ## Schema compatibility
 
-OMK is pre-1.0 and intentionally carries no database migrations. It initializes fresh databases at schema v3 and reopens v3 databases unchanged. Any other nonzero schema version is rejected before schema writes; start with a fresh database path when the development schema changes.
+OMK is pre-1.0 and intentionally carries no database migrations. It initializes fresh databases at schema v4 and reopens v4 databases unchanged. Any other nonzero schema version is rejected before schema writes; start with a fresh database path when the development schema changes.
 
 ## Views and reflection
 

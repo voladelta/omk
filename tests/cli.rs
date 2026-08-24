@@ -7,7 +7,6 @@ fn omk(db: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_omk"))
         .arg("--db")
         .arg(db)
-        .arg("--compact")
         .args(args)
         .output()
         .unwrap()
@@ -27,7 +26,6 @@ fn omk_with_stdin(db: &std::path::Path, args: &[&str], input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_omk"))
         .arg("--db")
         .arg(db)
-        .arg("--compact")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -44,7 +42,7 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
     let db = directory.path().join("memory.db");
     let initialized = success_json(&db, &["init"]);
     assert_eq!(initialized["data"]["ready"], true);
-    assert_eq!(initialized["data"]["schemaVersion"], 3);
+    assert_eq!(initialized["data"]["schemaVersion"], 4);
     assert_eq!(initialized["operation"]["replayed"], false);
     let created = success_json(
         &db,
@@ -419,6 +417,27 @@ fn cli_help_exposes_agent_critical_contracts() {
     assert!(no_args.contains("Usage: omk"));
     assert!(no_args.contains("Examples:"));
     assert!(no_args.contains("omk observe plan"));
+    assert!(!no_args.contains("--compact"));
+
+    let event_help = omk(&db, &["event", "--help"]);
+    assert!(event_help.status.success());
+    let event_help = String::from_utf8(event_help.stdout).unwrap();
+    assert!(!event_help.contains("  range"));
+
+    let context_help = omk(&db, &["context", "--help"]);
+    assert!(context_help.status.success());
+    assert!(
+        !String::from_utf8(context_help.stdout)
+            .unwrap()
+            .contains("--format")
+    );
+
+    let view_help = omk(&db, &["view", "create", "--help"]);
+    assert!(view_help.status.success());
+    let view_help = String::from_utf8(view_help.stdout).unwrap();
+    assert!(!view_help.contains("project-digest"));
+    assert!(!view_help.contains("decision-rationale"));
+    assert!(!view_help.contains("open-loops"));
 
     let purge_help = omk(&db, &["event", "purge", "--help"]);
     assert!(purge_help.status.success());
@@ -432,11 +451,23 @@ fn cli_help_exposes_agent_critical_contracts() {
     assert!(plan_help.contains(".data.events[].id"));
     assert!(plan_help.contains("caught-up"));
 
+    let commit_help = omk(&db, &["observe", "commit", "--help"]);
+    assert!(commit_help.status.success());
+    let commit_help = String::from_utf8(commit_help.stdout).unwrap();
+    assert!(commit_help.contains("do not include runId"));
+    assert!(commit_help.contains("\"sourceEventIds\""));
+    assert!(commit_help.contains("\"eventTimeFrom\": null"));
+    assert!(commit_help.contains("Allowed observation kinds:"));
+    assert!(commit_help.contains("Allowed claim kinds:"));
+    assert!(commit_help.contains("Allowed modalities:"));
+    assert!(commit_help.contains("emptyReason"));
+
     let append_help = omk(&db, &["event", "append", "--help"]);
     assert!(append_help.status.success());
     let append_help = String::from_utf8(append_help.stdout).unwrap();
     assert!(append_help.contains("Storage/privacy mode"));
     assert!(append_help.contains("do-not-store"));
+    assert!(!append_help.contains("private"));
     assert!(append_help.contains("--metadata-file"));
     assert!(append_help.contains("Secret content must come from stdin or --content-file"));
 

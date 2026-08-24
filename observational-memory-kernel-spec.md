@@ -2,11 +2,11 @@
 
 ## Design and Implementation Contract for Codex
 
-Reference implementation: OMK 0.4.0, Rust 2024 edition, SQLite schema v3.
+Reference implementation: OMK 0.5.0, Rust 2024 edition, SQLite schema v4.
 
 ### Objective
 
-Build a framework-neutral, local-first memory kernel for a personal agent system. It must preserve long-running conversational continuity without treating summaries as truth, and it must remain easy to customize at every boundary: storage, models, prompts, scope rules, reconciliation, retrieval, privacy, and context rendering.
+Build a framework-neutral, local-first memory kernel for a personal agent system. It must preserve long-running conversational continuity without treating summaries as truth and keep model execution and scheduling outside the kernel.
 
 The system is complete when it can:
 
@@ -16,7 +16,7 @@ The system is complete when it can:
 4. Preserve every observation and reflection source so exact evidence remains recoverable.
 5. Compose bounded context from current state, episodic memory, recent raw events, and targeted recall.
 6. Support user, project, thread, and task scopes without cross-scope leakage.
-7. Replace any model, prompt, storage adapter, or policy without changing the kernel.
+7. Replace external observer and reflector models or prompts without changing persisted memory invariants.
 
 Target the reference implementation at Rust 2024 with SQLite. Keep the core independent of any agent framework or model provider. Data-model snippets below use TypeScript-shaped pseudocode only as compact, language-neutral schema notation; the Rust types and serialized camelCase JSON are the executable interfaces.
 
@@ -139,7 +139,7 @@ export interface MemoryEvent {
   content: unknown;
   contentHash: string;
   tokenCount: number;
-  sensitivity: 'normal' | 'private' | 'secret' | 'do-not-store';
+  sensitivity: 'normal' | 'secret' | 'do-not-store';
   metadata: Record<string, unknown>;
 }
 ```
@@ -232,9 +232,6 @@ export interface Claim {
     | 'trusted-source'
     | 'model-inference';
   confidence: number;
-  validFrom?: string;
-  validTo?: string;
-  expiresAt?: string;
   supersedesId?: string;
   createdAt: string;
   updatedAt: string;
@@ -247,7 +244,7 @@ The logical key for reconciliation is:
 scope + kind + subject + predicate
 ```
 
-Do not assume a newer claim supersedes an older one. Check scope, modality, validity period, and explicit replacement language first.
+Do not assume a newer claim supersedes an older one. Check scope, modality, and explicit replacement language first.
 
 ### 4.4 View
 
@@ -256,10 +253,7 @@ Views are derived context artifacts. They are append-only and replaceable.
 ```ts
 export type ViewKind =
   | 'continuity'
-  | 'project-digest'
-  | 'continuation'
-  | 'decision-rationale'
-  | 'open-loops';
+  | 'continuation';
 
 export interface MemoryView {
   id: string;
@@ -277,7 +271,7 @@ export interface MemoryView {
 }
 ```
 
-Implement only `continuity` and `continuation` in the first complete version. Keep the view-builder interface generic so other views can be added without schema changes.
+Support only `continuity` and `continuation` views.
 
 ---
 
@@ -312,9 +306,6 @@ export interface ObserverResult {
     modality: ClaimModality;
     confidence: number;
     sourceEventIds: string[];
-    validFrom?: string;
-    validTo?: string;
-    expiresAt?: string;
   }>;
 
   continuation: {
@@ -346,6 +337,7 @@ Observer prompt rules:
 10. Produce schema-valid JSON and no free-form wrapper text.
 
 Version every observer prompt. Store the prompt version and model on each observation run.
+Repeat the exact input shape and allowed enum values in `omk observe commit --help`; an agent must not need repository access to construct valid input.
 
 ---
 
@@ -372,8 +364,9 @@ Raw events are never removed by observation. Context composition decides whether
 ### Observation run state
 
 ```text
-pending → running → committed
-              └────→ failed
+pending → committed
+       ├→ failed
+       └→ stale
 ```
 
 ### Atomic commit
@@ -570,26 +563,7 @@ Semantic similarity is a discovery signal only. It cannot establish truth, ident
 
 ---
 
-## 11. Extension ports
-
-Keep the public extension surface small.
-
-```ts
-export interface MemoryStore { /* events, observations, claims, views, runs */ }
-export interface Observer { observe(input: ObserverInput): Promise<ObserverResult> }
-export interface Reflector { reflect(input: ReflectorInput): Promise<ViewDraft> }
-export interface ReconciliationPolicy { decide(input: ReconcileInput): Promise<ReconcileAction> }
-export interface ScopePolicy { resolveVisibleScopes(input: ScopeQuery): Promise<string[]> }
-export interface RetrievalStrategy { search(input: RetrievalQuery): Promise<RetrievalHit[]> }
-export interface ContextPolicy { compose(input: ContextInput): Promise<ContextBundle> }
-export interface RedactionPolicy { sanitize(events: MemoryEvent[]): Promise<MemoryEvent[]> }
-```
-
-Model routing belongs inside observer and reflector implementations. Scheduling belongs outside the kernel and calls kernel methods. Agent frameworks receive thin adapters that translate messages and tool events into `MemoryEvent` objects.
-
----
-
-## 12. Public kernel API
+## 11. Public kernel API
 
 The Rust crate exports `MemoryStore`, the model types, and `SCHEMA_VERSION`. `MemoryStore` owns SQLite state and provides operations for:
 
@@ -608,16 +582,15 @@ Every mutating method accepts an idempotency key and returns a mutation result t
 
 ---
 
-## 13. Agent CLI contract
+## 12. Agent CLI contract
 
 The `omk` binary is an agent-first, non-interactive interface over the kernel.
 
 ### Output and discovery
 
-- Machine-readable JSON is the default for command results.
+- Every successful data command emits one compact JSON value. Help and version output remain plain text.
 - Successful output goes to stdout. Command runtime errors use structured JSON on stderr with a nonzero exit status; command-line syntax errors use clap's concise usage diagnostics on stderr.
 - Errors contain stable `code`, `message`, `retryable`, and `sameKeyReusable` fields and include `nextAction` when a concrete recovery action exists.
-- `--format markdown` is an explicit exception for human-oriented context rendering.
 - Running `omk` with no subcommand prints top-level help to stdout and exits successfully.
 - Support `-h`, `--help`, `help <command>`, and `--version` without opening the database.
 - Top-level help and agent-critical command help include copyable examples. Help must document privacy-sensitive input restrictions where they apply.
@@ -644,7 +617,7 @@ The `omk` binary is an agent-first, non-interactive interface over the kernel.
 
 ---
 
-## 14. SQLite schema
+## 13. SQLite schema
 
 While the kernel is pre-1.0, initialize one current schema and reject incompatible nonzero schema versions before writes. Do not carry forward migrations without a real compatibility requirement. Use WAL mode and avoid coupling the core to a particular ORM.
 
@@ -670,14 +643,16 @@ Important constraints:
 - Observation runs store `from_sequence` and `to_sequence`.
 - Only one committed observation run may cover a specific starting cursor.
 - Provenance foreign keys use cascading deletion for explicit privacy purge.
+- Claim provenance links directly to source events; there is no observation-to-claim source variant.
 - Claims are append-only except for lifecycle status fields.
 - Views are append-only.
+- A `NULL` operation result is a privacy-purged idempotency tombstone; a non-`NULL` result is replayable.
 
 Use FTS5 over event text, observation content, and claim text. Keep embeddings outside the initial schema or behind a separate adapter table.
 
 ---
 
-## 15. Reference source layout
+## 14. Reference source layout
 
 ```text
 Cargo.toml
@@ -698,86 +673,7 @@ Keep this compact layout while ownership remains clear. Split modules only when 
 
 ---
 
-## 16. Implementation sequence
-
-### Milestone 1 — Ledger and exact recall
-
-Implement:
-
-- Scope tree.
-- SQLite schema initialization with fail-closed version checks.
-- Event append with idempotency.
-- Exact event-range recall.
-- FTS indexing.
-- Unit tests for ordering, duplicates, and privacy flags.
-
-Exit criterion: a long thread can be stored and exactly replayed without an observer.
-
-### Milestone 2 — Observation pipeline
-
-Implement:
-
-- Observation planner.
-- Observer port and deterministic fake observer.
-- Strict result validation.
-- Atomic observation commit and cursor advancement.
-- Background/idle scheduler adapter.
-
-Exit criterion: events are observed exactly once; failures and retries create no gaps or duplicates.
-
-### Milestone 3 — Claims and current state
-
-Implement:
-
-- Claim persistence.
-- Default reconciliation rules.
-- Explicit memory commands.
-- Claim explanation with source evidence.
-- Conflict and supersession tests.
-
-Exit criterion: proposals, inferences, accepted decisions, and corrections behave differently and predictably.
-
-### Milestone 4 — Context composer
-
-Implement:
-
-- Scope inheritance.
-- Token budgeting.
-- Recent raw tail selection.
-- Observation de-duplication against raw events.
-- Structured context bundle and default renderer.
-
-Exit criterion: the composer produces bounded context without losing active constraints, current task, or exact recent interaction.
-
-### Milestone 5 — Reflection
-
-Implement:
-
-- Continuity-view planner.
-- Reflector port and fake reflector.
-- Append-only generations.
-- Stable cutoff before recent raw history.
-- Failure fallback to prior view.
-
-Exit criterion: older history can be compacted repeatedly while all observations and raw evidence remain recoverable.
-
-### Milestone 6 — Production hardening
-
-Implement:
-
-- Real observer and reflector model adapters.
-- Secret redaction.
-- Secret-safe file and stdin ingress.
-- Cancellation and timeout handling.
-- Agent-first CLI with JSON results, structured runtime errors, discoverable help, and immediate missing-input failures.
-- Metrics and structured logs.
-- End-to-end evaluation fixtures.
-
-Exit criterion: the system survives crashes, retries, contradictory updates, scope changes, and long-running sessions.
-
----
-
-## 17. Required tests
+## 15. Required tests
 
 ### Correctness
 
@@ -807,7 +703,6 @@ Include fixtures covering:
 - A user preference that applies only to implementation plans.
 - Two similarly named projects that must not be merged.
 - A tool failure followed by a successful repair.
-- A stale decision valid only during an earlier time period.
 - An explicit user correction of a model inference.
 - A long thread where the user says only “continue” and the agent still resumes correctly.
 
@@ -827,7 +722,7 @@ Every interruption must have an explicit idempotent recovery path.
 
 ---
 
-## 18. Definition of done
+## 16. Definition of done
 
 The implementation is done when all of the following are true:
 
@@ -845,7 +740,7 @@ The implementation is done when all of the following are true:
 
 ---
 
-## 19. Final implementation rule
+## 17. Final implementation rule
 
 Keep this distinction visible in code, storage, prompts, and user-facing inspection:
 

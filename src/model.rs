@@ -37,7 +37,6 @@ pub enum EventKind {
 #[serde(rename_all = "kebab-case")]
 pub enum Sensitivity {
     Normal,
-    Private,
     Secret,
     DoNotStore,
 }
@@ -148,7 +147,6 @@ pub enum ClaimStatus {
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimAuthority {
     ExplicitUser,
-    AcceptedRecord,
     TrustedSource,
     ModelInference,
 }
@@ -166,9 +164,6 @@ pub struct Claim {
     pub status: ClaimStatus,
     pub authority: ClaimAuthority,
     pub confidence: f64,
-    pub valid_from: Option<String>,
-    pub valid_to: Option<String>,
-    pub expires_at: Option<String>,
     pub supersedes_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -178,10 +173,7 @@ pub struct Claim {
 #[serde(rename_all = "kebab-case")]
 pub enum ViewKind {
     Continuity,
-    ProjectDigest,
     Continuation,
-    DecisionRationale,
-    OpenLoops,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,9 +280,6 @@ pub struct ClaimDraft {
     pub modality: ClaimModality,
     pub confidence: f64,
     pub source_event_ids: Vec<String>,
-    pub valid_from: Option<String>,
-    pub valid_to: Option<String>,
-    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -391,7 +380,6 @@ pub struct SearchHit {
 #[serde(rename_all = "camelCase")]
 pub struct ClaimExplanation {
     pub claim: Claim,
-    pub source_observations: Vec<Observation>,
     pub source_events: Vec<MemoryEvent>,
 }
 
