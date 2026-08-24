@@ -258,7 +258,7 @@ OMK applies these privacy rules:
 
 ## Use the current schema
 
-OMK is pre-1.0 and has no database migrations. It creates and reopens schema v4 databases.
+OMK is pre-1.0 and has no database migrations. It creates and reopens schema v5 databases.
 
 OMK rejects any other nonzero schema version before it writes schema changes. Use a fresh database path when the development schema changes.
 

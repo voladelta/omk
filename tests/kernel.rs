@@ -445,6 +445,114 @@ fn proposals_do_not_replace_state_but_explicit_corrections_do() {
 }
 
 #[test]
+fn claim_logical_keys_are_normalized_before_lookup() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let first = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember-1",
+        )
+        .unwrap();
+    let duplicate = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            " launch ",
+            " asset ",
+            json!("ETH"),
+            &[],
+            "remember-2",
+        )
+        .unwrap();
+
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn claim_commands_enforce_lifecycle_transitions() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let active = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let proposal = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("USDG"),
+            &[],
+            "proposal",
+        )
+        .unwrap();
+
+    assert!(
+        fixture
+            .store
+            .reject_claim(&active.id, "reject-active")
+            .unwrap_err()
+            .to_string()
+            .contains("pending or disputed")
+    );
+    let rejected = fixture
+        .store
+        .reject_claim(&proposal.id, "reject-proposal")
+        .unwrap();
+    assert_eq!(rejected.status, ClaimStatus::Rejected);
+    assert!(
+        fixture
+            .store
+            .confirm_claim(&active.id, "confirm-active")
+            .unwrap_err()
+            .to_string()
+            .contains("pending or disputed")
+    );
+    assert!(
+        fixture
+            .store
+            .confirm_claim(&rejected.id, "confirm-rejected")
+            .unwrap_err()
+            .to_string()
+            .contains("pending or disputed")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .forget_claim(&active.id, "forget-active")
+            .unwrap()
+            .status,
+        ClaimStatus::Expired
+    );
+}
+
+#[test]
 fn scope_inheritance_does_not_leak_between_projects() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
@@ -553,9 +661,187 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
     assert_eq!(first.generation, 1);
     assert_eq!(second.generation, 2);
     assert_eq!(second.previous_view_id.as_deref(), Some(first.id.as_str()));
+    let third = fixture
+        .store
+        .create_view(CreateView {
+            scope_id: "user".to_owned(),
+            kind: ViewKind::Continuity,
+            content: "No new reflected observations".to_owned(),
+            source_from_sequence: 1,
+            source_through_sequence: 1,
+            source_observation_ids: vec![],
+            model: Some("fake".to_owned()),
+            prompt_version: Some("reflector.v1".to_owned()),
+            token_count: None,
+            idempotency_key: "view-3".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(third.previous_view_id.as_deref(), Some(second.id.as_str()));
+    assert!(
+        fixture
+            .store
+            .compose_context("user", "stream", 1_000, 0, None)
+            .unwrap()
+            .observations
+            .is_empty()
+    );
     assert_eq!(
         fixture.store.recall_event_range("stream", 1, 1).unwrap()[0].id,
         event.id
+    );
+}
+
+#[test]
+fn context_deduplicates_only_exact_source_events() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event(
+        "user",
+        "stream-a",
+        "Raw event from stream A",
+        Sensitivity::Normal,
+        "event-a",
+    );
+    let event_b = fixture.event(
+        "user",
+        "stream-b",
+        "Decision from stream B",
+        Sensitivity::Normal,
+        "event-b",
+    );
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream-b", 100, "fake", "v1", "plan-b")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let result = ObserverResult {
+        observations: vec![ObservationDraft {
+            kind: ObservationKind::Decision,
+            content: "Remember stream B".to_owned(),
+            importance: 1.0,
+            confidence: 1.0,
+            source_event_ids: vec![event_b.id],
+            event_time_from: None,
+            event_time_to: None,
+        }],
+        claims: vec![],
+        continuation: ContinuationDraft::default(),
+        ambiguities: vec![],
+        empty_reason: None,
+    };
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, result, "commit-b")
+        .unwrap();
+
+    let context = fixture
+        .store
+        .compose_context("user", "stream-a", 1_000, 100, None)
+        .unwrap();
+    assert_eq!(context.observations[0].id, commit.observations[0].id);
+}
+
+#[test]
+fn context_prioritizes_continuation_over_pending_claims() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event(
+        "user",
+        "stream",
+        "Continue the release",
+        Sensitivity::Normal,
+        "event",
+    );
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let result = ObserverResult {
+        observations: vec![],
+        claims: vec![],
+        continuation: ContinuationDraft {
+            current_task: Some("Ship the release".to_owned()),
+            next_actions: vec!["Run final checks".to_owned()],
+            ..ContinuationDraft::default()
+        },
+        ambiguities: vec![],
+        empty_reason: None,
+    };
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, result, "commit")
+        .unwrap();
+    fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "p",
+            "q",
+            json!("v"),
+            &[],
+            "proposal",
+        )
+        .unwrap();
+
+    let context = fixture
+        .store
+        .compose_context(
+            "user",
+            "stream",
+            commit.continuation_view.token_count,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(context.pending_claims.is_empty());
+    assert_eq!(context.continuity_views.len(), 1);
+    assert_eq!(context.continuity_views[0].kind, ViewKind::Continuation);
+}
+
+#[test]
+fn full_text_search_does_not_index_views() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let event = fixture.event("user", "stream", "source", Sensitivity::Normal, "event");
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "ETH"), "commit")
+        .unwrap();
+    fixture
+        .store
+        .create_view(CreateView {
+            scope_id: "user".to_owned(),
+            kind: ViewKind::Continuity,
+            content: "view-only-search-marker".to_owned(),
+            source_from_sequence: 1,
+            source_through_sequence: 1,
+            source_observation_ids: vec![commit.observations[0].id.clone()],
+            model: Some("fake".to_owned()),
+            prompt_version: Some("reflector.v1".to_owned()),
+            token_count: None,
+            idempotency_key: "view".to_owned(),
+        })
+        .unwrap();
+
+    assert!(
+        fixture
+            .store
+            .search_full_text("user", "view-only-search-marker", 10)
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -1211,6 +1497,17 @@ fn current_schema_reopens_without_rewriting_data() {
             .iter()
             .all(|(_, not_null, primary_key)| *not_null == 1 && *primary_key > 0)
     );
+    let active_claim_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='index' AND name='one_active_claim_per_logical_key'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(active_claim_index);
     let operation_columns = table_columns(&connection, "memory_operations");
     assert!(
         !operation_columns
@@ -1234,7 +1531,7 @@ fn current_schema_reopens_without_rewriting_data() {
 #[test]
 fn incompatible_database_versions_are_rejected_without_schema_writes() {
     let directory = tempfile::tempdir().unwrap();
-    for version in [1_i64, 2, 3, 99] {
+    for version in [1_i64, 2, 3, 4, 99] {
         let path = directory.path().join(format!("schema-{version}.db"));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -1246,11 +1543,9 @@ fn incompatible_database_versions_are_rejected_without_schema_writes() {
             Ok(_) => panic!("schema version {version} should be rejected"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("is incompatible with OMK schema version 4")
-        );
+        assert!(error.to_string().contains(&format!(
+            "is incompatible with OMK schema version {SCHEMA_VERSION}"
+        )));
         let connection = Connection::open(path).unwrap();
         let table_count: i64 = connection
             .query_row(

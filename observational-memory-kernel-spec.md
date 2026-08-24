@@ -2,7 +2,7 @@
 
 This document defines the design and implementation contract for Codex.
 
-Reference implementation: OMK 0.5.0, Rust 2024 edition, SQLite schema v4.
+Reference implementation: OMK 0.5.0, Rust 2024 edition, SQLite schema v5.
 
 ## What OMK must do
 
@@ -646,7 +646,7 @@ While OMK is pre-1.0, initialise only the current schema. Reject incompatible no
 
 Do not add migrations without a real compatibility need. Use WAL mode and do not tie the core to one object-relational mapper (ORM).
 
-Schema v4 has 12 required tables:
+Schema v5 has 12 required tables:
 
 - `memory_scopes`
 - `memory_streams`
@@ -669,13 +669,14 @@ Apply these constraints:
 - only one committed run can cover a starting cursor
 - provenance foreign keys cascade on an explicit privacy purge
 - claim provenance links directly to source events
+- one active claim can exist for each logical claim key
 - observation-to-claim provenance does not exist
 - claims are append-only except for lifecycle status
 - views are append-only
 - a `NULL` operation result is an idempotency marker for purged data
 - a non-`NULL` operation result can be replayed
 
-Use FTS5 for event text, observation content and claim text. Keep embeddings outside schema v4 or in a separate adapter table.
+Use FTS5 for event text, observation content and claim text. Keep embeddings outside schema v5 or in a separate adapter table.
 
 ---
 
@@ -686,7 +687,15 @@ Cargo.toml
 src/
 ├── lib.rs       # public crate surface
 ├── model.rs     # serialized records and command inputs
-├── store.rs     # SQLite schema, invariants, and kernel operations
+├── store.rs     # MemoryStore, core event operations, and shared boundary
+├── store/
+│   ├── claim.rs       # claim lifecycle and reconciliation
+│   ├── context.rs     # views, retrieval, and context composition
+│   ├── observation.rs # observation lifecycle
+│   ├── privacy.rs     # explicit purge operations
+│   ├── rows.rs        # SQLite row decoding
+│   ├── schema.rs      # current SQLite schema
+│   └── support.rs     # shared persistence primitives
 └── main.rs      # clap-based agent CLI and JSON error boundary
 prompts/
 ├── observer.v1.md

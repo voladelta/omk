@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
+use omk::SCHEMA_VERSION;
 use serde_json::Value;
 
 fn omk(db: &std::path::Path, args: &[&str]) -> Output {
@@ -42,7 +43,7 @@ fn cli_reports_replays_and_structured_idempotency_conflicts() {
     let db = directory.path().join("memory.db");
     let initialized = success_json(&db, &["init"]);
     assert_eq!(initialized["data"]["ready"], true);
-    assert_eq!(initialized["data"]["schemaVersion"], 4);
+    assert_eq!(initialized["data"]["schemaVersion"], SCHEMA_VERSION);
     assert_eq!(initialized["operation"]["replayed"], false);
     let created = success_json(
         &db,
