@@ -1,27 +1,34 @@
 # OMK
 
-OMK is a local-first observational memory kernel and JSON CLI for agents:
+OMK gives local agents durable, source-backed memory through a JSON command-line interface (CLI).
 
-- Events are immutable evidence.
-- Observations are source-backed interpretations.
-- Claims are proposed or canonical state.
-- Views are disposable, append-only context renderings.
+It stores 4 types of record:
 
-SQLite is the only runtime dependency. Model execution and scheduling stay outside the kernel: an agent requests a redacted observation plan, produces strict JSON, and commits it atomically.
+- events record what happened
+- observations record source-backed interpretations
+- claims record proposed or accepted state
+- views provide replaceable context
 
-## Build
+SQLite is the only runtime dependency. OMK does not run or schedule models. Your agent requests a redacted observation plan, produces strict JSON and commits the result atomically.
+
+## Build and start OMK
+
+Build the release binary:
 
 ```sh
 cargo build --release
 ./target/release/omk --help
 ```
 
-The default database is `.omk/memory.db`. Set `OMK_DB` or pass `--db` to use another path.
-Running `omk` without a subcommand prints the top-level help and exits successfully. `omk help <command>` and `<command> --help` provide command-specific help.
+OMK stores data in `.omk/memory.db` by default. Use `OMK_DB` or `--db` to choose another path.
 
-## JSON contract
+Run `omk` without a command to show help. Use `omk help <command>` or `<command> --help` for command help.
 
-Every successful data command emits one compact JSON value on stdout. Help and version output remain plain text. Read commands return their data directly. `init` and every idempotent mutation return an operation envelope:
+## Read JSON output
+
+Every successful data command writes one compact JSON value to standard output. Help and version commands write plain text.
+
+Read commands return data directly. `init` and each idempotent write return an operation envelope:
 
 ```json
 {
@@ -30,11 +37,15 @@ Every successful data command emits one compact JSON value on stdout. Help and v
 }
 ```
 
-`retryable` means the unchanged command can be retried. `sameKeyReusable` means validation failed before an operation was recorded, so the corrected request may reuse its idempotency key. Follow `nextAction` before retrying.
+The operation fields tell you how to recover:
 
-An identical retry returns the original data with `replayed: true`. Reusing the key with changed scope, payload, model, metadata, or other input fails with `idempotency_conflict`.
+- `retryable` means you can retry the command without changing it
+- `sameKeyReusable` means validation failed before OMK recorded the operation
+- `nextAction` tells you what to do before you retry
 
-Failures are JSON on stderr:
+An identical retry returns the original data with `replayed: true`. OMK rejects a reused key if any input has changed.
+
+Failures are JSON on standard error:
 
 ```json
 {
@@ -48,9 +59,9 @@ Failures are JSON on stderr:
 }
 ```
 
-## Agent workflow
+## Set up agent memory
 
-Initialize a scope tree:
+Create a scope tree before you add evidence:
 
 ```sh
 omk init
@@ -59,7 +70,7 @@ omk scope add --id project:omk --kind project --parent user:me --idempotency-key
 omk scope add --id thread:build --kind thread --parent project:omk --idempotency-key scope-thread-build
 ```
 
-Append evidence:
+Add an event:
 
 ```sh
 omk event append \
@@ -70,9 +81,11 @@ omk event append \
   --idempotency-key codex-thread-1-message-1
 ```
 
-Every write requires a request-stable, globally unique idempotency key. Use the same key only for an identical retry.
+Every write needs a stable, globally unique idempotency key. Reuse a key only when you retry an identical command.
 
-Append privacy-sensitive evidence with `--sensitivity`. Pass secret content through stdin or `--content-file`, never `--content`, so it does not enter shell history or process listings:
+## Add secret evidence safely
+
+Pass secret content through standard input or `--content-file`. Do not use `--content`, because the value could enter shell history or process listings.
 
 ```sh
 printf '%s' 'credential material' | omk event append \
@@ -83,9 +96,13 @@ printf '%s' 'credential material' | omk event append \
   --idempotency-key codex-thread-1-secret-1
 ```
 
-Use `--metadata-file` for secret metadata. A single command cannot read both content and metadata from stdin; provide one of them through a file. Secret append and replay envelopes return a redacted content tombstone and empty metadata. Exact content is available only through the explicit local evidence commands described under Privacy. Use `do-not-store` when neither content nor metadata may be persisted.
+Use `--metadata-file` for secret metadata. One command cannot read content and metadata from standard input. Put one value in a file.
 
-Plan an observation batch. A ready result keeps the stable `.data.runId` and `.data.events[].id` paths needed for strict provenance:
+Secret append and replay results contain redacted content and empty metadata. Only explicit local evidence commands return the exact content. Use `do-not-store` when OMK must not persist the content or metadata.
+
+## Observe new events
+
+Plan a batch of events for an external observer:
 
 ```sh
 omk observe plan \
@@ -100,9 +117,9 @@ jq -r '.data.events[].id' observation-plan.json
 jq '.data' observation-plan.json > observer-input.json
 ```
 
-The `jq` commands are optional shell examples, not runtime dependencies; agents may parse the JSON directly.
+The `jq` commands are optional examples. Agents can parse the JSON directly.
 
-Ready output is shaped as:
+A ready plan provides stable paths for the run and source event IDs:
 
 ```json
 {
@@ -116,7 +133,7 @@ Ready output is shaped as:
 }
 ```
 
-When the stream has no pending events, planning succeeds explicitly without a run:
+When there are no new events, OMK returns a caught-up result without a run:
 
 ```json
 {
@@ -131,7 +148,13 @@ When the stream has no pending events, planning succeeds explicitly without a ru
 }
 ```
 
-Apply [prompts/observer.v1.md](prompts/observer.v1.md) to the `.data` object, then commit the strict `ObserverResult`. The same input shape and allowed values are available from `omk observe commit --help`, so a caller needs only the release binary. The four primary sections are required. A completely empty result also requires a non-empty `emptyReason` acknowledgement. Such an acknowledgement preserves the existing continuation view. For any non-empty result, `continuation` is a full replacement snapshot and must carry forward still-valid prior state from `previousContinuation`.
+Apply the [observer prompt and output contract](prompts/observer.v1.md) to the `.data` object. You can also get the full input shape from `omk observe commit --help`.
+
+The result must include `observations`, `claims`, `continuation` and `ambiguities`. Set `emptyReason` when all sections are empty. OMK then keeps the existing continuation view.
+
+For a non-empty result, `continuation` replaces the previous snapshot. Include all state that still applies from `previousContinuation`.
+
+Commit the result, then reconcile pending claims:
 
 ```sh
 omk observe commit \
@@ -144,7 +167,9 @@ omk claim reconcile \
   --idempotency-key codex-thread-1-reconcile-1
 ```
 
-Inspect lifecycle and recovery state:
+## Recover observation work
+
+Inspect runs and stream progress:
 
 ```sh
 omk observe get --run RUN_ID
@@ -153,11 +178,17 @@ omk observe status --stream codex-thread-1
 omk observe fail --run RUN_ID --reason model-timeout --idempotency-key observe-failure-1
 ```
 
-Failure does not advance the cursor. A new plan retries the same range. Competing plans are allowed, but only one can commit; stale runs return a structured recovery error.
-Runs record `cursorAtPlan`, so privacy-purged sequence gaps remain recoverable without reusing sequence numbers.
-Run inspection also exposes `sourceIntegrity`. A historical committed run remains `committed` after privacy purge but changes from `intact` to `privacy-purged`; its dependent derived records are removed and `nextAction` explains recovery. Pending affected runs become stale.
+A failed run does not move the cursor. A new plan retries the same range.
 
-Compose hard-bounded context:
+OMK allows competing plans, but only one can commit. It returns a structured recovery error for stale runs.
+
+Each run records `cursorAtPlan`. This lets OMK recover across privacy-purged sequence gaps without reusing sequence numbers.
+
+Run inspection also returns `sourceIntegrity`. A committed run changes from `intact` to `privacy-purged` when a purge removes its sources. OMK removes dependent records and returns a recovery action. Affected pending runs become stale.
+
+## Build bounded context
+
+Set a hard token budget when you build context:
 
 ```sh
 omk context \
@@ -167,26 +198,29 @@ omk context \
   --recent-raw-tokens 6000
 ```
 
-Active state is never silently trimmed. If it cannot fit, the command returns `budget_exceeded` with `minimumRequiredTokens`. Pending and disputed claims appear separately from active claims.
-Explicit `--token-count` values are treated as conservative hints: OMK never stores a value below its own estimate, and redaction tombstones still consume their visible estimated size.
+OMK never silently removes active state. If it cannot fit, the command returns `budget_exceeded` and `minimumRequiredTokens`.
 
-## Claims and provenance
+The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
+
+## Manage claims and evidence
+
+Use claim commands for these actions:
 
 ```text
 omk claim remember   Store explicit current state; conflicts become disputed.
 omk claim propose    Store a proposal; it cannot replace active state.
-omk claim confirm    Explicitly accept a claim and supersede same-key state.
-omk claim correct    Add a correction and preserve the old claim.
-omk claim rescope    Create a source-preserving replacement in another scope.
+omk claim confirm    Accept a claim and supersede state with the same logical key.
+omk claim correct    Add a correction and keep the old claim.
+omk claim rescope    Create a source-backed replacement in another scope.
 omk claim reject     Reject a pending or disputed claim.
-omk claim forget     Make a claim inactive while retaining history.
-omk claim purge      Physically delete a claim and provenance links.
-omk event purge      Delete an event and dependent derived records.
+omk claim forget     Make a claim inactive but keep its history.
+omk claim purge      Delete a claim and its provenance links.
+omk event purge      Delete an event and dependent records.
 ```
 
-Direct claim commands automatically create a `memory-command` event, so even commands without `--source-event` remain source-backed. `--source-event` accepts an event UUID, not a stream sequence.
+Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
-Recover interpretations and exact evidence:
+Recall interpretations and exact evidence:
 
 ```sh
 omk recall explain-claim --id CLAIM_ID
@@ -194,37 +228,49 @@ omk recall observation --id OBSERVATION_ID
 omk recall event-range --stream codex-thread-1 --from 1 --to 20
 ```
 
-`recall observation` returns both the observation and its raw source events.
+`recall observation` returns the observation and its raw source events.
 
-## Search and scopes
+## Search across scopes
 
-Search treats input as a literal phrase, so punctuation and hyphens are safe:
+Search treats your input as a literal phrase. Punctuation and hyphens are safe:
 
 ```sh
 omk recall search --scope project:omk --query 'settlement ETH-only'
 ```
 
-Add `--fts-query` only when intentionally supplying SQLite FTS5 syntax. Retrieval includes the target scope, its ancestors, and its descendants. Context state inheritance remains ancestor-based, while a project context may explicitly render one descendant stream.
+Use `--fts-query` only when you need SQLite FTS5 syntax.
 
-## Privacy
+Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. A project context can also render one named descendant stream.
 
-- `secret` content and metadata are redacted from observation plans and context and excluded from FTS.
-- Exact `event get` and event-range recall remain an explicit local evidence boundary and can return stored secret content.
-- `do-not-store` content becomes a sequence-preserving tombstone; its metadata is discarded before persistence.
-- Redacted events cannot source observations or claims.
-- Privacy purge removes dependent derived records, preserves monotonic sequence allocation, and invalidates cached operation results without allowing purged data to reappear.
-- Event purge output reports `dependentViews`, `dependentViewIds`, and `affectedRunIds` in addition to dependent observations and claims.
-- Purging a direct claim also removes any now-orphaned auto-generated command evidence that contains that claim request.
+## Protect private data
 
-## Schema compatibility
+OMK applies these privacy rules:
 
-OMK is pre-1.0 and intentionally carries no database migrations. It initializes fresh databases at schema v4 and reopens v4 databases unchanged. Any other nonzero schema version is rejected before schema writes; start with a fresh database path when the development schema changes.
+- `secret` content and metadata stay out of plans, context and full-text search
+- exact `event get` and event-range recall can return stored secrets at an explicit local evidence boundary
+- `do-not-store` creates a sequence marker and discards the content and metadata
+- redacted events cannot support observations or claims
+- event purge removes dependent records and keeps sequence allocation monotonic
+- purged operation results become tombstones, so retries cannot restore deleted data
+- event purge reports `dependentViews`, `dependentViewIds` and `affectedRunIds`
+- event purge also reports affected observations and claims
+- claim purge removes any orphaned command event that contains the request
 
-## Views and reflection
+## Use the current schema
 
-Use an external reflector with [prompts/reflector.v1.md](prompts/reflector.v1.md), then commit its text with `omk view create --kind continuity`. Each view is a new generation linked to its predecessor. Failed reflection performs no write, so the previous view remains active.
+OMK is pre-1.0 and has no database migrations. It creates and reopens schema v4 databases.
 
-## Verification
+OMK rejects any other nonzero schema version before it writes schema changes. Use a fresh database path when the development schema changes.
+
+## Create continuity views
+
+Run an external reflector with the [reflector prompt](prompts/reflector.v1.md). Commit the result with `omk view create --kind continuity`.
+
+Each view is a new generation linked to the previous view. A failed reflection writes nothing, so the previous view stays active.
+
+## Check the implementation
+
+Run these checks:
 
 ```sh
 cargo test
@@ -232,4 +278,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The integration suite covers fresh schema initialization, incompatible-version rejection, request-bound retries, monotonic ordering through purge, envelope privacy, strict observer validation, concurrency and recovery, command provenance, claim authority, scope retrieval, literal FTS, hard budgets, context composition, structured CLI errors, and exact evidence recall.
+The integration tests cover:
+
+- schema setup and incompatible versions
+- request-bound retries and sequence order through purge
+- privacy and strict observer validation
+- concurrency and recovery
+- command provenance and claim authority
+- scope retrieval and literal full-text search
+- hard context budgets and context composition
+- structured CLI errors and exact evidence recall
