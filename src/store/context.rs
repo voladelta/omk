@@ -358,10 +358,9 @@ impl MemoryStore {
                 sources_by_observation
                     .get(&observation.id)
                     .is_some_and(|source_ids| {
-                        !source_ids.is_empty()
-                            && source_ids
-                                .iter()
-                                .any(|source_id| recent_event_ids.contains(source_id.as_str()))
+                        source_ids
+                            .iter()
+                            .any(|source_id| recent_event_ids.contains(source_id.as_str()))
                     });
             let represented_by_view = represented_observation_ids.contains(&observation.id);
             if duplicated_by_raw || represented_by_view {
@@ -408,13 +407,12 @@ impl MemoryStore {
                     {
                         continue;
                     }
-                    let safe = redact_for_agent(event);
-                    if diagnostics.estimated_tokens + safe.token_count <= max_tokens {
-                        diagnostics.estimated_tokens += safe.token_count;
-                        recalled_evidence.push(safe);
+                    if diagnostics.estimated_tokens + event.token_count <= max_tokens {
+                        diagnostics.estimated_tokens += event.token_count;
+                        recalled_evidence.push(event);
                     } else {
                         diagnostics.omitted_items.push(OmittedItem {
-                            id: safe.id,
+                            id: event.id,
                             reason: "context token budget".to_owned(),
                         });
                     }

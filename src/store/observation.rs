@@ -244,10 +244,11 @@ impl MemoryStore {
         }
 
         let preserve_continuation = observer_result_is_completely_empty(&result);
-        let previous_continuation = preserve_continuation
-            .then(|| latest_view(&tx, &run.stream_id, "continuation"))
-            .transpose()?
-            .flatten();
+        let previous_continuation = if preserve_continuation {
+            latest_view(&tx, &run.stream_id, "continuation")?
+        } else {
+            None
+        };
         let (continuation_view, continuation_action) = if let Some(previous) = previous_continuation
         {
             (previous, ContinuationAction::Preserved)

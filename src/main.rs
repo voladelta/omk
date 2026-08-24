@@ -428,52 +428,33 @@ struct ContextArgs {
     query: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-enum RecoveryContext {
-    NoReusableKey,
-    IdempotentMutation,
-}
-
-impl RecoveryContext {
-    fn for_command(command: &Command) -> Self {
-        let is_idempotent_mutation = match command {
-            Command::Init | Command::Recall { .. } | Command::Context(_) => false,
-            Command::Scope { command } => matches!(command, ScopeCommand::Add { .. }),
-            Command::Event { command } => {
-                matches!(
-                    command,
-                    EventCommand::Append { .. } | EventCommand::Purge { .. }
-                )
-            }
-            Command::Observe { command } => matches!(
-                command,
-                ObserveCommand::Plan { .. }
-                    | ObserveCommand::Commit { .. }
-                    | ObserveCommand::Fail { .. }
-            ),
-            Command::Claim { command } => matches!(
-                command,
-                ClaimCommand::Remember(_)
-                    | ClaimCommand::Propose(_)
-                    | ClaimCommand::Confirm { .. }
-                    | ClaimCommand::Correct { .. }
-                    | ClaimCommand::Rescope { .. }
-                    | ClaimCommand::Reject { .. }
-                    | ClaimCommand::Forget { .. }
-                    | ClaimCommand::Purge { .. }
-                    | ClaimCommand::Reconcile { .. }
-            ),
-            Command::View { command } => matches!(command, ViewCommand::Create(_)),
-        };
-        if is_idempotent_mutation {
-            Self::IdempotentMutation
-        } else {
-            Self::NoReusableKey
-        }
-    }
-
-    fn same_key_reusable(self) -> bool {
-        matches!(self, Self::IdempotentMutation)
+fn command_allows_key_reuse(command: &Command) -> bool {
+    match command {
+        Command::Init | Command::Recall { .. } | Command::Context(_) => false,
+        Command::Scope { command } => matches!(command, ScopeCommand::Add { .. }),
+        Command::Event { command } => matches!(
+            command,
+            EventCommand::Append { .. } | EventCommand::Purge { .. }
+        ),
+        Command::Observe { command } => matches!(
+            command,
+            ObserveCommand::Plan { .. }
+                | ObserveCommand::Commit { .. }
+                | ObserveCommand::Fail { .. }
+        ),
+        Command::Claim { command } => matches!(
+            command,
+            ClaimCommand::Remember(_)
+                | ClaimCommand::Propose(_)
+                | ClaimCommand::Confirm { .. }
+                | ClaimCommand::Correct { .. }
+                | ClaimCommand::Rescope { .. }
+                | ClaimCommand::Reject { .. }
+                | ClaimCommand::Forget { .. }
+                | ClaimCommand::Purge { .. }
+                | ClaimCommand::Reconcile { .. }
+        ),
+        Command::View { command } => matches!(command, ViewCommand::Create(_)),
     }
 }
 
@@ -502,11 +483,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let recovery_context = RecoveryContext::for_command(&cli.command);
+    let key_reusable_for_command = command_allows_key_reuse(&cli.command);
     if let Err(error) = run(cli) {
         let message = format!("{error:#}");
         let (code, retryable, same_key_reusable, next_action) =
-            classify_error(&message, recovery_context);
+            classify_error(&message, key_reusable_for_command);
         print_error(code, &message, retryable, same_key_reusable, next_action);
         std::process::exit(1);
     }
@@ -860,9 +841,8 @@ fn parse_json_or_string(raw: &str) -> Value {
 
 fn classify_error(
     message: &str,
-    recovery_context: RecoveryContext,
+    key_reusable_for_command: bool,
 ) -> (&'static str, bool, bool, Option<&'static str>) {
-    let same_key_reusable = recovery_context.same_key_reusable();
     if message.contains("idempotency conflict") || message.contains("already used for") {
         (
             "idempotency_conflict",
@@ -871,7 +851,7 @@ fn classify_error(
             Some("use a new key or retry the identical request"),
         )
     } else if message.contains("budget too small") {
-        let next_action = if same_key_reusable {
+        let next_action = if key_reusable_for_command {
             "increase the token budget and retry with the same key"
         } else {
             "increase the token budget and retry"
@@ -879,14 +859,14 @@ fn classify_error(
         (
             "budget_exceeded",
             false,
-            same_key_reusable,
+            key_reusable_for_command,
             Some(next_action),
         )
     } else if message.contains("view is stale") {
         (
             "stale_view",
             false,
-            same_key_reusable,
+            key_reusable_for_command,
             Some(
                 "read the latest continuity view, rerun reflection from it, and retry with the same key",
             ),
@@ -906,7 +886,7 @@ fn classify_error(
             Some("use a new idempotency key without restoring purged data"),
         )
     } else if message.contains("does not exist") {
-        if same_key_reusable {
+        if key_reusable_for_command {
             (
                 "not_found",
                 false,
@@ -925,21 +905,21 @@ fn classify_error(
         (
             "scope_violation",
             false,
-            same_key_reusable,
+            key_reusable_for_command,
             Some("inspect the scope tree and target scope"),
         )
     } else if message.contains("FTS") || message.contains("SQL logic error") {
         (
             "invalid_search_query",
             false,
-            same_key_reusable,
+            key_reusable_for_command,
             Some("use literal search or correct --fts-query syntax"),
         )
     } else if message.contains("stdin is interactive") || message.contains("stdin was empty") {
         (
             "missing_input",
             false,
-            same_key_reusable,
+            key_reusable_for_command,
             Some("pipe input on stdin or pass the command's file option"),
         )
     } else if message.contains("ObserverResult")
@@ -950,12 +930,17 @@ fn classify_error(
         || message.contains("reading input file")
         || message.contains("claim slot already uses")
     {
-        let next_action = if same_key_reusable {
+        let next_action = if key_reusable_for_command {
             "correct the input and retry with the same key"
         } else {
             "correct the input and retry"
         };
-        ("invalid_input", false, same_key_reusable, Some(next_action))
+        (
+            "invalid_input",
+            false,
+            key_reusable_for_command,
+            Some(next_action),
+        )
     } else {
         ("kernel_error", false, false, None)
     }
@@ -985,13 +970,13 @@ fn print_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryContext, classify_error};
+    use super::classify_error;
 
     #[test]
     fn stale_view_errors_have_view_specific_recovery() {
         let classified = classify_error(
             "view is stale: expected previous view None, found Some(\"view-id\")",
-            RecoveryContext::IdempotentMutation,
+            true,
         );
         assert_eq!(classified.0, "stale_view");
         assert!(!classified.1);
@@ -1005,18 +990,12 @@ mod tests {
 
     #[test]
     fn not_found_recovery_only_reuses_keys_for_idempotent_mutations() {
-        let mutation = classify_error(
-            "scope project:later does not exist",
-            RecoveryContext::IdempotentMutation,
-        );
+        let mutation = classify_error("scope project:later does not exist", true);
         assert_eq!(mutation.0, "not_found");
         assert!(mutation.2);
         assert!(mutation.3.is_some_and(|action| action.contains("same key")));
 
-        let read = classify_error(
-            "event event-id does not exist",
-            RecoveryContext::NoReusableKey,
-        );
+        let read = classify_error("event event-id does not exist", false);
         assert_eq!(read.0, "not_found");
         assert!(!read.2);
         assert!(read.3.is_some_and(|action| !action.contains("key")));
@@ -1026,7 +1005,7 @@ mod tests {
     fn input_file_errors_are_correctable_with_the_same_mutation_key() {
         let classified = classify_error(
             "reading input file /tmp/missing: No such file or directory",
-            RecoveryContext::IdempotentMutation,
+            true,
         );
         assert_eq!(classified.0, "invalid_input");
         assert!(!classified.1);

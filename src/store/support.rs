@@ -174,7 +174,9 @@ pub(super) fn ensure_read_scope(
     record_scope_id: &str,
 ) -> Result<()> {
     ensure!(
-        retrieval_scope_ids(conn, &access.anchor_scope_id)?.contains(&record_scope_id.to_owned()),
+        retrieval_scope_ids(conn, &access.anchor_scope_id)?
+            .iter()
+            .any(|scope_id| scope_id == record_scope_id),
         "record is not visible from scope {}",
         access.anchor_scope_id
     );
