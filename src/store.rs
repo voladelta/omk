@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::model::*;
+use crate::{KernelError, KernelErrorKind};
 
 pub const SCHEMA_VERSION: i64 = 6;
 
@@ -44,6 +45,87 @@ pub struct CreateView {
     pub prompt_version: Option<String>,
     pub token_count: Option<i64>,
     pub idempotency_key: String,
+}
+
+struct EventInsert {
+    scope_id: String,
+    stream_id: String,
+    kind: EventKind,
+    actor_id: Option<String>,
+    occurred_at: Option<String>,
+    content: Value,
+    token_count: i64,
+    sensitivity: Sensitivity,
+    metadata: Value,
+}
+
+fn insert_event(conn: &Connection, input: EventInsert) -> Result<MemoryEvent> {
+    let timestamp = now();
+    let content_hash = hash_json(&input.content);
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_streams(id,scope_id,created_at) VALUES (?1,?2,?3)",
+        params![input.stream_id, input.scope_id, timestamp],
+    )?;
+    let (stream_scope, sequence): (String, i64) = conn.query_row(
+        "SELECT scope_id,next_sequence FROM memory_streams WHERE id=?1",
+        [&input.stream_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        stream_scope == input.scope_id,
+        KernelError::scope_violation(format!(
+            "stream {} belongs to scope {}, not {}",
+            input.stream_id, stream_scope, input.scope_id
+        ))
+    );
+    conn.execute(
+        "UPDATE memory_streams SET next_sequence=next_sequence+1 WHERE id=?1",
+        [&input.stream_id],
+    )?;
+    let event = MemoryEvent {
+        id: Uuid::new_v4().to_string(),
+        stream_id: input.stream_id,
+        sequence,
+        scope_id: input.scope_id,
+        kind: input.kind,
+        actor_id: input.actor_id,
+        occurred_at: input.occurred_at.unwrap_or_else(|| timestamp.clone()),
+        recorded_at: timestamp,
+        content: input.content,
+        content_hash,
+        token_count: input.token_count,
+        sensitivity: input.sensitivity,
+        metadata: input.metadata,
+    };
+    conn.execute(
+        "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            event.id,
+            event.stream_id,
+            event.sequence,
+            event.scope_id,
+            enum_text(&event.kind),
+            event.actor_id,
+            event.occurred_at,
+            event.recorded_at,
+            event.content.to_string(),
+            event.content_hash,
+            event.token_count,
+            enum_text(&event.sensitivity),
+            event.metadata.to_string(),
+        ],
+    )?;
+    if event.sensitivity == Sensitivity::Normal {
+        insert_fts(
+            conn,
+            "event",
+            &event.id,
+            &event.scope_id,
+            &searchable_json(&event.content),
+        )?;
+    }
+    Ok(event)
 }
 
 impl MemoryStore {
@@ -100,7 +182,13 @@ impl MemoryStore {
     ) -> Result<MutationResult<Scope>> {
         validate_nonempty("scope id", id)?;
         validate_nonempty("idempotency key", idempotency_key)?;
-        ensure!(parent_id != Some(id), "a scope cannot be its own parent");
+        ensure!(
+            parent_id != Some(id),
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "a scope cannot be its own parent",
+            )
+        );
 
         let request_hash = operation_request_hash(
             "scope.create",
@@ -155,12 +243,25 @@ impl MemoryStore {
         validate_nonempty("idempotency key", &event.idempotency_key)?;
         ensure!(
             event.token_count.is_none_or(|count| count >= 0),
-            "token count cannot be negative"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "token count cannot be negative",
+            )
         );
-        ensure!(event.metadata.is_object(), "metadata must be a JSON object");
+        ensure!(
+            event.metadata.is_object(),
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "metadata must be a JSON object",
+            )
+        );
         if let Some(occurred_at) = &event.occurred_at {
-            chrono::DateTime::parse_from_rfc3339(occurred_at)
-                .context("occurred-at must be an RFC 3339 timestamp")?;
+            chrono::DateTime::parse_from_rfc3339(occurred_at).map_err(|error| {
+                KernelError::new(
+                    KernelErrorKind::InvalidInput,
+                    format!("occurred-at must be an RFC 3339 timestamp: {error}"),
+                )
+            })?;
         }
 
         let request_hash = if event.sensitivity == Sensitivity::DoNotStore {
@@ -187,32 +288,10 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(redact_for_agent(prior)));
         }
         ensure_scope_exists(&tx, &event.scope_id)?;
-        let now = now();
-        tx.execute(
-            "INSERT OR IGNORE INTO memory_streams(id,scope_id,created_at) VALUES (?1,?2,?3)",
-            params![event.stream_id, event.scope_id, now],
-        )?;
-        let (stream_scope, sequence): (String, i64) = tx.query_row(
-            "SELECT scope_id,next_sequence FROM memory_streams WHERE id=?1",
-            [&event.stream_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        ensure!(
-            stream_scope == event.scope_id,
-            "stream {} belongs to scope {}, not {}",
-            event.stream_id,
-            stream_scope,
-            event.scope_id
-        );
-        tx.execute(
-            "UPDATE memory_streams SET next_sequence=next_sequence+1 WHERE id=?1",
-            [&event.stream_id],
-        )?;
-        let (content, content_hash, token_count) = if event.sensitivity == Sensitivity::DoNotStore {
+        let (content, token_count) = if event.sensitivity == Sensitivity::DoNotStore {
             let tombstone = json!({"omitted": true, "reason": "do-not-store"});
             (
                 tombstone.clone(),
-                hash_json(&tombstone),
                 estimate_event_tokens(&tombstone, &json!({})),
             )
         } else {
@@ -220,56 +299,27 @@ impl MemoryStore {
             let count = event
                 .token_count
                 .map_or(estimated, |count| count.max(estimated));
-            (event.content.clone(), hash_json(&event.content), count)
+            (event.content.clone(), count)
         };
         let stored_metadata = if event.sensitivity == Sensitivity::DoNotStore {
             json!({})
         } else {
             event.metadata
         };
-        let stored = MemoryEvent {
-            id: Uuid::new_v4().to_string(),
-            stream_id: event.stream_id,
-            sequence,
-            scope_id: event.scope_id,
-            kind: event.kind,
-            actor_id: event.actor_id,
-            occurred_at: event.occurred_at.unwrap_or_else(|| now.clone()),
-            recorded_at: now,
-            content,
-            content_hash,
-            token_count,
-            sensitivity: event.sensitivity,
-            metadata: stored_metadata,
-        };
-        tx.execute(
-            "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                stored.id,
-                stored.stream_id,
-                stored.sequence,
-                stored.scope_id,
-                enum_text(&stored.kind),
-                stored.actor_id,
-                stored.occurred_at,
-                stored.recorded_at,
-                stored.content.to_string(),
-                stored.content_hash,
-                stored.token_count,
-                enum_text(&stored.sensitivity),
-                stored.metadata.to_string(),
-            ],
+        let stored = insert_event(
+            &tx,
+            EventInsert {
+                scope_id: event.scope_id,
+                stream_id: event.stream_id,
+                kind: event.kind,
+                actor_id: event.actor_id,
+                occurred_at: event.occurred_at,
+                content,
+                token_count,
+                sensitivity: event.sensitivity,
+                metadata: stored_metadata,
+            },
         )?;
-        if stored.sensitivity == Sensitivity::Normal {
-            insert_fts(
-                &tx,
-                "event",
-                &stored.id,
-                &stored.scope_id,
-                &searchable_json(&stored.content),
-            )?;
-        }
         save_operation(
             &tx,
             &event.idempotency_key,
@@ -288,10 +338,19 @@ impl MemoryStore {
         from_sequence: i64,
         to_sequence: i64,
     ) -> Result<Vec<MemoryEvent>> {
-        ensure!(from_sequence > 0, "from sequence must be positive");
+        ensure!(
+            from_sequence > 0,
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "from sequence must be positive",
+            )
+        );
         ensure!(
             to_sequence >= from_sequence,
-            "to sequence must be at least from sequence"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "to sequence must be at least from sequence",
+            )
         );
         let stream_scope: String = self
             .conn
@@ -301,7 +360,12 @@ impl MemoryStore {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("stream {stream_id} does not exist"),
+                )
+            })?;
         ensure_read_scope(&self.conn, access, &stream_scope)?;
         query_events_range(&self.conn, stream_id, from_sequence, to_sequence)?
             .into_iter()
@@ -317,7 +381,12 @@ impl MemoryStore {
                 row_event,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("event {event_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("event {event_id} does not exist"),
+                )
+            })?;
         apply_read_access(&self.conn, access, event)
     }
 

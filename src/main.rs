@@ -2,12 +2,12 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use omk::{
-    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, MemoryStore, MutationResult, NewEvent,
-    ObserverResult, ReadAccess, SCHEMA_VERSION, ScopeKind, Sensitivity, ViewKind,
-    store::CreateView,
+    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, KernelError, KernelErrorKind, MemoryStore,
+    MutationResult, NewEvent, ObserverResult, ReadAccess, SCHEMA_VERSION, ScopeKind, Sensitivity,
+    ViewKind, store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -487,7 +487,7 @@ fn main() {
     if let Err(error) = run(cli) {
         let message = format!("{error:#}");
         let (code, retryable, same_key_reusable, next_action) =
-            classify_error(&message, key_reusable_for_command);
+            classify_error(&error, key_reusable_for_command);
         print_error(code, &message, retryable, same_key_reusable, next_action);
         std::process::exit(1);
     }
@@ -533,11 +533,15 @@ fn run(cli: Cli) -> Result<()> {
                 if sensitivity == Sensitivity::Secret {
                     ensure!(
                         content.is_none(),
-                        "secret content must be read from stdin or --content-file"
+                        KernelError::invalid_input(
+                            "secret content must be read from stdin or --content-file",
+                        )
                     );
                     ensure!(
                         metadata.is_none(),
-                        "secret metadata must be read from --metadata-file"
+                        KernelError::invalid_input(
+                            "secret metadata must be read from --metadata-file"
+                        )
                     );
                 }
                 let content_uses_stdin = content.is_none()
@@ -547,7 +551,9 @@ fn run(cli: Cli) -> Result<()> {
                 let metadata_uses_stdin = metadata_file.as_deref() == Some(Path::new("-"));
                 ensure!(
                     !(content_uses_stdin && metadata_uses_stdin),
-                    "content and metadata cannot both be read from stdin"
+                    KernelError::invalid_input(
+                        "content and metadata cannot both be read from stdin",
+                    )
                 );
                 let raw = read_inline_or_file(content, content_file.as_deref())?;
                 let content = parse_json_or_string(&raw);
@@ -558,8 +564,11 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     "{}".to_owned()
                 };
-                let metadata: Value = serde_json::from_str(&raw_metadata)
-                    .context("event metadata must be valid JSON")?;
+                let metadata: Value = serde_json::from_str(&raw_metadata).map_err(|error| {
+                    KernelError::invalid_input(format!(
+                        "event metadata must be valid JSON: {error}"
+                    ))
+                })?;
                 print_json(&store.append_event(NewEvent {
                     scope_id: scope,
                     stream_id: stream,
@@ -611,8 +620,11 @@ fn run(cli: Cli) -> Result<()> {
                 idempotency_key,
             } => {
                 let raw = read_path_or_stdin(input.as_deref())?;
-                let result: ObserverResult =
-                    serde_json::from_str(&raw).context("parsing strict ObserverResult JSON")?;
+                let result: ObserverResult = serde_json::from_str(&raw).map_err(|error| {
+                    KernelError::invalid_input(format!(
+                        "parsing strict ObserverResult JSON: {error}"
+                    ))
+                })?;
                 print_json(&store.commit_observation(&run, result, &idempotency_key)?)?;
             }
             ObserveCommand::Fail {
@@ -820,16 +832,23 @@ fn read_inline_or_file(inline: Option<String>, path: Option<&Path>) -> Result<St
 
 fn read_path_or_stdin(path: Option<&Path>) -> Result<String> {
     match path {
-        Some(path) if path != Path::new("-") => fs::read_to_string(path)
-            .with_context(|| format!("reading input file {}", path.display())),
+        Some(path) if path != Path::new("-") => fs::read_to_string(path).map_err(|error| {
+            KernelError::invalid_input(format!("reading input file {}: {error}", path.display()))
+                .into()
+        }),
         _ => {
             ensure!(
                 !io::stdin().is_terminal(),
-                "stdin is interactive; pipe input or pass a file option"
+                KernelError::missing_input(
+                    "stdin is interactive; pipe input or pass a file option",
+                )
             );
             let mut input = String::new();
             io::stdin().read_to_string(&mut input)?;
-            ensure!(!input.is_empty(), "stdin was empty");
+            ensure!(
+                !input.is_empty(),
+                KernelError::missing_input("stdin was empty")
+            );
             Ok(input)
         }
     }
@@ -840,109 +859,94 @@ fn parse_json_or_string(raw: &str) -> Value {
 }
 
 fn classify_error(
-    message: &str,
+    error: &anyhow::Error,
     key_reusable_for_command: bool,
 ) -> (&'static str, bool, bool, Option<&'static str>) {
-    if message.contains("idempotency conflict") || message.contains("already used for") {
-        (
+    let Some(error) = error.downcast_ref::<KernelError>() else {
+        return ("kernel_error", false, false, None);
+    };
+    match error.kind() {
+        KernelErrorKind::IdempotencyConflict => (
             "idempotency_conflict",
             false,
             false,
             Some("use a new key or retry the identical request"),
-        )
-    } else if message.contains("budget too small") {
-        let next_action = if key_reusable_for_command {
-            "increase the token budget and retry with the same key"
-        } else {
-            "increase the token budget and retry"
-        };
-        (
+        ),
+        KernelErrorKind::BudgetExceeded => (
             "budget_exceeded",
             false,
             key_reusable_for_command,
-            Some(next_action),
-        )
-    } else if message.contains("view is stale") {
-        (
+            Some(if key_reusable_for_command {
+                "increase the token budget and retry with the same key"
+            } else {
+                "increase the token budget and retry"
+            }),
+        ),
+        KernelErrorKind::StaleView => (
             "stale_view",
             false,
             key_reusable_for_command,
             Some(
                 "read the latest continuity view, rerun reflection from it, and retry with the same key",
             ),
-        )
-    } else if message.contains(" is stale") {
-        (
+        ),
+        KernelErrorKind::StaleObservationRun => (
             "stale_observation_run",
             false,
             false,
             Some("request a new observation plan"),
-        )
-    } else if message.contains("privacy-purged") {
-        (
+        ),
+        KernelErrorKind::PrivacyPurged => (
             "privacy_purged",
             false,
             false,
             Some("use a new idempotency key without restoring purged data"),
-        )
-    } else if message.contains("does not exist") {
-        if key_reusable_for_command {
-            (
-                "not_found",
-                false,
-                true,
-                Some("create or target an existing resource and retry with the same key"),
-            )
-        } else {
-            (
-                "not_found",
-                false,
-                false,
-                Some("inspect the identifier and scope"),
-            )
+        ),
+        KernelErrorKind::NotFound => {
+            if key_reusable_for_command {
+                (
+                    "not_found",
+                    false,
+                    true,
+                    Some("create or target an existing resource and retry with the same key"),
+                )
+            } else {
+                (
+                    "not_found",
+                    false,
+                    false,
+                    Some("inspect the identifier and scope"),
+                )
+            }
         }
-    } else if message.contains("not visible") || message.contains("does not belong to scope") {
-        (
+        KernelErrorKind::ScopeViolation => (
             "scope_violation",
             false,
             key_reusable_for_command,
             Some("inspect the scope tree and target scope"),
-        )
-    } else if message.contains("FTS") || message.contains("SQL logic error") {
-        (
+        ),
+        KernelErrorKind::InvalidSearchQuery => (
             "invalid_search_query",
             false,
             key_reusable_for_command,
             Some("use literal search or correct --fts-query syntax"),
-        )
-    } else if message.contains("stdin is interactive") || message.contains("stdin was empty") {
-        (
+        ),
+        KernelErrorKind::MissingInput => (
             "missing_input",
             false,
             key_reusable_for_command,
             Some("pipe input on stdin or pass the command's file option"),
-        )
-    } else if message.contains("ObserverResult")
-        || message.contains("source event")
-        || message.contains("must be")
-        || message.contains("cannot be empty")
-        || message.contains("parsing")
-        || message.contains("reading input file")
-        || message.contains("claim slot already uses")
-    {
-        let next_action = if key_reusable_for_command {
-            "correct the input and retry with the same key"
-        } else {
-            "correct the input and retry"
-        };
-        (
+        ),
+        KernelErrorKind::InvalidInput => (
             "invalid_input",
             false,
             key_reusable_for_command,
-            Some(next_action),
-        )
-    } else {
-        ("kernel_error", false, false, None)
+            Some(if key_reusable_for_command {
+                "correct the input and retry with the same key"
+            } else {
+                "correct the input and retry"
+            }),
+        ),
     }
 }
 
@@ -970,11 +974,23 @@ fn print_error(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_error;
+    use super::{KernelError, KernelErrorKind, classify_error};
+
+    fn classified(
+        kind: KernelErrorKind,
+        message: &str,
+        key_reusable: bool,
+    ) -> (&'static str, bool, bool, Option<&'static str>) {
+        classify_error(
+            &anyhow::Error::new(KernelError::new(kind, message)),
+            key_reusable,
+        )
+    }
 
     #[test]
     fn stale_view_errors_have_view_specific_recovery() {
-        let classified = classify_error(
+        let classified = classified(
+            KernelErrorKind::StaleView,
             "view is stale: expected previous view None, found Some(\"view-id\")",
             true,
         );
@@ -990,12 +1006,20 @@ mod tests {
 
     #[test]
     fn not_found_recovery_only_reuses_keys_for_idempotent_mutations() {
-        let mutation = classify_error("scope project:later does not exist", true);
+        let mutation = classified(
+            KernelErrorKind::NotFound,
+            "scope project:later does not exist",
+            true,
+        );
         assert_eq!(mutation.0, "not_found");
         assert!(mutation.2);
         assert!(mutation.3.is_some_and(|action| action.contains("same key")));
 
-        let read = classify_error("event event-id does not exist", false);
+        let read = classified(
+            KernelErrorKind::NotFound,
+            "event event-id does not exist",
+            false,
+        );
         assert_eq!(read.0, "not_found");
         assert!(!read.2);
         assert!(read.3.is_some_and(|action| !action.contains("key")));
@@ -1003,7 +1027,8 @@ mod tests {
 
     #[test]
     fn input_file_errors_are_correctable_with_the_same_mutation_key() {
-        let classified = classify_error(
+        let classified = classified(
+            KernelErrorKind::InvalidInput,
             "reading input file /tmp/missing: No such file or directory",
             true,
         );

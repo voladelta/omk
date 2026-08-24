@@ -532,6 +532,48 @@ fn cli_prewrite_failures_preserve_idempotency_keys() {
     );
     assert_eq!(corrected_scope["operation"]["replayed"], false);
 
+    let wrong_stream_scope = omk(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:recovery",
+            "--stream",
+            "later-stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "wrong owner",
+            "--idempotency-key",
+            "stream-scope-key",
+        ],
+    );
+    assert!(!wrong_stream_scope.status.success());
+    let error: Value = serde_json::from_slice(&wrong_stream_scope.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "scope_violation");
+    assert_eq!(error["error"]["sameKeyReusable"], true);
+    assert!(error["error"]["nextAction"].as_str().is_some());
+
+    let corrected_stream_scope = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:recovery",
+            "--stream",
+            "user-stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "correct owner",
+            "--idempotency-key",
+            "stream-scope-key",
+        ],
+    );
+    assert_eq!(corrected_stream_scope["operation"]["replayed"], false);
+
     success_json(
         &db,
         &[

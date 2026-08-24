@@ -224,7 +224,10 @@ impl MemoryStore {
         let mut claim = query_claim(&tx, claim_id)?;
         ensure!(
             matches!(claim.status, ClaimStatus::Pending | ClaimStatus::Disputed),
-            "claim must be pending or disputed to confirm"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "claim must be pending or disputed to confirm",
+            )
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.confirm", &request)?;
@@ -382,7 +385,10 @@ impl MemoryStore {
         let old = query_claim(&tx, claim_id)?;
         ensure!(
             new_scope_id == old.scope_id || scope_is_ancestor(&tx, new_scope_id, &old.scope_id)?,
-            "claim rescope target must be the current scope or one of its ancestors"
+            KernelError::new(
+                KernelErrorKind::ScopeViolation,
+                "claim rescope target must be the current scope or one of its ancestors",
+            )
         );
         validate_existing_claim_sources_visible(&tx, claim_id, new_scope_id)?;
         let command_event =
@@ -459,7 +465,10 @@ impl MemoryStore {
         let mut claim = query_claim(&tx, claim_id)?;
         ensure!(
             matches!(claim.status, ClaimStatus::Pending | ClaimStatus::Disputed),
-            "claim must be pending or disputed to reject"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "claim must be pending or disputed to reject",
+            )
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.reject", &request)?;
@@ -497,7 +506,10 @@ impl MemoryStore {
                 claim.status,
                 ClaimStatus::Pending | ClaimStatus::Active | ClaimStatus::Disputed
             ),
-            "claim must be pending, active, or disputed to forget"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "claim must be pending, active, or disputed to forget",
+            )
         );
         let command_event =
             insert_memory_command_event(&tx, &claim.scope_id, "claim.forget", &request)?;

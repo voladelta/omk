@@ -257,6 +257,62 @@ fn exact_reads_require_a_visible_scope_even_for_known_ids() {
 }
 
 #[test]
+fn generated_command_events_reject_cross_scope_stream_collisions() {
+    let mut fixture = Fixture::new();
+    fixture.scope("project-a", ScopeKind::Project, None);
+    fixture.scope("project-b", ScopeKind::Project, None);
+    fixture.event(
+        "project-a",
+        "memory-commands:project-b",
+        "occupied",
+        Sensitivity::Normal,
+        "occupy-command-stream",
+    );
+
+    let error = fixture
+        .store
+        .remember_claim(
+            "project-b",
+            ClaimKind::Fact,
+            "private",
+            "note",
+            json!("sibling-data"),
+            &[],
+            "remember-project-b",
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::ScopeViolation)
+    );
+    assert!(
+        fixture
+            .store
+            .list_claims("project-b", false, None)
+            .unwrap()
+            .is_empty()
+    );
+
+    let plan = fixture
+        .store
+        .plan_observation(
+            "project-a",
+            "memory-commands:project-b",
+            100,
+            "fake",
+            "v1",
+            "plan-project-a",
+        )
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(plan.events.len(), 1);
+    assert_eq!(plan.events[0].scope_id, "project-a");
+    assert_eq!(plan.events[0].content, json!("occupied"));
+}
+
+#[test]
 fn set_claims_keep_distinct_members_and_lock_slot_cardinality() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);

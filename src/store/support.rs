@@ -30,7 +30,19 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
         },
     )
     .optional()?
-    .ok_or_else(|| anyhow!("observation run {id} does not exist"))
+    .ok_or_else(|| KernelError::not_found(format!("observation run {id} does not exist")).into())
+}
+
+pub(super) fn ensure_run_pending(run: &ObservationRun, id: &str) -> Result<()> {
+    if run.status == "pending" {
+        return Ok(());
+    }
+    if run.status == "stale" {
+        bail!(KernelError::stale_observation_run(format!(
+            "observation run {id} is stale, not pending"
+        ),));
+    }
+    bail!("observation run {id} is {}, not pending", run.status)
 }
 
 pub(super) fn validate_observer_result(result: &ObserverResult) -> Result<()> {
@@ -40,50 +52,52 @@ pub(super) fn validate_observer_result(result: &ObserverResult) -> Result<()> {
                 .empty_reason
                 .as_deref()
                 .is_some_and(|reason| !reason.trim().is_empty()),
-            "an empty ObserverResult requires a non-empty emptyReason acknowledgement"
+            KernelError::invalid_input(
+                "an empty ObserverResult requires a non-empty emptyReason acknowledgement",
+            )
         );
     }
     if let Some(reason) = &result.empty_reason {
         ensure!(
             reason.chars().count() <= 500,
-            "emptyReason must be at most 500 characters"
+            KernelError::invalid_input("emptyReason must be at most 500 characters")
         );
     }
     for (index, observation) in result.observations.iter().enumerate() {
         ensure!(
             !observation.content.trim().is_empty(),
-            "observation {index} content is empty"
+            KernelError::invalid_input(format!("observation {index} content is empty"))
         );
         validate_score("observation importance", observation.importance)?;
         validate_score("observation confidence", observation.confidence)?;
         ensure!(
             !observation.source_event_ids.is_empty(),
-            "observation {index} has no source events"
+            KernelError::invalid_input(format!("observation {index} has no source events"))
         );
     }
     for (index, claim) in result.claims.iter().enumerate() {
         ensure!(
             !claim.subject.trim().is_empty(),
-            "claim {index} subject is empty"
+            KernelError::invalid_input(format!("claim {index} subject is empty"))
         );
         ensure!(
             !claim.predicate.trim().is_empty(),
-            "claim {index} predicate is empty"
+            KernelError::invalid_input(format!("claim {index} predicate is empty"))
         );
         validate_score("claim confidence", claim.confidence)?;
         ensure!(
             !claim.source_event_ids.is_empty(),
-            "claim {index} has no source events"
+            KernelError::invalid_input(format!("claim {index} has no source events"))
         );
     }
     for (index, ambiguity) in result.ambiguities.iter().enumerate() {
         ensure!(
             !ambiguity.description.trim().is_empty(),
-            "ambiguity {index} description is empty"
+            KernelError::invalid_input(format!("ambiguity {index} description is empty"))
         );
         ensure!(
             !ambiguity.source_event_ids.is_empty(),
-            "ambiguity {index} has no source events"
+            KernelError::invalid_input(format!("ambiguity {index} has no source events"))
         );
     }
     Ok(())
@@ -121,12 +135,16 @@ pub(super) fn validate_provenance(
                 .flat_map(|item| item.source_event_ids.iter()),
         );
     for event_id in all_ids {
-        let event = sources_by_id
-            .get(event_id)
-            .ok_or_else(|| anyhow!("source event {event_id} is not in the observation run"))?;
+        let event = sources_by_id.get(event_id).ok_or_else(|| {
+            KernelError::invalid_input(format!(
+                "source event {event_id} is not in the observation run"
+            ))
+        })?;
         ensure!(
             event.sensitivity == Sensitivity::Normal,
-            "redacted event {event_id} cannot source derived memory"
+            KernelError::invalid_input(format!(
+                "redacted event {event_id} cannot source derived memory"
+            ))
         );
     }
     Ok(())
@@ -135,7 +153,7 @@ pub(super) fn validate_provenance(
 pub(super) fn validate_score(name: &str, score: f64) -> Result<()> {
     ensure!(
         score.is_finite() && (0.0..=1.0).contains(&score),
-        "{name} must be between 0 and 1"
+        KernelError::invalid_input(format!("{name} must be between 0 and 1"))
     );
     Ok(())
 }
@@ -158,8 +176,10 @@ pub(super) fn apply_read_access(
     let visible = retrieval_scope_ids(conn, &access.anchor_scope_id)?;
     ensure!(
         visible.contains(&event.scope_id),
-        "record is not visible from scope {}",
-        access.anchor_scope_id
+        KernelError::scope_violation(format!(
+            "record is not visible from scope {}",
+            access.anchor_scope_id
+        ))
     );
     Ok(if access.reveal_secrets {
         event
@@ -177,8 +197,10 @@ pub(super) fn ensure_read_scope(
         retrieval_scope_ids(conn, &access.anchor_scope_id)?
             .iter()
             .any(|scope_id| scope_id == record_scope_id),
-        "record is not visible from scope {}",
-        access.anchor_scope_id
+        KernelError::scope_violation(format!(
+            "record is not visible from scope {}",
+            access.anchor_scope_id
+        ))
     );
     Ok(())
 }
@@ -188,7 +210,10 @@ pub(super) fn now() -> String {
 }
 
 pub(super) fn validate_nonempty(name: &str, value: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty(), "{name} cannot be empty");
+    ensure!(
+        !value.trim().is_empty(),
+        KernelError::invalid_input(format!("{name} cannot be empty"))
+    );
     Ok(())
 }
 
@@ -219,7 +244,10 @@ pub(super) fn ensure_scope_exists(conn: &Connection, id: &str) -> Result<()> {
         [id],
         |row| row.get(0),
     )?;
-    ensure!(exists, "scope {id} does not exist");
+    ensure!(
+        exists,
+        KernelError::not_found(format!("scope {id} does not exist"))
+    );
     Ok(())
 }
 
@@ -241,15 +269,21 @@ pub(super) fn prior_result<T: DeserializeOwned>(
     };
     ensure!(
         operation == expected_operation,
-        "idempotency key was already used for {operation}, not {expected_operation}"
+        KernelError::idempotency_conflict(format!(
+            "idempotency key was already used for {operation}, not {expected_operation}"
+        ),)
     );
-    let result_json = result_json
-        .ok_or_else(|| anyhow!("the prior result for this idempotency key was privacy-purged"))?;
-    let request_hash = request_hash
-        .ok_or_else(|| anyhow!("the prior request for this idempotency key was privacy-purged"))?;
+    let result_json = result_json.ok_or_else(|| {
+        KernelError::privacy_purged("the prior result for this idempotency key was privacy-purged")
+    })?;
+    let request_hash = request_hash.ok_or_else(|| {
+        KernelError::privacy_purged("the prior request for this idempotency key was privacy-purged")
+    })?;
     ensure!(
         request_hash == expected_request_hash,
-        "idempotency conflict: this key was already used with different request input"
+        KernelError::idempotency_conflict(
+            "idempotency conflict: this key was already used with different request input",
+        )
     );
     Ok(Some(serde_json::from_str(&result_json).with_context(
         || format!("reading stored result for idempotency key {key}"),
@@ -359,7 +393,7 @@ pub(super) fn query_scope(conn: &Connection, id: &str) -> Result<Scope> {
         row_scope,
     )
     .optional()?
-    .ok_or_else(|| anyhow!("scope {id} does not exist"))
+    .ok_or_else(|| KernelError::not_found(format!("scope {id} does not exist")).into())
 }
 
 pub(super) fn visible_scope_ids(conn: &Connection, scope_id: &str) -> Result<Vec<String>> {
@@ -379,7 +413,7 @@ pub(super) fn visible_scope_ids(conn: &Connection, scope_id: &str) -> Result<Vec
             )
             .optional()?;
         let Some(parent) = parent else {
-            bail!("scope {id} does not exist");
+            bail!(KernelError::not_found(format!("scope {id} does not exist")));
         };
         result.push(id);
         current = parent;
@@ -475,63 +509,22 @@ pub(super) fn insert_memory_command_event(
     request: &Value,
 ) -> Result<MemoryEvent> {
     let stream_id = format!("memory-commands:{scope_id}");
-    let timestamp = now();
-    conn.execute(
-        "INSERT OR IGNORE INTO memory_streams(id,scope_id,created_at) VALUES (?1,?2,?3)",
-        params![stream_id, scope_id, timestamp],
-    )?;
-    let sequence: i64 = conn.query_row(
-        "SELECT next_sequence FROM memory_streams WHERE id=?1",
-        [&stream_id],
-        |row| row.get(0),
-    )?;
-    conn.execute(
-        "UPDATE memory_streams SET next_sequence=next_sequence+1 WHERE id=?1",
-        [&stream_id],
-    )?;
     let content = json!({"operation": operation, "request": request});
-    let event = MemoryEvent {
-        id: Uuid::new_v4().to_string(),
-        stream_id,
-        sequence,
-        scope_id: scope_id.to_owned(),
-        kind: EventKind::MemoryCommand,
-        actor_id: Some("explicit-user".to_owned()),
-        occurred_at: timestamp.clone(),
-        recorded_at: timestamp,
-        content_hash: hash_json(&content),
-        token_count: estimate_tokens(&content.to_string()),
-        content,
-        sensitivity: Sensitivity::Normal,
-        metadata: json!({"generatedBy": "omk"}),
-    };
-    conn.execute(
-        "INSERT INTO memory_events(id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![
-            event.id,
-            event.stream_id,
-            event.sequence,
-            event.scope_id,
-            enum_text(&event.kind),
-            event.actor_id,
-            event.occurred_at,
-            event.recorded_at,
-            event.content.to_string(),
-            event.content_hash,
-            event.token_count,
-            enum_text(&event.sensitivity),
-            event.metadata.to_string(),
-        ],
-    )?;
-    insert_fts(
+    let token_count = estimate_tokens(&content.to_string());
+    insert_event(
         conn,
-        "event",
-        &event.id,
-        &event.scope_id,
-        &searchable_json(&event.content),
-    )?;
-    Ok(event)
+        EventInsert {
+            scope_id: scope_id.to_owned(),
+            stream_id,
+            kind: EventKind::MemoryCommand,
+            actor_id: Some("explicit-user".to_owned()),
+            occurred_at: None,
+            content,
+            token_count,
+            sensitivity: Sensitivity::Normal,
+            metadata: json!({"generatedBy": "omk"}),
+        },
+    )
 }
 
 pub(super) fn insert_claim(conn: &Connection, claim: &Claim) -> Result<()> {
@@ -673,7 +666,7 @@ pub(super) fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
         row_claim,
     )
     .optional()?
-    .ok_or_else(|| anyhow!("claim {id} does not exist"))
+    .ok_or_else(|| KernelError::not_found(format!("claim {id} does not exist")).into())
 }
 
 pub(super) fn query_active_claim_member(
@@ -746,7 +739,7 @@ pub(super) fn ensure_claim_slot(conn: &Connection, claim: &Claim) -> Result<()> 
     )?;
     ensure!(
         cardinality == enum_text(&claim.cardinality),
-        "claim slot already uses {cardinality} cardinality"
+        KernelError::invalid_input(format!("claim slot already uses {cardinality} cardinality"))
     );
     Ok(())
 }
@@ -765,14 +758,18 @@ pub(super) fn validate_claim_event_sources(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("source event {event_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::not_found(format!("source event {event_id} does not exist"))
+            })?;
         ensure!(
             visible.contains(&event_scope),
-            "source event {event_id} from scope {event_scope} is not visible to scope {scope_id}"
+            KernelError::scope_violation(format!(
+                "source event {event_id} from scope {event_scope} is not visible to scope {scope_id}"
+            ))
         );
         ensure!(
             sensitivity == "normal",
-            "redacted event {event_id} cannot source a claim"
+            KernelError::invalid_input(format!("redacted event {event_id} cannot source a claim"))
         );
     }
     Ok(())
@@ -796,7 +793,9 @@ pub(super) fn validate_existing_claim_sources_visible(
     for source_scope in source_scopes {
         ensure!(
             visible.contains(&source_scope),
-            "claim {claim_id} has source evidence in scope {source_scope}, which is not visible from scope {new_scope_id}"
+            KernelError::scope_violation(format!(
+                "claim {claim_id} has source evidence in scope {source_scope}, which is not visible from scope {new_scope_id}"
+            ))
         );
     }
     Ok(())
@@ -956,7 +955,11 @@ pub(super) fn search_fts(
                 rank: row.get(4)?,
             })
         })
-        .with_context(|| format!("running SQLite FTS query {query:?}"))?;
+        .map_err(|error| {
+            KernelError::invalid_search_query(format!(
+                "running SQLite FTS query {query:?}: {error}"
+            ))
+        })?;
     collect_rows(rows)
 }
 

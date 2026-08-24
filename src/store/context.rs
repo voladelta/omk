@@ -6,12 +6,18 @@ impl MemoryStore {
         validate_nonempty("idempotency key", &input.idempotency_key)?;
         ensure!(
             input.kind == ViewKind::Continuity,
-            "continuation views are created only by observation commit"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "continuation views are created only by observation commit",
+            )
         );
         ensure!(
             input.source_from_sequence > 0
                 && input.source_through_sequence >= input.source_from_sequence,
-            "view source sequence range is invalid"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "view source sequence range is invalid",
+            )
         );
         let request_hash = operation_request_hash("view.create", &input)?;
         let tx = self.immediate()?;
@@ -29,20 +35,34 @@ impl MemoryStore {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("stream {} does not exist", input.stream_id))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("stream {} does not exist", input.stream_id),
+                )
+            })?;
         ensure!(
             stream_scope == input.scope_id,
-            "stream {} belongs to scope {stream_scope}, not {}",
-            input.stream_id,
-            input.scope_id
+            KernelError::new(
+                KernelErrorKind::ScopeViolation,
+                format!(
+                    "stream {} belongs to scope {stream_scope}, not {}",
+                    input.stream_id, input.scope_id
+                ),
+            )
         );
         let latest = latest_view(&tx, &input.stream_id, "continuity")?;
         ensure!(
             latest.as_ref().map(|view| view.id.as_str())
                 == input.expected_previous_view_id.as_deref(),
-            "view is stale: expected previous view {:?}, found {:?}",
-            input.expected_previous_view_id,
-            latest.as_ref().map(|view| view.id.as_str())
+            KernelError::new(
+                KernelErrorKind::StaleView,
+                format!(
+                    "view is stale: expected previous view {:?}, found {:?}",
+                    input.expected_previous_view_id,
+                    latest.as_ref().map(|view| view.id.as_str())
+                ),
+            )
         );
         for observation_id in &input.source_observation_ids {
             let (source_scope, source_stream, source_start, source_end):
@@ -56,21 +76,41 @@ impl MemoryStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?
-                .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
+                .ok_or_else(|| {
+                    KernelError::new(
+                        KernelErrorKind::NotFound,
+                        format!("observation {observation_id} does not exist"),
+                    )
+                })?;
             ensure!(
                 source_scope == input.scope_id,
-                "observation {observation_id} belongs to scope {source_scope}, not {}",
-                input.scope_id
+                KernelError::new(
+                    KernelErrorKind::ScopeViolation,
+                    format!(
+                        "observation {observation_id} belongs to scope {source_scope}, not {}",
+                        input.scope_id
+                    ),
+                )
             );
             ensure!(
                 source_stream == input.stream_id,
-                "observation {observation_id} belongs to stream {source_stream}, not {}",
-                input.stream_id
+                KernelError::new(
+                    KernelErrorKind::ScopeViolation,
+                    format!(
+                        "observation {observation_id} belongs to stream {source_stream}, not {}",
+                        input.stream_id
+                    ),
+                )
             );
             ensure!(
                 source_start >= input.source_from_sequence
                     && source_end <= input.source_through_sequence,
-                "observation {observation_id} is outside the declared view source range"
+                KernelError::new(
+                    KernelErrorKind::InvalidInput,
+                    format!(
+                        "observation {observation_id} is outside the declared view source range"
+                    ),
+                )
             );
         }
         let estimated_token_count = estimate_tokens(&input.content);
@@ -128,7 +168,12 @@ impl MemoryStore {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("observation {observation_id} does not exist"),
+                )
+            })?;
         ensure_read_scope(&self.conn, access, &scope_id)?;
         let mut statement = self.conn.prepare(
             "SELECT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
@@ -155,7 +200,12 @@ impl MemoryStore {
                 row_observation,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("observation {observation_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("observation {observation_id} does not exist"),
+                )
+            })?;
         ensure_read_scope(&self.conn, access, &observation.scope_id)?;
         Ok(ObservationExplanation {
             observation,
@@ -210,7 +260,10 @@ impl MemoryStore {
         validate_nonempty("search query", query)?;
         ensure!(
             limit > 0 && limit <= 1000,
-            "search limit must be from 1 to 1000"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "search limit must be from 1 to 1000",
+            )
         );
         let scope_ids = retrieval_scope_ids(&self.conn, scope_id)?;
         let fts_query = if advanced_fts {
@@ -229,10 +282,16 @@ impl MemoryStore {
         recent_raw_tokens: i64,
         query: Option<&str>,
     ) -> Result<ContextBundle> {
-        ensure!(max_tokens > 0, "max tokens must be positive");
+        ensure!(
+            max_tokens > 0,
+            KernelError::new(KernelErrorKind::InvalidInput, "max tokens must be positive",)
+        );
         ensure!(
             recent_raw_tokens >= 0,
-            "recent raw tokens cannot be negative"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "recent raw tokens cannot be negative",
+            )
         );
         let visible = visible_scope_ids(&self.conn, scope_id)?;
         let stream_scope: String = self
@@ -243,11 +302,19 @@ impl MemoryStore {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("stream {stream_id} does not exist"),
+                )
+            })?;
         ensure!(
             visible.contains(&stream_scope)
                 || scope_is_ancestor(&self.conn, scope_id, &stream_scope)?,
-            "stream {stream_id} is not visible from scope {scope_id}"
+            KernelError::new(
+                KernelErrorKind::ScopeViolation,
+                format!("stream {stream_id} is not visible from scope {scope_id}"),
+            )
         );
         let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"))?;
         sort_claims_by_scope(&mut claims, &visible);
@@ -261,7 +328,12 @@ impl MemoryStore {
         let required_tokens: i64 = claims.iter().map(estimate_claim_tokens).sum();
         ensure!(
             required_tokens <= max_tokens,
-            "context budget too small: minimumRequiredTokens={required_tokens} for active claims"
+            KernelError::new(
+                KernelErrorKind::BudgetExceeded,
+                format!(
+                    "context budget too small: minimumRequiredTokens={required_tokens} for active claims"
+                ),
+            )
         );
         let mut diagnostics = ContextDiagnostics {
             estimated_tokens: required_tokens,

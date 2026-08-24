@@ -72,7 +72,12 @@ impl MemoryStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("event {event_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("event {event_id} does not exist"),
+                )
+            })?;
         let closure = collect_privacy_closure(&tx, &[event_id.to_owned()], &[])?;
         let dependent_observations = closure.observation_ids.len();
         let dependent_claims = closure.claim_ids.len();

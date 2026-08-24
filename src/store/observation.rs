@@ -10,7 +10,10 @@ impl MemoryStore {
         prompt_version: &str,
         idempotency_key: &str,
     ) -> Result<MutationResult<ObservationPlanOutcome>> {
-        ensure!(max_tokens > 0, "max tokens must be positive");
+        ensure!(
+            max_tokens > 0,
+            KernelError::new(KernelErrorKind::InvalidInput, "max tokens must be positive",)
+        );
         validate_nonempty("observer model", observer_model)?;
         validate_nonempty("prompt version", prompt_version)?;
         validate_nonempty("idempotency key", idempotency_key)?;
@@ -42,10 +45,18 @@ impl MemoryStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("stream {stream_id} does not exist"),
+                )
+            })?;
         ensure!(
             stream_scope == scope_id,
-            "stream {stream_id} does not belong to scope {scope_id}"
+            KernelError::new(
+                KernelErrorKind::ScopeViolation,
+                format!("stream {stream_id} does not belong to scope {scope_id}"),
+            )
         );
 
         let model_events: Vec<MemoryEvent> = query_events_after(&tx, stream_id, cursor)?
@@ -55,9 +66,13 @@ impl MemoryStore {
         if let Some(first) = model_events.first() {
             ensure!(
                 first.token_count <= max_tokens,
-                "observation budget too small: minimumRequiredTokens={} for event {}",
-                first.token_count,
-                first.id
+                KernelError::new(
+                    KernelErrorKind::BudgetExceeded,
+                    format!(
+                        "observation budget too small: minimumRequiredTokens={} for event {}",
+                        first.token_count, first.id
+                    ),
+                )
             );
         }
         let mut selected = Vec::new();
@@ -141,11 +156,7 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(prior));
         }
         let run = query_run(&tx, run_id)?;
-        ensure!(
-            run.status == "pending",
-            "observation run {run_id} is {}, not pending",
-            run.status
-        );
+        ensure_run_pending(&run, run_id)?;
         let cursor: i64 = tx.query_row(
             "SELECT observed_through_sequence FROM memory_streams WHERE id=?1",
             [&run.stream_id],
@@ -157,10 +168,13 @@ impl MemoryStore {
                 params![run_id, now()],
             )?;
             tx.commit()?;
-            bail!(
-                "observation run {run_id} is stale: expected cursor {}, found {cursor}",
-                run.cursor_at_plan
-            );
+            bail!(KernelError::new(
+                KernelErrorKind::StaleObservationRun,
+                format!(
+                    "observation run {run_id} is stale: expected cursor {}, found {cursor}",
+                    run.cursor_at_plan
+                ),
+            ));
         }
 
         let source_events =
@@ -329,7 +343,10 @@ impl MemoryStore {
         validate_nonempty("idempotency key", idempotency_key)?;
         ensure!(
             reason.chars().count() <= 200,
-            "failure reason must be at most 200 characters"
+            KernelError::new(
+                KernelErrorKind::InvalidInput,
+                "failure reason must be at most 200 characters",
+            )
         );
         let request_hash = operation_request_hash("observation.fail", &(run_id, reason))?;
         let tx = self.immediate()?;
@@ -340,11 +357,7 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(prior));
         }
         let run = query_run(&tx, run_id)?;
-        ensure!(
-            run.status == "pending",
-            "observation run {run_id} is {}, not pending",
-            run.status
-        );
+        ensure_run_pending(&run, run_id)?;
         tx.execute(
             "UPDATE observation_runs SET status='failed',error=?2,updated_at=?3 WHERE id=?1",
             params![run_id, reason, now()],
@@ -374,7 +387,12 @@ impl MemoryStore {
                 row_observation_run_info,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("observation run {run_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("observation run {run_id} does not exist"),
+                )
+            })?;
         ensure_read_scope(&self.conn, access, &run.scope_id)?;
         Ok(run)
     }
@@ -388,7 +406,10 @@ impl MemoryStore {
         if let Some(status) = status {
             ensure!(
                 matches!(status, "pending" | "committed" | "failed" | "stale"),
-                "invalid observation run status {status}"
+                KernelError::new(
+                    KernelErrorKind::InvalidInput,
+                    format!("invalid observation run status {status}"),
+                )
             );
         }
         let mut statement = self.conn.prepare(
@@ -416,7 +437,12 @@ impl MemoryStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("stream {stream_id} does not exist"))?;
+            .ok_or_else(|| {
+                KernelError::new(
+                    KernelErrorKind::NotFound,
+                    format!("stream {stream_id} does not exist"),
+                )
+            })?;
         ensure_read_scope(&self.conn, access, &scope_id)?;
         let last_sequence = self.conn.query_row(
             "SELECT MAX(sequence) FROM memory_events WHERE stream_id=?1",
