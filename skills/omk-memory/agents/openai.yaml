@@ -1,0 +1,4 @@
+interface:
+  display_name: "OMK Memory"
+  short_description: "Operate durable source-backed agent memory"
+  default_prompt: "Use $omk-memory to resume this task from durable OMK context and record material outcomes."
