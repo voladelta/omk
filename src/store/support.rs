@@ -45,7 +45,39 @@ pub(super) fn ensure_run_pending(run: &ObservationRun, id: &str) -> Result<()> {
     bail!("observation run {id} is {}, not pending", run.status)
 }
 
+pub(super) fn validate_observer_size(result: &ObserverResult) -> Result<()> {
+    ensure!(
+        serde_json::to_vec(result)?.len() <= MAX_OBSERVER_BYTES,
+        KernelError::invalid_input("ObserverResult exceeds 1048576 serialized bytes")
+    );
+    Ok(())
+}
+
 pub(super) fn validate_observer_result(result: &ObserverResult) -> Result<()> {
+    let continuation = &result.continuation;
+    let items = result.observations.len()
+        + result.claims.len()
+        + result.ambiguities.len()
+        + continuation.completed.len()
+        + continuation.blockers.len()
+        + continuation.next_actions.len()
+        + continuation.unresolved_questions.len();
+    ensure!(
+        items <= MAX_OBSERVER_ITEMS,
+        KernelError::invalid_input("ObserverResult exceeds 256 items")
+    );
+    for sources in result
+        .observations
+        .iter()
+        .map(|item| &item.source_event_ids)
+        .chain(result.claims.iter().map(|item| &item.source_event_ids))
+        .chain(result.ambiguities.iter().map(|item| &item.source_event_ids))
+    {
+        ensure!(
+            sources.len() <= MAX_SOURCE_IDS,
+            KernelError::invalid_input("ObserverResult item exceeds 256 source IDs")
+        );
+    }
     if observer_result_is_completely_empty(result) {
         ensure!(
             result
@@ -453,15 +485,17 @@ pub(super) fn literal_fts_query(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
-pub(super) fn query_events_after(
+pub(super) fn query_event_page(
     conn: &Connection,
     stream_id: &str,
     cursor: i64,
+    reverse: bool,
 ) -> Result<Vec<MemoryEvent>> {
-    let mut statement = conn.prepare(
+    let (comparison, order) = if reverse { ("<", "DESC") } else { (">", "ASC") };
+    let mut statement = conn.prepare(&format!(
         "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json
-         FROM memory_events WHERE stream_id=?1 AND sequence>?2 ORDER BY sequence",
-    )?;
+         FROM memory_events WHERE stream_id=?1 AND sequence{comparison}?2 ORDER BY sequence {order} LIMIT 32"
+    ))?;
     collect_rows(statement.query_map(params![stream_id, cursor], row_event)?)
 }
 
@@ -640,6 +674,15 @@ pub(super) fn query_claims_for_scopes(
     scope_ids: &[String],
     status: Option<&str>,
 ) -> Result<Vec<Claim>> {
+    query_claim_candidates(conn, scope_ids, status, None)
+}
+
+pub(super) fn query_claim_candidates(
+    conn: &Connection,
+    scope_ids: &[String],
+    status: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<Claim>> {
     if scope_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -655,6 +698,9 @@ pub(super) fn query_claims_for_scopes(
         values.push(status.to_owned());
     }
     sql.push_str(" ORDER BY created_at,id");
+    if let Some(limit) = limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
     let mut statement = conn.prepare(&sql)?;
     collect_rows(statement.query_map(rusqlite::params_from_iter(values), row_claim)?)
 }
@@ -840,46 +886,33 @@ pub(super) fn query_observations_for_scopes(
         .join(",");
     let sql = format!(
         "SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
-         FROM observations WHERE scope_id IN ({placeholders}) ORDER BY created_at,id"
+         FROM observations WHERE scope_id IN ({placeholders}) ORDER BY importance DESC,created_at,id LIMIT 257"
     );
     let mut statement = conn.prepare(&sql)?;
     collect_rows(statement.query_map(rusqlite::params_from_iter(scope_ids), row_observation)?)
 }
 
-pub(super) fn query_observation_source_ids_for_scopes(
+pub(super) fn observation_has_events(
     conn: &Connection,
-    scope_ids: &[String],
-) -> Result<HashMap<String, HashSet<String>>> {
-    if scope_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = std::iter::repeat_n("?", scope_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT source.observation_id,source.event_id
-         FROM observation_sources source
-         JOIN observations observation ON observation.id=source.observation_id
-         WHERE observation.scope_id IN ({placeholders})"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(scope_ids), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut sources = HashMap::<String, HashSet<String>>::new();
-    for row in rows {
-        let (observation_id, event_id) = row?;
-        sources.entry(observation_id).or_default().insert(event_id);
-    }
-    Ok(sources)
+    observation_id: &str,
+    event_ids_json: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM json_each(?2) event
+         JOIN observation_sources source ON source.event_id=event.value
+         WHERE source.observation_id=?1)",
+        params![observation_id, event_ids_json],
+        |row| row.get(0),
+    )?)
 }
 
-pub(super) fn query_view_observation_ids(
+pub(super) fn observation_in_views(
     conn: &Connection,
+    observation_id: &str,
     view_ids: &[String],
-) -> Result<HashSet<String>> {
+) -> Result<bool> {
     if view_ids.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(false);
     }
     let placeholders = std::iter::repeat_n("?", view_ids.len())
         .collect::<Vec<_>>()
@@ -893,25 +926,55 @@ pub(super) fn query_view_observation_ids(
             JOIN view_chain current ON current.id=view.id
             WHERE view.previous_view_id IS NOT NULL
          )
-         SELECT DISTINCT source.observation_id
+         SELECT EXISTS(SELECT 1
          FROM view_chain
-         JOIN view_sources source ON source.view_id=view_chain.id"
+         JOIN view_sources source ON source.view_id=view_chain.id
+         WHERE source.observation_id=?)"
     );
     let mut statement = conn.prepare(&sql)?;
-    Ok(collect_rows(
-        statement.query_map(rusqlite::params_from_iter(view_ids), |row| {
-            row.get::<_, String>(0)
-        })?,
-    )?
-    .into_iter()
-    .collect())
+    Ok(statement.query_row(
+        rusqlite::params_from_iter(
+            view_ids
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(observation_id)),
+        ),
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn context_source_ids(
+    conn: &Connection,
+    record_type: &str,
+    id: &str,
+) -> Result<Vec<String>> {
+    let (table, column) = match record_type {
+        "observation" => ("observation_sources", "observation_id"),
+        "claim" => ("claim_sources", "claim_id"),
+        _ => bail!("unsupported full-text record type"),
+    };
+    query_string_column(
+        conn,
+        &format!("SELECT event_id FROM {table} WHERE {column}=?1 ORDER BY event_id LIMIT 257"),
+        id,
+    )
 }
 
 pub(super) fn estimate_claim_tokens(claim: &Claim) -> i64 {
-    estimate_tokens(&format!(
-        "{} {} {}",
-        claim.subject, claim.predicate, claim.value
-    ))
+    serialized_item_tokens(claim)
+}
+
+// One extra character covers the array separator; rounding per item is conservative.
+pub(super) fn serialized_item_tokens(value: &impl Serialize) -> i64 {
+    estimate_tokens(&(serde_json::to_string(value).expect("model value serializes") + ","))
+}
+
+pub(super) fn event_hint_extra(event: &MemoryEvent) -> i64 {
+    (event.token_count - estimate_event_tokens(&event.content, &event.metadata)).max(0)
+}
+
+pub(super) fn view_hint_extra(view: &MemoryView) -> i64 {
+    (view.token_count - estimate_tokens(&view.content)).max(0)
 }
 
 pub(super) fn sort_claims_by_scope(claims: &mut [Claim], scope_order: &[String]) {
@@ -928,6 +991,7 @@ pub(super) fn search_fts(
     scope_ids: &[String],
     query: &str,
     limit: usize,
+    current_only: bool,
 ) -> Result<Vec<SearchHit>> {
     if scope_ids.is_empty() {
         return Ok(Vec::new());
@@ -936,13 +1000,16 @@ pub(super) fn search_fts(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT record_type,record_id,scope_id,text,rank FROM memory_fts
-         WHERE memory_fts MATCH ? AND scope_id IN ({placeholders})
-         ORDER BY rank LIMIT ?"
+        "SELECT record_type,record_id,memory_fts.scope_id,substr(text,1,512),rank,claims.status FROM memory_fts
+         LEFT JOIN claims ON record_type='claim' AND claims.id=record_id
+         WHERE memory_fts MATCH ? AND memory_fts.scope_id IN ({placeholders})
+           AND (?=0 OR record_type!='claim' OR claims.status='active')
+         ORDER BY rank,record_type,record_id LIMIT ?"
     );
-    let mut values = Vec::with_capacity(scope_ids.len() + 2);
+    let mut values = Vec::with_capacity(scope_ids.len() + 3);
     values.push(rusqlite::types::Value::Text(query.to_owned()));
     values.extend(scope_ids.iter().cloned().map(rusqlite::types::Value::Text));
+    values.push(rusqlite::types::Value::Integer(i64::from(current_only)));
     values.push(rusqlite::types::Value::Integer(limit as i64));
     let mut statement = conn.prepare(&sql)?;
     let rows = statement
@@ -953,6 +1020,10 @@ pub(super) fn search_fts(
                 scope_id: row.get(2)?,
                 text: row.get(3)?,
                 rank: row.get(4)?,
+                claim_status: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|value| parse_enum(&value))
+                    .transpose()?,
             })
         })
         .map_err(|error| {
@@ -961,6 +1032,24 @@ pub(super) fn search_fts(
             ))
         })?;
     collect_rows(rows)
+}
+
+pub(super) fn bounded_fts_query(query: &str, mode: SearchMode) -> Result<String> {
+    ensure!(
+        !query.trim().is_empty() && query.len() <= 4096 && query.split_whitespace().count() <= 64,
+        KernelError::invalid_search_query(
+            "search query must contain 1 to 4096 bytes and at most 64 whitespace terms"
+        )
+    );
+    Ok(match mode {
+        SearchMode::Phrase => literal_fts_query(query),
+        SearchMode::Terms => query
+            .split_whitespace()
+            .map(literal_fts_query)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        SearchMode::Advanced => query.to_owned(),
+    })
 }
 
 pub(super) fn query_string_column(

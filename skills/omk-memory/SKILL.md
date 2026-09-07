@@ -47,9 +47,10 @@ Use `single` when one value may be active in the logical slot and `set` when dis
 ## Maintain and retrieve memory
 
 - For new unobserved history or continuity maintenance, follow [observe and reflect](references/observe-and-reflect.md).
-- Use `recall search` for a literal phrase by default; opt into `--fts-query` only for intentional FTS5 syntax.
+- Use `recall search` for a literal phrase by default. Use `--terms` for separated literal words, or `--fts-query` for intentional FTS5 syntax. Read `claimStatus`; use `--current-only` when only active claims apply. Search text is a preview of at most 512 characters.
 - Use exact recall commands when a conclusion needs source verification.
 - Rebuild bounded context after accepted state or continuity changes. On `budget_exceeded`, preserve active state and raise the budget to at least `minimumRequiredTokens`; never manufacture room by discarding authoritative state.
+- Check the final rendered model input with its tokenizer. OMK estimates compact JSON fields, excludes diagnostics and command envelopes, and does not count your prompt or rendering overhead. Inspect `diagnostics.truncated`; exact recall is complete when bounded context needs more evidence.
 
 Before `observe commit`, apply this provenance gate to every proposed observation, claim, ambiguity, and continuation item:
 

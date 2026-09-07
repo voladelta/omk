@@ -1,3 +1,41 @@
+use super::*;
+
+pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SCHEMA)?;
+    let mut statement = reference
+        .prepare("SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
+    let required = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for object in required {
+        let (kind, name, sql) = object?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Compare SQLite's stored definitions exactly. Rewriting quoted SQL can
+        // hide changed CHECK values, partial predicates, or FTS configuration.
+        ensure!(
+            actual.as_deref() == Some(sql.as_str()),
+            KernelError::new(
+                KernelErrorKind::SchemaMismatch,
+                format!(
+                    "schema v{SCHEMA_VERSION} mismatch: required {kind} {name} is missing or changed"
+                )
+            )
+        );
+    }
+    Ok(())
+}
+
 pub(super) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memory_scopes (
     id TEXT PRIMARY KEY,

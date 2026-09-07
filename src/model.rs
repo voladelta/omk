@@ -218,6 +218,14 @@ pub struct ObservationPlan {
     pub previous_continuation: Option<MemoryView>,
 }
 
+impl ObservationPlan {
+    /// Model input only. Run identifiers and command instructions are envelopes.
+    pub fn model_payload(&self) -> Value {
+        serde_json::json!({"scope": self.scope, "events": self.events,
+            "activeClaims": self.active_claims, "previousContinuation": self.previous_continuation})
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "status",
@@ -359,6 +367,8 @@ pub struct ReconciliationSummary {
 pub struct ContextDiagnostics {
     pub estimated_tokens: i64,
     pub omitted_items: Vec<OmittedItem>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,7 +399,37 @@ pub struct SearchHit {
     pub scope_id: String,
     pub text: String,
     pub rank: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_status: Option<ClaimStatus>,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Phrase,
+    Terms,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchOptions {
+    pub mode: SearchMode,
+    /// Filter claims to active status; events and observations remain searchable.
+    pub current_only: bool,
+}
+
+impl ContextBundle {
+    pub fn model_payload(&self) -> Value {
+        serde_json::json!({"claims": self.claims, "pendingClaims": self.pending_claims,
+            "continuation": self.continuation, "continuityViews": self.continuity_views,
+            "observations": self.observations, "recentEvents": self.recent_events,
+            "recalledEvidence": self.recalled_evidence})
+    }
+}
+
+pub const MAX_OBSERVER_BYTES: usize = 1_048_576;
+pub const MAX_OBSERVER_ITEMS: usize = 256;
+pub const MAX_SOURCE_IDS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

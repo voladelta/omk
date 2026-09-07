@@ -422,6 +422,13 @@ impl MemoryStore {
                 &claim.cardinality,
                 &claim.value_hash,
             )? {
+                ensure!(
+                    existing.value == claim.value,
+                    KernelError::new(
+                        KernelErrorKind::ClaimConflict,
+                        "rescope destination has a different active value; confirm or correct the conflict explicitly"
+                    )
+                );
                 set_command_event_owner(&tx, &command_event.id, &existing.id)?;
                 copy_claim_sources(&tx, claim_id, &existing.id)?;
                 attach_event_sources(&tx, &existing.id, std::slice::from_ref(&command_event.id))?;

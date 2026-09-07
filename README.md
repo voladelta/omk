@@ -152,7 +152,7 @@ When there are no new events, OMK returns a caught-up result without a run:
 }
 ```
 
-Apply the [observer prompt and output contract](prompts/observer.v1.md) to the `.data` object. You can also get the full input shape from `omk observe commit --help`.
+Apply the [observer prompt and output contract](prompts/observer.v1.md) to the returned `scope`, `events`, `activeClaims`, and `previousContinuation` fields. Keep `runId` for commit routing. You can also get the full output shape from `omk observe commit --help`.
 
 The result must include `observations`, `claims`, `continuation` and `ambiguities`. Set `emptyReason` when all sections are empty. OMK then keeps the existing continuation view.
 
@@ -194,7 +194,7 @@ Run inspection also returns `sourceIntegrity`. A committed run changes from `int
 
 ## Build bounded context
 
-Set a hard token budget when you build context:
+Set a token estimate budget when you build context:
 
 ```sh
 omk context \
@@ -207,6 +207,16 @@ omk context \
 OMK never silently removes active state. If it cannot fit, the command returns `budget_exceeded` and `minimumRequiredTokens`.
 
 The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
+
+The estimate covers compact JSON model input, including record fields and metadata. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
+
+Observation planning reserves active inherited claims and previous continuation before selecting the next events. If required state and the first event cannot fit, it returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
+
+Plans and recent context read events in pages of 32. Context considers at most 256 general observations and 256 pending/disputed claims (reading at most 257 observations and 257 claims per status to detect truncation). Each of at most 10 search hits expands to at most 256 source events. `diagnostics.truncated` marks candidate, source, or raw-tail truncation; `omittedItems` describes inspected items only. Exact recall remains complete. Active claims are all inspected. These bounds limit decoded rows and source loading; SQLite sorting, scope traversal, and view-chain checks can still scan growing history, so they do not guarantee constant latency.
+
+Observer input is limited to 1,048,576 bytes before CLI JSON parsing and after store serialization, 256 total observations/claims/ambiguities/continuation list items, and 256 source IDs per item. Oversized input fails with `invalid_input` before commit.
+
+Within the byte limit, identical saved commits replay before new item and source admission checks. Older committed results remain replayable; changed requests and privacy tombstones retain their existing errors.
 
 ## Manage claims and evidence
 
@@ -223,6 +233,8 @@ omk claim forget     Make a claim inactive but keep its history.
 omk claim purge      Delete a claim and its provenance links.
 omk event purge      Delete an event and dependent records.
 ```
+
+Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
@@ -250,6 +262,8 @@ Search treats your input as a literal phrase. Punctuation and hyphens are safe:
 omk recall search --scope project:omk --query 'settlement ETH-only'
 ```
 
+Search returns a preview of at most 512 Unicode characters in `text`, with `claimStatus` for claim hits. Use exact recall to read full evidence. The default includes historical claims and matches a literal phrase. `--terms` matches all whitespace-separated literal terms; `--fts-query` enables raw FTS5 syntax and conflicts with `--terms`. `--current-only` filters claims to active status while retaining matching events and observations. Queries allow at most 4,096 UTF-8 bytes and 64 whitespace terms. Results sort by rank, record type, then record ID.
+
 Use `--fts-query` only when you need SQLite FTS5 syntax.
 
 Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. A project context can also render one named descendant stream.
@@ -271,6 +285,8 @@ OMK applies these privacy rules:
 ## Use the current schema
 
 OMK 0.6 uses schema v6. Existing schema v6 databases reopen without changes.
+
+Opening a database compares its required table, column, constraint, index, and FTS definitions against the schema created by OMK. A missing or changed definition returns `schema_mismatch` before record writes. The comparison is deliberately exact for OMK-created databases; it does not repair altered schemas or replace a full integrity check.
 
 OMK does not provide migrations before 1.0. It rejects any other nonzero schema version before writing changes. Use a fresh database path for an older schema.
 

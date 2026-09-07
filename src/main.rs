@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use omk::{
-    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, KernelError, KernelErrorKind, MemoryStore,
-    MutationResult, NewEvent, ObserverResult, ReadAccess, SCHEMA_VERSION, ScopeKind, Sensitivity,
-    ViewKind, store::CreateView,
+    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, KernelError, KernelErrorKind,
+    MAX_OBSERVER_BYTES, MemoryStore, MutationResult, NewEvent, ObserverResult, ReadAccess,
+    SCHEMA_VERSION, ScopeKind, SearchMode, SearchOptions, Sensitivity, ViewKind, store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -161,7 +161,7 @@ enum ObserveCommand {
         /// Stream ID to observe.
         #[arg(long)]
         stream: String,
-        /// Hard maximum for the redacted model-visible event batch.
+        /// Maximum token estimate for the complete serialized model payload.
         #[arg(long, default_value_t = 6_000)]
         max_tokens: i64,
         /// Observer model label recorded for provenance.
@@ -402,6 +402,12 @@ enum RecallCommand {
         /// Interpret --query as raw SQLite FTS5 syntax instead of a literal phrase.
         #[arg(long)]
         fts_query: bool,
+        /// Match all whitespace-separated literal terms.
+        #[arg(long, conflicts_with = "fts_query")]
+        terms: bool,
+        /// Return only active claims, alongside matching events and observations.
+        #[arg(long)]
+        current_only: bool,
     },
     /// Return a claim with its exact source events.
     ExplainClaim {
@@ -619,7 +625,7 @@ fn run(cli: Cli) -> Result<()> {
                 input,
                 idempotency_key,
             } => {
-                let raw = read_path_or_stdin(input.as_deref())?;
+                let raw = read_observer_input(input.as_deref())?;
                 let result: ObserverResult = serde_json::from_str(&raw).map_err(|error| {
                     KernelError::invalid_input(format!(
                         "parsing strict ObserverResult JSON: {error}"
@@ -782,12 +788,22 @@ fn run(cli: Cli) -> Result<()> {
                 query,
                 limit,
                 fts_query,
+                terms,
+                current_only,
             } => {
-                let hits = if fts_query {
-                    store.search_full_text_advanced(&scope, &query, limit)?
+                let mode = if fts_query {
+                    SearchMode::Advanced
+                } else if terms {
+                    SearchMode::Terms
                 } else {
-                    store.search_full_text(&scope, &query, limit)?
+                    SearchMode::Phrase
                 };
+                let hits = store.search_with_options(
+                    &scope,
+                    &query,
+                    limit,
+                    SearchOptions { mode, current_only },
+                )?;
                 print_json(&hits)?;
             }
             RecallCommand::ExplainClaim {
@@ -854,6 +870,42 @@ fn read_path_or_stdin(path: Option<&Path>) -> Result<String> {
     }
 }
 
+fn read_observer_input(path: Option<&Path>) -> Result<String> {
+    let reader: Box<dyn Read> = match path {
+        Some(path) if path != Path::new("-") => {
+            Box::new(fs::File::open(path).map_err(|error| {
+                KernelError::invalid_input(format!(
+                    "reading input file {}: {error}",
+                    path.display()
+                ))
+            })?)
+        }
+        _ => {
+            ensure!(
+                !io::stdin().is_terminal(),
+                KernelError::missing_input(
+                    "stdin is interactive; pipe input or pass a file option"
+                )
+            );
+            Box::new(io::stdin())
+        }
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_OBSERVER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_OBSERVER_BYTES,
+        KernelError::invalid_input("ObserverResult input exceeds 1048576 bytes")
+    );
+    ensure!(
+        !bytes.is_empty(),
+        KernelError::missing_input("observer input was empty")
+    );
+    String::from_utf8(bytes)
+        .map_err(|_| KernelError::invalid_input("observer input must be UTF-8").into())
+}
+
 fn parse_json_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
 }
@@ -866,6 +918,18 @@ fn classify_error(
         return ("kernel_error", false, false, None);
     };
     match error.kind() {
+        KernelErrorKind::ClaimConflict => (
+            "claim_conflict",
+            false,
+            true,
+            Some("resolve the destination claim explicitly, then retry rescope"),
+        ),
+        KernelErrorKind::SchemaMismatch => (
+            "schema_mismatch",
+            false,
+            true,
+            Some("restore a valid schema v6 database from backup; do not delete existing data"),
+        ),
         KernelErrorKind::IdempotencyConflict => (
             "idempotency_conflict",
             false,

@@ -545,19 +545,24 @@ export interface ContextBundle {
   diagnostics: {
     estimatedTokens: number;
     omittedItems: Array<{ id: string; reason: string }>;
+    truncated: boolean;
   };
 }
 ```
 
 Callers convert the bundle into their target model format. Keep rendering outside the kernel.
 
+`max_tokens` bounds an estimate of compact JSON model input. Plan input contains `scope`, `events`, `activeClaims`, and `previousContinuation`; context input contains all bundle fields except `diagnostics`. Rust exposes each through `model_payload()`. The estimate uses four Unicode characters per token, rounds up each selected serialized item including its separator, and adds token hints above content estimates. Envelopes, routing fields, system prompts, and renderer overhead are excluded. Callers must check the final rendered input with the target tokenizer. Plans reserve inherited active claims and previous continuation before events, and fail atomically if required state plus the first event does not fit.
+
+Context reads raw events in reverse pages of 32; plans read forward pages of 32. Context reads at most 257 observation candidates and 257 pending/disputed claims per status, selects at most 256 of each combined category, and checks sources per candidate. All active claims remain mandatory and are inspected. Query recall precedes optional continuity and observations, expands at most 10 hits with 256 source events each, and preserves exact recall as a separate complete operation. `truncated` reports bounded selection; omissions do not enumerate uninspected history. SQL sorts, scope traversal, and view-chain checks can still grow with stored history.
+
 Recommended budget priorities:
 
 1. System and safety instructions.
 2. Current task and active decisions.
 3. Recent raw user/tool interaction.
-4. Continuity view.
-5. Supporting evidence.
+4. Query-specific supporting evidence.
+5. Continuity view.
 6. Low-importance historical observations.
 
 Keep the current task, user corrections, active constraints and unresolved blockers before lower-priority history.
@@ -580,10 +585,17 @@ OMK 0.6 must support:
 recallByObservation(access, observationId)
 recallByEventRange(access, streamId, fromSequence, toSequence)
 searchFullText(scopeIds, query, limit)
+searchWithOptions(scopeId, query, limit, { mode, currentOnly })
 explainClaim(access, claimId)
 ```
 
 `explainClaim` must return the claim and its raw source events.
+
+Search defaults to literal phrase mode with historical claims included. Terms mode joins escaped whitespace terms with AND; advanced mode accepts explicit FTS5 syntax. Queries are limited to 4,096 UTF-8 bytes and 64 whitespace terms. Results contain at most 512 Unicode characters of preview text and a claim status where applicable, ordered by rank, record type, and ID. Current-only filtering excludes non-active claims but keeps matching events and observations.
+
+Observer commits accept at most 1,048,576 serialized bytes, 256 combined observation/claim/ambiguity/continuation-list items, and 256 source IDs per item. The CLI limits bytes before parsing. Failures do not save a commit or consume its operation key.
+
+Rescope may merge equal active destination values with provenance. Unequal active values return `claim_conflict` atomically; explicit confirmation or correction must resolve the conflict. Opening v6 validates required SQLite-stored schema definitions against a fresh in-memory schema reference. Missing or altered definitions return `schema_mismatch`; no automatic migration or repair occurs.
 
 Semantic similarity can help discovery only. It cannot establish truth, identity or replacement.
 

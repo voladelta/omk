@@ -169,6 +169,7 @@ impl MemoryStore {
             tx.commit()
                 .context("committing SQLite schema initialization")?;
         }
+        schema::validate_schema(&conn)?;
         Ok(Self { conn })
     }
 

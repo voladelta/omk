@@ -2,6 +2,8 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelErrorKind {
+    ClaimConflict,
+    SchemaMismatch,
     IdempotencyConflict,
     BudgetExceeded,
     StaleView,

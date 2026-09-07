@@ -59,35 +59,8 @@ impl MemoryStore {
             )
         );
 
-        let model_events: Vec<MemoryEvent> = query_events_after(&tx, stream_id, cursor)?
-            .into_iter()
-            .map(redact_for_agent)
-            .collect();
-        if let Some(first) = model_events.first() {
-            ensure!(
-                first.token_count <= max_tokens,
-                KernelError::new(
-                    KernelErrorKind::BudgetExceeded,
-                    format!(
-                        "observation budget too small: minimumRequiredTokens={} for event {}",
-                        first.token_count, first.id
-                    ),
-                )
-            );
-        }
-        let mut selected = Vec::new();
-        let mut tokens = 0;
-        for event in model_events {
-            if !selected.is_empty() && tokens + event.token_count > max_tokens {
-                break;
-            }
-            tokens += event.token_count;
-            selected.push(event);
-            if tokens >= max_tokens {
-                break;
-            }
-        }
-        if selected.is_empty() {
+        let mut page = query_event_page(&tx, stream_id, cursor, false)?;
+        if page.is_empty() {
             let outcome = ObservationPlanOutcome::caught_up(scope_id, stream_id, cursor);
             save_operation(
                 &tx,
@@ -99,29 +72,60 @@ impl MemoryStore {
             tx.commit()?;
             return Ok(MutationResult::created(outcome));
         }
-        let from_sequence = selected.first().expect("not empty").sequence;
-        let to_sequence = selected.last().expect("not empty").sequence;
-        let run_id = Uuid::new_v4().to_string();
+        let visible = visible_scope_ids(&tx, scope_id)?;
+        let mut active_claims = query_claims_for_scopes(&tx, &visible, Some("active"))?;
+        sort_claims_by_scope(&mut active_claims, &visible);
+        let previous_continuation = latest_view(&tx, stream_id, "continuation")?;
+        let mut plan = ObservationPlan {
+            run_id: Uuid::new_v4().to_string(),
+            scope,
+            stream_id: stream_id.to_owned(),
+            from_sequence: 0,
+            to_sequence: 0,
+            events: Vec::new(),
+            active_claims,
+            previous_continuation,
+        };
+        let mut tokens = estimate_tokens(&plan.model_payload().to_string()).saturating_add(
+            plan.previous_continuation
+                .as_ref()
+                .map_or(0, view_hint_extra),
+        );
+        'pages: loop {
+            let page_len = page.len();
+            for event in page {
+                let event = redact_for_agent(event);
+                let cost = serialized_item_tokens(&event).saturating_add(event_hint_extra(&event));
+                if cost > max_tokens - tokens {
+                    ensure!(
+                        !plan.events.is_empty(),
+                        KernelError::budget_exceeded(format!(
+                            "observation budget too small: minimumRequiredTokens={} for required state and first event",
+                            tokens.saturating_add(cost)
+                        ))
+                    );
+                    break 'pages;
+                }
+                tokens += cost;
+                plan.events.push(event);
+            }
+            if page_len < 32 {
+                break;
+            }
+            let cursor = plan.events.last().expect("nonempty page").sequence;
+            page = query_event_page(&tx, stream_id, cursor, false)?;
+        }
+        let from_sequence = plan.events.first().expect("not empty").sequence;
+        let to_sequence = plan.events.last().expect("not empty").sequence;
+        plan.from_sequence = from_sequence;
+        plan.to_sequence = to_sequence;
+        let run_id = &plan.run_id;
         let timestamp = now();
         tx.execute(
             "INSERT INTO observation_runs(id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,created_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?9)",
             params![run_id, scope_id, stream_id, cursor, from_sequence, to_sequence, observer_model, prompt_version, timestamp],
         )?;
-        let visible = visible_scope_ids(&tx, scope_id)?;
-        let mut active_claims = query_claims_for_scopes(&tx, &visible, Some("active"))?;
-        sort_claims_by_scope(&mut active_claims, &visible);
-        let previous_continuation = latest_view(&tx, stream_id, "continuation")?;
-        let plan = ObservationPlan {
-            run_id,
-            scope,
-            stream_id: stream_id.to_owned(),
-            from_sequence,
-            to_sequence,
-            events: selected,
-            active_claims,
-            previous_continuation,
-        };
         let outcome = ObservationPlanOutcome::ready(plan);
         save_operation(
             &tx,
@@ -142,7 +146,7 @@ impl MemoryStore {
     ) -> Result<MutationResult<ObservationCommit>> {
         validate_nonempty("run id", run_id)?;
         validate_nonempty("idempotency key", idempotency_key)?;
-        validate_observer_result(&result)?;
+        validate_observer_size(&result)?;
 
         let request_hash = operation_request_hash("observation.commit", &(run_id, &result))?;
         let tx = self.immediate()?;
@@ -155,6 +159,7 @@ impl MemoryStore {
             tx.commit()?;
             return Ok(MutationResult::replayed(prior));
         }
+        validate_observer_result(&result)?;
         let run = query_run(&tx, run_id)?;
         ensure_run_pending(&run, run_id)?;
         let cursor: i64 = tx.query_row(

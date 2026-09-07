@@ -155,7 +155,7 @@ fn append_is_idempotent_and_privacy_boundaries_are_safe() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "thread", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -298,7 +298,7 @@ fn generated_command_events_reject_cross_scope_stream_collisions() {
         .plan_observation(
             "project-a",
             "memory-commands:project-b",
-            100,
+            10_000,
             "fake",
             "v1",
             "plan-project-a",
@@ -390,7 +390,7 @@ fn observation_commit_is_atomic_idempotent_and_source_backed() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "thread", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -416,7 +416,7 @@ fn observation_commit_is_atomic_idempotent_and_source_backed() {
     assert!(matches!(
         fixture
             .store
-            .plan_observation("user", "thread", 100, "fake", "v1", "plan-2")
+            .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-2")
             .unwrap()
             .data,
         ObservationPlanOutcome::CaughtUp { .. }
@@ -459,7 +459,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
     );
     let first_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -486,7 +486,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
     );
     let second_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
         .unwrap()
         .data
         .into_plan()
@@ -520,7 +520,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
 
     let caught_up = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-3")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-3")
         .unwrap();
     assert!(matches!(
         &caught_up.data,
@@ -545,14 +545,14 @@ fn invalid_and_stale_observation_commits_never_advance_twice() {
     );
     let first = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
         .unwrap();
     let stale = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
         .unwrap()
         .data
         .into_plan()
@@ -578,7 +578,7 @@ fn invalid_and_stale_observation_commits_never_advance_twice() {
     assert!(matches!(
         fixture
             .store
-            .plan_observation("user", "stream", 100, "fake", "v1", "plan-3")
+            .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-3")
             .unwrap()
             .data,
         ObservationPlanOutcome::CaughtUp { .. }
@@ -592,7 +592,7 @@ fn observer_failure_is_recorded_without_advancing_the_cursor() {
     let event = fixture.event("user", "stream", "retry me", Sensitivity::Normal, "event-1");
     let failed = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -603,7 +603,7 @@ fn observer_failure_is_recorded_without_advancing_the_cursor() {
         .unwrap();
     let retry = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
         .unwrap()
         .data
         .into_plan()
@@ -885,7 +885,7 @@ fn project_context_includes_observations_from_its_selected_descendant_stream() {
     );
     let plan = fixture
         .store
-        .plan_observation("thread", "thread-stream", 100, "fake", "v1", "plan")
+        .plan_observation("thread", "thread-stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -917,7 +917,7 @@ fn rescoping_an_observer_claim_does_not_grant_activation_authority() {
     );
     let plan = fixture
         .store
-        .plan_observation("thread", "thread-stream", 100, "fake", "v1", "plan")
+        .plan_observation("thread", "thread-stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -948,7 +948,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
     let event = fixture.event("user", "stream", "Use ETH", Sensitivity::Normal, "event-1");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -959,7 +959,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
         .unwrap();
     let context = fixture
         .store
-        .compose_context("user", "stream", 1_000, 100, None)
+        .compose_context("user", "stream", 1_000, 200, None)
         .unwrap();
     assert!(context.observations.is_empty());
     assert_eq!(context.recent_events[0].id, event.id);
@@ -1061,7 +1061,7 @@ fn context_deduplicates_only_exact_source_events() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream-b", 100, "fake", "v1", "plan-b")
+        .plan_observation("user", "stream-b", 10_000, "fake", "v1", "plan-b")
         .unwrap()
         .data
         .into_plan()
@@ -1106,7 +1106,7 @@ fn context_prioritizes_continuation_over_pending_claims() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -1141,16 +1141,14 @@ fn context_prioritizes_continuation_over_pending_claims() {
 
     let context = fixture
         .store
-        .compose_context(
-            "user",
-            "stream",
-            commit.continuation_view.token_count,
-            0,
-            None,
-        )
+        .compose_context("user", "stream", 100, 0, None)
         .unwrap();
     assert!(context.pending_claims.is_empty());
     assert!(context.continuation.is_some());
+    assert_eq!(
+        serde_json::to_value(&context.continuation).unwrap(),
+        serde_json::from_str::<Value>(&commit.continuation_view.content).unwrap()
+    );
     assert!(context.continuity_views.is_empty());
 }
 
@@ -1161,7 +1159,7 @@ fn full_text_search_does_not_index_views() {
     let event = fixture.event("user", "stream", "source", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -1247,7 +1245,7 @@ fn redacted_secret_evidence_cannot_activate_a_model_claim() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -1283,7 +1281,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -1369,7 +1367,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
     assert_eq!(replacement.sequence, 2);
     let retry_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-after-purge")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-after-purge")
         .unwrap()
         .data
         .into_plan()
@@ -1390,7 +1388,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
     );
     let stale_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -1415,7 +1413,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
     assert_eq!(replacement.sequence, 2);
     let recovery_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
         .unwrap()
         .data
         .into_plan()
@@ -1532,7 +1530,7 @@ fn privacy_covers_metadata_and_observer_envelopes_are_strict() {
         .data;
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -1888,7 +1886,12 @@ fn budgets_are_hard_and_literal_search_includes_descendants() {
         .store
         .plan_observation("thread", "stream", 1, "fake", "v1", "small-plan")
         .unwrap_err();
-    assert!(plan_error.to_string().contains("minimumRequiredTokens=100"));
+    assert!(plan_error.to_string().contains("minimumRequiredTokens="));
+    assert!(
+        plan_error
+            .to_string()
+            .contains("required state and first event")
+    );
     assert_eq!(
         fixture
             .store
@@ -1980,7 +1983,7 @@ fn observation_and_stream_inspection_are_complete() {
     let event = fixture.event("user", "stream", "inspect", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -2137,7 +2140,7 @@ fn context_omits_an_observation_when_raw_sources_partially_overlap() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -2164,7 +2167,7 @@ fn context_omits_an_observation_when_raw_sources_partially_overlap() {
 
     let context = fixture
         .store
-        .compose_context("user", "stream", 1_000, 10, None)
+        .compose_context("user", "stream", 1_000, 140, None)
         .unwrap();
     assert_eq!(context.recent_events.len(), 1);
     assert_eq!(context.recent_events[0].id, second.id);
@@ -2182,7 +2185,7 @@ fn continuity_view_commits_compare_and_swap_per_stream() {
     let event = fixture.event("user", "stream", "source", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
         .unwrap()
         .data
         .into_plan()
@@ -2282,7 +2285,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
     let first_event = fixture.event("user", "stream", "first", Sensitivity::Normal, "event-1");
     let first_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
         .unwrap()
         .data
         .into_plan()
@@ -2316,7 +2319,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
     let second_event = fixture.event("user", "stream", "second", Sensitivity::Normal, "event-2");
     let second_plan = fixture
         .store
-        .plan_observation("user", "stream", 100, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
         .unwrap()
         .data
         .into_plan()

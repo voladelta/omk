@@ -238,7 +238,7 @@ impl MemoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        self.search_full_text_mode(scope_id, query, limit, false)
+        self.search_with_options(scope_id, query, limit, SearchOptions::default())
     }
 
     pub fn search_full_text_advanced(
@@ -247,15 +247,23 @@ impl MemoryStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        self.search_full_text_mode(scope_id, query, limit, true)
+        self.search_with_options(
+            scope_id,
+            query,
+            limit,
+            SearchOptions {
+                mode: SearchMode::Advanced,
+                current_only: false,
+            },
+        )
     }
 
-    fn search_full_text_mode(
+    pub fn search_with_options(
         &self,
         scope_id: &str,
         query: &str,
         limit: usize,
-        advanced_fts: bool,
+        options: SearchOptions,
     ) -> Result<Vec<SearchHit>> {
         validate_nonempty("search query", query)?;
         ensure!(
@@ -266,12 +274,14 @@ impl MemoryStore {
             )
         );
         let scope_ids = retrieval_scope_ids(&self.conn, scope_id)?;
-        let fts_query = if advanced_fts {
-            query.to_owned()
-        } else {
-            literal_fts_query(query)
-        };
-        search_fts(&self.conn, &scope_ids, &fts_query, limit)
+        let fts_query = bounded_fts_query(query, options.mode)?;
+        search_fts(
+            &self.conn,
+            &scope_ids,
+            &fts_query,
+            limit,
+            options.current_only,
+        )
     }
 
     pub fn compose_context(
@@ -318,14 +328,21 @@ impl MemoryStore {
         );
         let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"))?;
         sort_claims_by_scope(&mut claims, &visible);
-        let mut pending_claims = query_claims_for_scopes(&self.conn, &visible, Some("pending"))?;
-        pending_claims.extend(query_claims_for_scopes(
+        let mut pending_claims =
+            query_claim_candidates(&self.conn, &visible, Some("pending"), Some(257))?;
+        pending_claims.extend(query_claim_candidates(
             &self.conn,
             &visible,
             Some("disputed"),
+            Some(257),
         )?);
+        let pending_truncated = pending_claims.len() > 256;
         sort_claims_by_scope(&mut pending_claims, &visible);
-        let required_tokens: i64 = claims.iter().map(estimate_claim_tokens).sum();
+        pending_claims.truncate(256);
+        let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
+            "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
+        let required_tokens: i64 = estimate_tokens(&empty_payload.to_string())
+            + claims.iter().map(estimate_claim_tokens).sum::<i64>();
         ensure!(
             required_tokens <= max_tokens,
             KernelError::new(
@@ -338,17 +355,18 @@ impl MemoryStore {
         let mut diagnostics = ContextDiagnostics {
             estimated_tokens: required_tokens,
             omitted_items: Vec::new(),
+            truncated: pending_truncated,
         };
 
         let mut continuity_views = Vec::new();
         let mut continuation = None;
         if let Some(view) = latest_view(&self.conn, stream_id, "continuation")? {
-            if diagnostics.estimated_tokens + view.token_count <= max_tokens {
-                diagnostics.estimated_tokens += view.token_count;
-                continuation = Some(
-                    serde_json::from_str(&view.content)
-                        .context("reading structured continuation view")?,
-                );
+            let draft: ContinuationDraft = serde_json::from_str(&view.content)
+                .context("reading structured continuation view")?;
+            let cost = serialized_item_tokens(&draft).saturating_add(view_hint_extra(&view));
+            if cost <= max_tokens - diagnostics.estimated_tokens {
+                diagnostics.estimated_tokens += cost;
+                continuation = Some(draft);
             } else {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: view.id,
@@ -360,7 +378,7 @@ impl MemoryStore {
         let mut selected_pending_claims = Vec::new();
         for claim in pending_claims {
             let cost = estimate_claim_tokens(&claim);
-            if diagnostics.estimated_tokens + cost <= max_tokens {
+            if cost <= max_tokens - diagnostics.estimated_tokens {
                 diagnostics.estimated_tokens += cost;
                 selected_pending_claims.push(claim);
             } else {
@@ -371,34 +389,85 @@ impl MemoryStore {
             }
         }
 
-        let all_events = query_events_after(&self.conn, stream_id, 0)?;
         let mut recent_events_reversed = Vec::new();
         let raw_budget = recent_raw_tokens.min((max_tokens - diagnostics.estimated_tokens).max(0));
         let mut raw_tokens = 0;
-        for event in all_events.iter().rev() {
-            let safe = redact_for_agent(event.clone());
-            if raw_tokens + safe.token_count > raw_budget {
-                diagnostics.omitted_items.push(OmittedItem {
-                    id: event.id.clone(),
-                    reason: "outside recent raw token budget".to_owned(),
-                });
+        let mut cursor = i64::MAX;
+        'raw: loop {
+            if raw_budget == 0 {
                 break;
             }
-            raw_tokens += safe.token_count;
-            recent_events_reversed.push(safe);
+            let page = query_event_page(&self.conn, stream_id, cursor, true)?;
+            let page_len = page.len();
+            for event in page {
+                cursor = event.sequence;
+                let safe = redact_for_agent(event);
+                let cost = serialized_item_tokens(&safe).saturating_add(event_hint_extra(&safe));
+                if cost > raw_budget - raw_tokens {
+                    diagnostics.omitted_items.push(OmittedItem {
+                        id: safe.id,
+                        reason: "outside recent raw token budget".to_owned(),
+                    });
+                    diagnostics.truncated = true;
+                    break 'raw;
+                }
+                raw_tokens += cost;
+                recent_events_reversed.push(safe);
+            }
+            if page_len < 32 {
+                break;
+            }
         }
         recent_events_reversed.reverse();
         let recent_events = recent_events_reversed;
         diagnostics.estimated_tokens += raw_tokens;
-        let recent_event_ids: HashSet<&str> = recent_events
+        let mut recalled_evidence = Vec::new();
+        let read_access = ReadAccess::agent(scope_id);
+        if let Some(query) = query {
+            let hits = self.search_full_text(scope_id, query, 10)?;
+            let mut recalled_ids = HashSet::new();
+            for hit in hits {
+                let mut ids = if hit.record_type == "event" {
+                    vec![hit.id]
+                } else {
+                    context_source_ids(&self.conn, &hit.record_type, &hit.id)?
+                };
+                if ids.len() > MAX_SOURCE_IDS {
+                    diagnostics.truncated = true;
+                    ids.truncate(MAX_SOURCE_IDS);
+                }
+                for id in ids {
+                    if !recalled_ids.insert(id.clone()) || recent_events.iter().any(|e| e.id == id)
+                    {
+                        continue;
+                    }
+                    let event = self.get_event(&read_access, &id)?;
+                    let cost =
+                        serialized_item_tokens(&event).saturating_add(event_hint_extra(&event));
+                    if cost <= max_tokens - diagnostics.estimated_tokens {
+                        diagnostics.estimated_tokens += cost;
+                        recalled_evidence.push(event);
+                    } else {
+                        diagnostics.omitted_items.push(OmittedItem {
+                            id,
+                            reason: "context token budget".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        let represented_event_ids: Vec<&str> = recent_events
             .iter()
+            .chain(recalled_evidence.iter())
             .map(|event| event.id.as_str())
             .collect();
+        let represented_event_ids = serde_json::to_string(&represented_event_ids)?;
 
         let mut selected_continuity_ids = Vec::new();
         if let Some(view) = latest_view(&self.conn, stream_id, "continuity")? {
-            if diagnostics.estimated_tokens + view.token_count <= max_tokens {
-                diagnostics.estimated_tokens += view.token_count;
+            let cost = serialized_item_tokens(&view).saturating_add(view_hint_extra(&view));
+            if cost <= max_tokens - diagnostics.estimated_tokens {
+                diagnostics.estimated_tokens += cost;
                 selected_continuity_ids.push(view.id.clone());
                 continuity_views.push(view);
             } else {
@@ -414,27 +483,16 @@ impl MemoryStore {
             observation_scopes.push(stream_scope);
         }
         let mut candidates = query_observations_for_scopes(&self.conn, &observation_scopes)?;
-        candidates.sort_by(|left, right| {
-            right
-                .importance
-                .total_cmp(&left.importance)
-                .then_with(|| left.created_at.cmp(&right.created_at))
-        });
-        let sources_by_observation =
-            query_observation_source_ids_for_scopes(&self.conn, &observation_scopes)?;
-        let represented_observation_ids =
-            query_view_observation_ids(&self.conn, &selected_continuity_ids)?;
+        if candidates.len() > 256 {
+            diagnostics.truncated = true;
+            candidates.truncate(256);
+        }
         let mut observations = Vec::new();
         for observation in candidates {
             let duplicated_by_raw =
-                sources_by_observation
-                    .get(&observation.id)
-                    .is_some_and(|source_ids| {
-                        source_ids
-                            .iter()
-                            .any(|source_id| recent_event_ids.contains(source_id.as_str()))
-                    });
-            let represented_by_view = represented_observation_ids.contains(&observation.id);
+                observation_has_events(&self.conn, &observation.id, &represented_event_ids)?;
+            let represented_by_view =
+                observation_in_views(&self.conn, &observation.id, &selected_continuity_ids)?;
             if duplicated_by_raw || represented_by_view {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: observation.id,
@@ -447,8 +505,8 @@ impl MemoryStore {
                 });
                 continue;
             }
-            let cost = estimate_tokens(&observation.content);
-            if diagnostics.estimated_tokens + cost <= max_tokens {
+            let cost = serialized_item_tokens(&observation);
+            if cost <= max_tokens - diagnostics.estimated_tokens {
                 diagnostics.estimated_tokens += cost;
                 observations.push(observation);
             } else {
@@ -458,39 +516,11 @@ impl MemoryStore {
                 });
             }
         }
-        observations.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-
-        let mut recalled_evidence = Vec::new();
-        let read_access = ReadAccess::agent(scope_id);
-        if let Some(query) = query {
-            let retrieval_scopes = retrieval_scope_ids(&self.conn, scope_id)?;
-            let hits = search_fts(&self.conn, &retrieval_scopes, &literal_fts_query(query), 10)?;
-            let mut recalled_ids = HashSet::new();
-            for hit in hits {
-                let evidence = match hit.record_type.as_str() {
-                    "event" => vec![self.get_event(&read_access, &hit.id)?],
-                    "observation" => self.recall_by_observation(&read_access, &hit.id)?,
-                    "claim" => self.explain_claim(&read_access, &hit.id)?.source_events,
-                    record_type => bail!("unsupported full-text record type {record_type}"),
-                };
-                for event in evidence {
-                    if !recalled_ids.insert(event.id.clone())
-                        || recent_events.iter().any(|recent| recent.id == event.id)
-                    {
-                        continue;
-                    }
-                    if diagnostics.estimated_tokens + event.token_count <= max_tokens {
-                        diagnostics.estimated_tokens += event.token_count;
-                        recalled_evidence.push(event);
-                    } else {
-                        diagnostics.omitted_items.push(OmittedItem {
-                            id: event.id,
-                            reason: "context token budget".to_owned(),
-                        });
-                    }
-                }
-            }
-        }
+        observations.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(ContextBundle {
             claims,
             pending_claims: selected_pending_claims,
