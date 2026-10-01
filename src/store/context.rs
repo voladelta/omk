@@ -212,7 +212,16 @@ impl MemoryStore {
                     format!("observation {observation_id} does not exist"),
                 )
             })?;
-        ensure_read_scope(&self.conn, access, &scope_id)?;
+        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
+        access.ensure_scope(&scope_id)?;
+        self.recall_observation_sources(&access, observation_id)
+    }
+
+    fn recall_observation_sources(
+        &self,
+        access: &ResolvedReadAccess<'_>,
+        observation_id: &str,
+    ) -> Result<Vec<MemoryEvent>> {
         let mut statement = self.conn.prepare(
             "SELECT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
              FROM memory_events e JOIN observation_sources s ON s.event_id=e.id
@@ -220,7 +229,7 @@ impl MemoryStore {
         )?;
         collect_rows(statement.query_map([observation_id], row_event)?)?
             .into_iter()
-            .map(|event| apply_read_access(&self.conn, access, event))
+            .map(|event| access.apply(event))
             .collect()
     }
 
@@ -244,16 +253,18 @@ impl MemoryStore {
                     format!("observation {observation_id} does not exist"),
                 )
             })?;
-        ensure_read_scope(&self.conn, access, &observation.scope_id)?;
+        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
+        access.ensure_scope(&observation.scope_id)?;
         Ok(ObservationExplanation {
             observation,
-            source_events: self.recall_by_observation(access, observation_id)?,
+            source_events: self.recall_observation_sources(&access, observation_id)?,
         })
     }
 
     pub fn explain_claim(&self, access: &ReadAccess, claim_id: &str) -> Result<ClaimExplanation> {
         let claim = query_claim(&self.conn, claim_id)?;
-        ensure_read_scope(&self.conn, access, &claim.scope_id)?;
+        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
+        access.ensure_scope(&claim.scope_id)?;
         let mut events_statement = self.conn.prepare(
             "SELECT DISTINCT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
              FROM memory_events e JOIN claim_sources source ON source.event_id=e.id
@@ -262,7 +273,7 @@ impl MemoryStore {
         )?;
         let source_events = collect_rows(events_statement.query_map([claim_id], row_event)?)?
             .into_iter()
-            .map(|event| apply_read_access(&self.conn, access, event))
+            .map(|event| access.apply(event))
             .collect::<Result<Vec<_>>>()?;
         Ok(ClaimExplanation {
             claim,
@@ -545,6 +556,7 @@ impl MemoryStore {
         let read_access = ReadAccess::agent(scope_id);
         if let Some(query) = query {
             let hits = self.search_with_options(scope_id, query.text, 10, query.options)?;
+            let access = ResolvedReadAccess::resolve(&self.conn, &read_access)?;
             let mut recalled_ids = HashSet::new();
             for hit in hits {
                 let mut ids = if hit.record_type == "event" {
@@ -561,7 +573,7 @@ impl MemoryStore {
                     {
                         continue;
                     }
-                    let event = self.get_event(&read_access, &id)?;
+                    let event = access.apply(self.query_event(&id)?)?;
                     let cost = rendering.event_tokens(&event);
                     if cost <= max_tokens - diagnostics.estimated_tokens {
                         diagnostics.estimated_tokens += cost;
@@ -607,11 +619,16 @@ impl MemoryStore {
             candidates.truncate(256);
         }
         let mut observations = Vec::new();
+        let candidate_ids: Vec<&str> = candidates
+            .iter()
+            .map(|observation| observation.id.as_str())
+            .collect();
+        let represented_observations =
+            observations_in_views(&self.conn, &candidate_ids, &selected_continuity_ids)?;
         for observation in candidates {
             let duplicated_by_raw =
                 observation_has_events(&self.conn, &observation.id, &represented_event_ids)?;
-            let represented_by_view =
-                observation_in_views(&self.conn, &observation.id, &selected_continuity_ids)?;
+            let represented_by_view = represented_observations.contains(&observation.id);
             if duplicated_by_raw || represented_by_view {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: observation.id,

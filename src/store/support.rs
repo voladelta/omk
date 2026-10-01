@@ -200,24 +200,42 @@ pub(super) fn redact_for_agent(mut event: MemoryEvent) -> MemoryEvent {
     event
 }
 
-pub(super) fn apply_read_access(
-    conn: &Connection,
-    access: &ReadAccess,
-    event: MemoryEvent,
-) -> Result<MemoryEvent> {
-    let visible = retrieval_scope_ids(conn, &access.anchor_scope_id)?;
-    ensure!(
-        visible.contains(&event.scope_id),
-        KernelError::scope_violation(format!(
-            "record is not visible from scope {}",
-            access.anchor_scope_id
-        ))
-    );
-    Ok(if access.reveal_secrets {
-        event
-    } else {
-        redact_for_agent(event)
-    })
+pub(super) struct ResolvedReadAccess<'a> {
+    anchor_scope_id: &'a str,
+    visible: HashSet<String>,
+    reveal_secrets: bool,
+}
+
+impl<'a> ResolvedReadAccess<'a> {
+    pub(super) fn resolve(conn: &Connection, access: &'a ReadAccess) -> Result<Self> {
+        Ok(Self {
+            anchor_scope_id: &access.anchor_scope_id,
+            visible: retrieval_scope_ids(conn, &access.anchor_scope_id)?
+                .into_iter()
+                .collect(),
+            reveal_secrets: access.reveal_secrets,
+        })
+    }
+
+    pub(super) fn ensure_scope(&self, scope_id: &str) -> Result<()> {
+        ensure!(
+            self.visible.contains(scope_id),
+            KernelError::scope_violation(format!(
+                "record is not visible from scope {}",
+                self.anchor_scope_id
+            ))
+        );
+        Ok(())
+    }
+
+    pub(super) fn apply(&self, event: MemoryEvent) -> Result<MemoryEvent> {
+        self.ensure_scope(&event.scope_id)?;
+        Ok(if self.reveal_secrets {
+            event
+        } else {
+            redact_for_agent(event)
+        })
+    }
 }
 
 pub(super) fn ensure_read_scope(
@@ -225,16 +243,7 @@ pub(super) fn ensure_read_scope(
     access: &ReadAccess,
     record_scope_id: &str,
 ) -> Result<()> {
-    ensure!(
-        retrieval_scope_ids(conn, &access.anchor_scope_id)?
-            .iter()
-            .any(|scope_id| scope_id == record_scope_id),
-        KernelError::scope_violation(format!(
-            "record is not visible from scope {}",
-            access.anchor_scope_id
-        ))
-    );
-    Ok(())
+    ResolvedReadAccess::resolve(conn, access)?.ensure_scope(record_scope_id)
 }
 
 pub(super) fn now() -> String {
@@ -344,10 +353,14 @@ pub(super) fn operation_request_hash(operation: &str, request: &impl Serialize) 
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub(super) fn scrub_operations_referencing(conn: &Connection, record_id: &str) -> Result<()> {
+pub(super) fn scrub_operations_referencing(conn: &Connection, record_ids: &[&str]) -> Result<()> {
+    if record_ids.is_empty() {
+        return Ok(());
+    }
     conn.execute(
-        "UPDATE memory_operations SET request_hash=NULL,result_json=NULL WHERE instr(result_json,?1)>0",
-        [record_id],
+        "UPDATE memory_operations SET request_hash=NULL,result_json=NULL
+         WHERE EXISTS (SELECT 1 FROM json_each(?1) WHERE instr(result_json,value)>0)",
+        [serde_json::to_string(record_ids)?],
     )?;
     Ok(())
 }
@@ -906,13 +919,13 @@ pub(super) fn observation_has_events(
     )?)
 }
 
-pub(super) fn observation_in_views(
+pub(super) fn observations_in_views(
     conn: &Connection,
-    observation_id: &str,
+    observation_ids: &[&str],
     view_ids: &[String],
-) -> Result<bool> {
-    if view_ids.is_empty() {
-        return Ok(false);
+) -> Result<HashSet<String>> {
+    if view_ids.is_empty() || observation_ids.is_empty() {
+        return Ok(HashSet::new());
     }
     let placeholders = std::iter::repeat_n("?", view_ids.len())
         .collect::<Vec<_>>()
@@ -926,21 +939,26 @@ pub(super) fn observation_in_views(
             JOIN view_chain current ON current.id=view.id
             WHERE view.previous_view_id IS NOT NULL
          )
-         SELECT EXISTS(SELECT 1
+         SELECT DISTINCT source.observation_id
          FROM view_chain
          JOIN view_sources source ON source.view_id=view_chain.id
-         WHERE source.observation_id=?)"
+         WHERE source.observation_id IN (SELECT value FROM json_each(?))"
     );
     let mut statement = conn.prepare(&sql)?;
-    Ok(statement.query_row(
-        rusqlite::params_from_iter(
-            view_ids
-                .iter()
-                .map(String::as_str)
-                .chain(std::iter::once(observation_id)),
-        ),
-        |row| row.get(0),
-    )?)
+    let ids_json = serde_json::to_string(observation_ids)?;
+    Ok(collect_rows(
+        statement.query_map(
+            rusqlite::params_from_iter(
+                view_ids
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(ids_json.as_str())),
+            ),
+            |row| row.get(0),
+        )?,
+    )?
+    .into_iter()
+    .collect())
 }
 
 pub(super) fn context_source_ids(

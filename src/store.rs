@@ -367,14 +367,20 @@ impl MemoryStore {
                     format!("stream {stream_id} does not exist"),
                 )
             })?;
-        ensure_read_scope(&self.conn, access, &stream_scope)?;
+        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
+        access.ensure_scope(&stream_scope)?;
         query_events_range(&self.conn, stream_id, from_sequence, to_sequence)?
             .into_iter()
-            .map(|event| apply_read_access(&self.conn, access, event))
+            .map(|event| access.apply(event))
             .collect()
     }
 
     pub fn get_event(&self, access: &ReadAccess, event_id: &str) -> Result<MemoryEvent> {
+        let event = self.query_event(event_id)?;
+        ResolvedReadAccess::resolve(&self.conn, access)?.apply(event)
+    }
+
+    fn query_event(&self, event_id: &str) -> Result<MemoryEvent> {
         let event = self.conn
             .query_row(
                 "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json FROM memory_events WHERE id=?1",
@@ -388,7 +394,7 @@ impl MemoryStore {
                     format!("event {event_id} does not exist"),
                 )
             })?;
-        apply_read_access(&self.conn, access, event)
+        Ok(event)
     }
 
     fn immediate(&mut self) -> Result<Transaction<'_>> {

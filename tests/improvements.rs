@@ -59,6 +59,253 @@ fn empty_result() -> ObserverResult {
 }
 
 #[test]
+fn run_listing_filters_scope_before_decoding_unrelated_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let mut store = setup(&path);
+    event(&mut store, "visible", "visible");
+    let visible = store
+        .plan_observation("thread", "stream", 1000, "test", "v1", "visible-plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    store
+        .create_scope("other", ScopeKind::Project, None, None, "other")
+        .unwrap();
+    store
+        .append_event(NewEvent {
+            scope_id: "other".into(),
+            stream_id: "other-stream".into(),
+            kind: EventKind::UserMessage,
+            actor_id: None,
+            occurred_at: None,
+            content: json!("unrelated"),
+            token_count: None,
+            sensitivity: Sensitivity::Normal,
+            metadata: json!({}),
+            idempotency_key: "other-event".into(),
+        })
+        .unwrap();
+    let unrelated = store
+        .plan_observation("other", "other-stream", 1000, "test", "v1", "other-plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    // An unrelated row must never reach this request's JSON decoder.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE observation_runs SET ambiguities_json='invalid JSON' WHERE id=?1",
+        [&unrelated.run_id],
+    )
+    .unwrap();
+    for scope in ["thread", "project"] {
+        let runs = store
+            .list_observation_runs(&ReadAccess::agent(scope), None, Some("pending"))
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, visible.run_id);
+    }
+    assert!(
+        store
+            .list_observation_runs(&ReadAccess::agent("thread"), Some("other-stream"), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_observation_runs(&ReadAccess::agent("other"), None, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn resolved_recall_checks_each_source_and_refreshes_between_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let mut store = setup(&path);
+    let record = claim(&mut store, "thread", "first", "claim");
+    let access = ReadAccess::agent("project");
+    assert!(
+        !store
+            .explain_claim(&access, &record.id)
+            .unwrap()
+            .source_events
+            .is_empty()
+    );
+    store
+        .create_scope(
+            "new-child",
+            ScopeKind::Task,
+            Some("project"),
+            None,
+            "new-child",
+        )
+        .unwrap();
+    let child = store
+        .append_event(NewEvent {
+            scope_id: "new-child".into(),
+            stream_id: "child-stream".into(),
+            kind: EventKind::ToolResult,
+            actor_id: None,
+            occurred_at: None,
+            content: json!("secret detail"),
+            token_count: None,
+            sensitivity: Sensitivity::Secret,
+            metadata: json!({}),
+            idempotency_key: "child-event".into(),
+        })
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO claim_sources(claim_id,event_id) VALUES (?1,?2)",
+        rusqlite::params![record.id, child.id],
+    )
+    .unwrap();
+    let safe = store.explain_claim(&access, &record.id).unwrap();
+    let secret = safe
+        .source_events
+        .iter()
+        .find(|event| event.id == child.id)
+        .unwrap();
+    assert_eq!(secret.content["redacted"], true);
+    let revealed = store
+        .explain_claim(
+            &ReadAccess {
+                anchor_scope_id: "project".into(),
+                reveal_secrets: true,
+            },
+            &record.id,
+        )
+        .unwrap();
+    assert!(
+        revealed
+            .source_events
+            .iter()
+            .any(|event| event.content == json!("secret detail"))
+    );
+    store
+        .create_scope("other", ScopeKind::Project, None, None, "other")
+        .unwrap();
+    let other = store
+        .append_event(NewEvent {
+            scope_id: "other".into(),
+            stream_id: "other-stream".into(),
+            kind: EventKind::UserMessage,
+            actor_id: None,
+            occurred_at: None,
+            content: json!("outside scope"),
+            token_count: None,
+            sensitivity: Sensitivity::Normal,
+            metadata: json!({}),
+            idempotency_key: "other-event".into(),
+        })
+        .unwrap();
+    conn.execute(
+        "INSERT INTO claim_sources(claim_id,event_id) VALUES (?1,?2)",
+        rusqlite::params![record.id, other.id],
+    )
+    .unwrap();
+    let error = store.explain_claim(&access, &record.id).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::ScopeViolation
+    );
+}
+
+#[test]
+fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let mut store = setup(&path);
+    let source = event(&mut store, "source", "source");
+    let unrelated = event(&mut store, "unrelated", "unrelated");
+    for (subject, key) in [("one", "claim-one"), ("two", "claim-two")] {
+        store
+            .remember_claim(
+                "thread",
+                ClaimKind::Fact,
+                subject,
+                "value",
+                json!("accepted"),
+                std::slice::from_ref(&source.id),
+                key,
+            )
+            .unwrap();
+    }
+    let mut plans = Vec::new();
+    for key in ["committed-plan", "pending-plan", "failed-plan"] {
+        plans.push(
+            store
+                .plan_observation("thread", "memory-commands:thread", 6000, "test", "v1", key)
+                .unwrap()
+                .data
+                .into_plan()
+                .unwrap(),
+        );
+    }
+    assert_eq!(plans[0].events.len(), 2);
+    store
+        .fail_observation(&plans[2].run_id, "observer failure", "fail")
+        .unwrap();
+    store
+        .commit_observation(&plans[0].run_id, empty_result(), "commit")
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    // Installed after opening the store; these counters are fixture-only instrumentation.
+    conn.execute_batch("CREATE TABLE run_updates(id TEXT);
+        CREATE TRIGGER count_run_update AFTER UPDATE ON observation_runs BEGIN INSERT INTO run_updates VALUES (NEW.id); END;
+        INSERT INTO memory_operations VALUES ('already-purged','event.append',NULL,NULL);").unwrap();
+    let purge = store.purge_event(&source.id, "purge").unwrap();
+    assert_eq!(purge["purgedCommandEvents"], 2);
+    assert_eq!(purge["affectedRunIds"].as_array().unwrap().len(), 3);
+    for (plan, status) in plans.iter().zip(["committed", "stale", "failed"]) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_updates WHERE id=?1",
+                [&plan.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let run = store
+            .get_observation_run(&ReadAccess::agent("thread"), &plan.run_id)
+            .unwrap();
+        assert_eq!(run.status, status);
+        assert_eq!(run.source_integrity, SourceIntegrity::PrivacyPurged);
+        assert!(run.ambiguities.is_empty());
+        if status == "failed" {
+            assert_eq!(run.error.as_deref(), Some("observer failure"));
+        }
+        if status == "stale" {
+            assert_eq!(run.error.as_deref(), Some("source evidence privacy-purged"));
+        }
+    }
+    for key in [
+        "source",
+        "claim-one",
+        "claim-two",
+        "committed-plan",
+        "pending-plan",
+        "failed-plan",
+        "commit",
+        "already-purged",
+    ] {
+        let tombstoned: bool = conn.query_row("SELECT request_hash IS NULL AND result_json IS NULL FROM memory_operations WHERE idempotency_key=?1", [key], |row| row.get(0)).unwrap();
+        assert!(tombstoned, "operation {key} retained purged evidence");
+    }
+    assert_eq!(event(&mut store, "unrelated", "unrelated").id, unrelated.id);
+    assert!(
+        store
+            .purge_event(&source.id, "purge")
+            .unwrap()
+            .operation
+            .replayed
+    );
+}
+
+#[test]
 fn legacy_observer_replay_precedes_new_admission_limits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memory.db");

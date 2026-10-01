@@ -422,15 +422,14 @@ impl MemoryStore {
              FROM observation_runs
              WHERE (?1 IS NULL OR stream_id=?1)
                AND (?2 IS NULL OR status=?2)
+               AND scope_id IN (SELECT value FROM json_each(?3))
              ORDER BY created_at,id",
         )?;
         let visible = retrieval_scope_ids(&self.conn, &access.anchor_scope_id)?;
-        Ok(collect_rows(
-            statement.query_map(params![stream_id, status], row_observation_run_info)?,
-        )?
-        .into_iter()
-        .filter(|run| visible.contains(&run.scope_id))
-        .collect())
+        collect_rows(statement.query_map(
+            params![stream_id, status, serde_json::to_string(&visible)?],
+            row_observation_run_info,
+        )?)
     }
 
     pub fn stream_status(&self, access: &ReadAccess, stream_id: &str) -> Result<StreamStatus> {

@@ -216,12 +216,20 @@ fn collect_privacy_closure(
 }
 
 fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<()> {
+    let record_ids: Vec<&str> = closure
+        .claim_ids
+        .iter()
+        .chain(closure.observation_ids.iter())
+        .chain(closure.view_ids.iter())
+        .map(String::as_str)
+        .chain(closure.events.iter().map(|event| event.0.as_str()))
+        .collect();
+    scrub_operations_referencing(conn, &record_ids)?;
     for claim_id in &closure.claim_ids {
         conn.execute(
             "DELETE FROM memory_fts WHERE record_type='claim' AND record_id=?1",
             [claim_id],
         )?;
-        scrub_operations_referencing(conn, claim_id)?;
         conn.execute("DELETE FROM claims WHERE id=?1", [claim_id])?;
     }
     for slot in &closure.claim_slots {
@@ -240,16 +248,13 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
             "DELETE FROM memory_fts WHERE record_type='observation' AND record_id=?1",
             [observation_id],
         )?;
-        scrub_operations_referencing(conn, observation_id)?;
         conn.execute("DELETE FROM observations WHERE id=?1", [observation_id])?;
-    }
-    for view_id in &closure.view_ids {
-        scrub_operations_referencing(conn, view_id)?;
     }
     for view_id in &closure.direct_view_ids {
         conn.execute("DELETE FROM memory_views WHERE id=?1", [view_id])?;
     }
-    for (_, stream_id, sequence, _) in &closure.events {
+    let updated_at = now();
+    for run_id in &closure.affected_run_ids {
         conn.execute(
             "UPDATE observation_runs
              SET status=CASE WHEN status='pending' THEN 'stale' ELSE status END,
@@ -257,8 +262,8 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
                  ambiguities_json='[]',
                  error=CASE WHEN status='pending' THEN 'source evidence privacy-purged' ELSE error END,
                  updated_at=?1
-             WHERE stream_id=?2 AND from_sequence<=?3 AND to_sequence>=?3",
-            params![now(), stream_id, sequence],
+             WHERE id=?2",
+            params![updated_at, run_id],
         )?;
     }
     for (event_id, _, _, _) in &closure.events {
@@ -266,7 +271,6 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
             "DELETE FROM memory_fts WHERE record_type='event' AND record_id=?1",
             [event_id],
         )?;
-        scrub_operations_referencing(conn, event_id)?;
         conn.execute("DELETE FROM memory_events WHERE id=?1", [event_id])?;
     }
     Ok(())

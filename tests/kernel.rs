@@ -1189,6 +1189,38 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
             .observations
             .is_empty()
     );
+    // A view rejected by the budget must not suppress its inherited observations.
+    fixture
+        .store
+        .create_view(CreateView {
+            scope_id: "user".to_owned(),
+            stream_id: "stream".to_owned(),
+            kind: ViewKind::Continuity,
+            content: "large continuity text ".repeat(1000),
+            source_from_sequence: 1,
+            source_through_sequence: 1,
+            source_observation_ids: vec![],
+            expected_previous_view_id: Some(third.id.clone()),
+            model: None,
+            prompt_version: None,
+            token_count: None,
+            idempotency_key: "view-4".to_owned(),
+        })
+        .unwrap();
+    for compact in [false, true] {
+        let context = if compact {
+            fixture
+                .store
+                .compose_compact_context("user", "stream", 1000, 0, None)
+        } else {
+            fixture
+                .store
+                .compose_context("user", "stream", 1000, 0, None)
+        }
+        .unwrap();
+        assert!(context.continuity_views.is_empty());
+        assert_eq!(context.observations[0].id, commit.observations[0].id);
+    }
     assert_eq!(
         fixture
             .store
