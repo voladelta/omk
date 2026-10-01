@@ -14,6 +14,12 @@ Before retrying after interruption, inspect the relevant event, run, view, claim
 
 For `claim_conflict` during rescope, inspect both values and obtain the user's intended resolution before an explicit confirmation or correction unless that intent is already supplied. The failed rescope changes no claims or sources and leaves its key reusable. For `schema_mismatch`, stop record writes and restore a valid v6 database from backup; do not delete data or reconstruct constraints automatically.
 
-For stale observation or view work, refresh the cursor or latest view and regenerate the derived output from that accepted base. For privacy purges, follow the reported dependent records, affected runs, and recovery action; purged operation tombstones prevent deleted evidence from returning through replay.
+For `scope_violation`, verify the intended anchor scope and the cited source IDs. Claim and observation recall check each source, so a visible parent record can still fail when one source is outside the allowed scope. Keep the scope tied to the current task; do not switch to a broader scope just to bypass the error. Scope visibility is resolved again on the next request.
+
+For stale observation or view work, refresh the cursor or latest view and regenerate the derived output from that accepted base.
+
+For privacy purges, inspect the reported dependent records, `dependentViewIds`, `affectedRunIds`, and recovery action. Purge follows owned command evidence and later view generations. Deletion, search cleanup, run invalidation, and operation tombstones commit in one transaction. Each affected run is updated once: pending runs become stale; committed and failed runs retain their status. All affected runs report `sourceIntegrity: "privacy-purged"` and have their ambiguities cleared. Do not infer that a committed status means its source evidence is still intact.
+
+Purged operation tombstones discard both the saved result and request hash. A `privacy_purged` replay error is not a reason to use a new key to restore deleted evidence. Unrelated operations remain replayable. If the purge response was lost, retry the identical purge with its original key to read its saved result.
 
 Recovery is complete when inspection proves either one accepted write, a safe corrected retry path, or an explicit unresolved blocker. Report the operation code, whether the key remains reusable, and the required next action.

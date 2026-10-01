@@ -20,6 +20,8 @@ Plans reserve inherited active claims and previous continuation before events. O
 
 Inspect `observe status`, `observe get`, or `observe list` before creating more work. A failed run does not move the cursor. Competing or stale plans may exist, but only the run matching the current cursor can commit. Use `observe fail` to record a real observer failure; do not mark a usable run failed merely to bypass a commit error.
 
+Pass the intended `--scope` to run inspection. `observe list` includes runs from that scope, its ancestors and its descendants, subject to the stream and status filters. Unrelated runs are excluded before decoding. If a purge changed `sourceIntegrity` or made a pending run stale, follow [privacy recovery](recovery.md) before producing another result.
+
 ## Reflect
 
 Reflection is optional and never replaces evidence or canonical claims.
@@ -30,3 +32,5 @@ Reflection is optional and never replaces evidence or canonical claims.
 4. If the commit is stale, inspect the new active view and regenerate from current inputs; never reuse text derived from the stale base as though it were current.
 
 Reflection is complete when the new append-only generation cites its source observations and exact predecessor, while canonical claims remain separate.
+
+When checking the resulting context, account for observations inherited through the view's predecessor chain. Full and compact context omit an observation if a selected continuity view represents it, or if any source event is already present in the selected raw tail or query evidence. A view that cannot fit the budget does not suppress observations. Use exact recall to verify sources; absence from bounded context does not prove deletion.

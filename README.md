@@ -186,6 +186,8 @@ omk observe fail --run RUN_ID --reason model-timeout --idempotency-key observe-f
 
 A failed run does not move the cursor. A new plan retries the same range.
 
+`observe list` returns runs from the anchor scope, its ancestors and its descendants, subject to the stream and status filters. Unrelated runs are excluded before their stored fields are decoded.
+
 OMK allows competing plans, but only one can commit. It returns a structured recovery error for stale runs.
 
 Each run records `cursorAtPlan`. This lets OMK recover across privacy-purged sequence gaps without reusing sequence numbers.
@@ -213,6 +215,8 @@ The result separates pending and disputed claims from active claims. OMK treats 
 The estimate covers JSON model input, including the record fields selected by the chosen context format. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` and `compact_model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
 
 Observation planning reserves active inherited claims and previous continuation before selecting the next events. If required state and the first event cannot fit, it returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
+
+Context omits an observation when any of its source events is already present in the selected raw tail or query evidence, or when a selected continuity view represents it. View coverage includes observations inherited through previous generations. A continuity view that cannot fit the budget does not suppress observations. These rules apply to both full and compact context; exact recall still returns the stored evidence.
 
 Plans and recent context read events in pages of 32. Context considers at most 256 general observations and 256 pending/disputed claims (reading at most 257 observations and 257 claims per status to detect truncation). Each of at most 10 search hits expands to at most 256 source events. `diagnostics.truncated` marks candidate, source, or raw-tail truncation; `omittedItems` describes inspected items only. Exact recall remains complete. Active claims are all inspected. These bounds limit decoded rows and source loading; SQLite sorting, scope traversal, and view-chain checks can still scan growing history, so they do not guarantee constant latency.
 
@@ -256,6 +260,8 @@ omk recall event-range --scope thread:build --stream codex-thread-1 --from 1 --t
 
 `recall observation` returns the observation and its raw source events.
 
+Exact reads allow the anchor scope, its ancestors and its descendants. Knowing a record ID does not bypass this check: claim and observation recall also check every source event. An out-of-scope source fails the request with `scope_violation`; secret sources remain redacted unless you pass `--reveal-secret`. Scope visibility is resolved afresh for each request.
+
 ## Search across scopes
 
 Search treats your input as a literal phrase. Punctuation and hyphens are safe:
@@ -285,6 +291,10 @@ OMK applies these privacy rules:
 - event purge reports `dependentViews`, `dependentViewIds` and `affectedRunIds`
 - event purge also reports affected observations and claims
 - claim and event purge remove owned command events and records derived from them
+
+Each purge commits dependency deletion, search cleanup, run invalidation and operation tombstones in one transaction. It follows owned command evidence and removes dependent views along with their later generations. Each affected run is updated once: pending runs become stale, while committed and failed runs keep their status. All affected runs report `sourceIntegrity: "privacy-purged"` and have their ambiguities cleared.
+
+Matching operation tombstones discard both the saved result and request hash. Unrelated operations remain replayable, and an identical retry of the purge returns its saved result.
 
 ## Use the current schema
 
@@ -323,6 +333,7 @@ The integration tests cover:
 - privacy and strict observer validation
 - concurrency and recovery
 - command provenance and claim authority
-- scope retrieval and literal full-text search
-- hard context budgets and context composition
+- scope retrieval, per-source recall checks and full-text search modes
+- hard context budgets and deduplication through inherited continuity views
+- overlapping purge dependencies and preservation of unrelated replays
 - structured CLI errors and exact evidence recall
