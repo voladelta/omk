@@ -204,11 +204,13 @@ omk context \
   --recent-raw-tokens 6000
 ```
 
+Add `--compact` to emit the direct model payload with the same top-level sections and a budget calculated from compact records. The default command still returns the complete context bundle with diagnostics. Compact records keep claim status, modality, authority, confidence, scope and value; events keep their kind, scope, time, content and sensitivity. Record UUIDs remain intact for `omk event get`, `omk recall explain-claim`, and `omk recall observation`. Routine storage fields such as hashes, token counts, observer model and creation timestamps are omitted. Compact output has no diagnostics field; use the default command when you need omitted-item details. The library equivalents are `compose_compact_context(...)` and `ContextBundle::compact_model_payload()`.
+
 OMK never silently removes active state. If it cannot fit, the command returns `budget_exceeded` and `minimumRequiredTokens`.
 
 The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
 
-The estimate covers compact JSON model input, including record fields and metadata. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
+The estimate covers JSON model input, including the record fields selected by the chosen context format. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` and `compact_model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
 
 Observation planning reserves active inherited claims and previous continuation before selecting the next events. If required state and the first event cannot fit, it returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
 

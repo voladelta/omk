@@ -1,5 +1,43 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ContextRendering {
+    Full,
+    Compact,
+}
+
+impl ContextRendering {
+    fn claim_tokens(self, claim: &Claim) -> i64 {
+        match self {
+            Self::Full => estimate_claim_tokens(claim),
+            Self::Compact => serialized_item_tokens(&claim.compact_model_record()),
+        }
+    }
+
+    fn event_tokens(self, event: &MemoryEvent) -> i64 {
+        let serialized = match self {
+            Self::Full => serialized_item_tokens(event),
+            Self::Compact => serialized_item_tokens(&event.compact_model_record()),
+        };
+        serialized.saturating_add(event_hint_extra(event))
+    }
+
+    fn view_tokens(self, view: &MemoryView) -> i64 {
+        let serialized = match self {
+            Self::Full => serialized_item_tokens(view),
+            Self::Compact => serialized_item_tokens(&view.compact_model_record()),
+        };
+        serialized.saturating_add(view_hint_extra(view))
+    }
+
+    fn observation_tokens(self, observation: &Observation) -> i64 {
+        match self {
+            Self::Full => serialized_item_tokens(observation),
+            Self::Compact => serialized_item_tokens(&observation.compact_model_record()),
+        }
+    }
+}
+
 impl MemoryStore {
     pub fn create_view(&mut self, input: CreateView) -> Result<MutationResult<MemoryView>> {
         validate_nonempty("view content", &input.content)?;
@@ -292,6 +330,43 @@ impl MemoryStore {
         recent_raw_tokens: i64,
         query: Option<&str>,
     ) -> Result<ContextBundle> {
+        self.compose_context_with_rendering(
+            scope_id,
+            stream_id,
+            max_tokens,
+            recent_raw_tokens,
+            query,
+            ContextRendering::Full,
+        )
+    }
+
+    pub fn compose_compact_context(
+        &self,
+        scope_id: &str,
+        stream_id: &str,
+        max_tokens: i64,
+        recent_raw_tokens: i64,
+        query: Option<&str>,
+    ) -> Result<ContextBundle> {
+        self.compose_context_with_rendering(
+            scope_id,
+            stream_id,
+            max_tokens,
+            recent_raw_tokens,
+            query,
+            ContextRendering::Compact,
+        )
+    }
+
+    fn compose_context_with_rendering(
+        &self,
+        scope_id: &str,
+        stream_id: &str,
+        max_tokens: i64,
+        recent_raw_tokens: i64,
+        query: Option<&str>,
+        rendering: ContextRendering,
+    ) -> Result<ContextBundle> {
         ensure!(
             max_tokens > 0,
             KernelError::new(KernelErrorKind::InvalidInput, "max tokens must be positive",)
@@ -342,7 +417,10 @@ impl MemoryStore {
         let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
             "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
         let required_tokens: i64 = estimate_tokens(&empty_payload.to_string())
-            + claims.iter().map(estimate_claim_tokens).sum::<i64>();
+            + claims
+                .iter()
+                .map(|claim| rendering.claim_tokens(claim))
+                .sum::<i64>();
         ensure!(
             required_tokens <= max_tokens,
             KernelError::new(
@@ -377,7 +455,7 @@ impl MemoryStore {
 
         let mut selected_pending_claims = Vec::new();
         for claim in pending_claims {
-            let cost = estimate_claim_tokens(&claim);
+            let cost = rendering.claim_tokens(&claim);
             if cost <= max_tokens - diagnostics.estimated_tokens {
                 diagnostics.estimated_tokens += cost;
                 selected_pending_claims.push(claim);
@@ -402,7 +480,7 @@ impl MemoryStore {
             for event in page {
                 cursor = event.sequence;
                 let safe = redact_for_agent(event);
-                let cost = serialized_item_tokens(&safe).saturating_add(event_hint_extra(&safe));
+                let cost = rendering.event_tokens(&safe);
                 if cost > raw_budget - raw_tokens {
                     diagnostics.omitted_items.push(OmittedItem {
                         id: safe.id,
@@ -442,8 +520,7 @@ impl MemoryStore {
                         continue;
                     }
                     let event = self.get_event(&read_access, &id)?;
-                    let cost =
-                        serialized_item_tokens(&event).saturating_add(event_hint_extra(&event));
+                    let cost = rendering.event_tokens(&event);
                     if cost <= max_tokens - diagnostics.estimated_tokens {
                         diagnostics.estimated_tokens += cost;
                         recalled_evidence.push(event);
@@ -465,7 +542,7 @@ impl MemoryStore {
 
         let mut selected_continuity_ids = Vec::new();
         if let Some(view) = latest_view(&self.conn, stream_id, "continuity")? {
-            let cost = serialized_item_tokens(&view).saturating_add(view_hint_extra(&view));
+            let cost = rendering.view_tokens(&view);
             if cost <= max_tokens - diagnostics.estimated_tokens {
                 diagnostics.estimated_tokens += cost;
                 selected_continuity_ids.push(view.id.clone());
@@ -505,7 +582,7 @@ impl MemoryStore {
                 });
                 continue;
             }
-            let cost = serialized_item_tokens(&observation);
+            let cost = rendering.observation_tokens(&observation);
             if cost <= max_tokens - diagnostics.estimated_tokens {
                 diagnostics.estimated_tokens += cost;
                 observations.push(observation);

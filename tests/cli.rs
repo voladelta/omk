@@ -38,6 +38,77 @@ fn omk_with_stdin(db: &std::path::Path, args: &[&str], input: &[u8]) -> Output {
 }
 
 #[test]
+fn compact_context_cli_emits_recallable_model_input_and_keeps_default_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("memory.db");
+    success_json(&db, &["init"]);
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "user:cli",
+            "--kind",
+            "user",
+            "--idempotency-key",
+            "scope",
+        ],
+    );
+    let event = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "Keep the release decision",
+            "--idempotency-key",
+            "event",
+        ],
+    );
+    let event_id = event["data"]["id"].as_str().unwrap();
+
+    let default = success_json(
+        &db,
+        &["context", "--scope", "user:cli", "--stream", "stream"],
+    );
+    let compact = success_json(
+        &db,
+        &[
+            "context",
+            "--scope",
+            "user:cli",
+            "--stream",
+            "stream",
+            "--compact",
+        ],
+    );
+
+    assert!(default["diagnostics"]["estimatedTokens"].is_number());
+    assert_eq!(default["recentEvents"][0]["id"], event_id);
+    assert!(default["recentEvents"][0]["contentHash"].is_string());
+    assert!(compact.get("diagnostics").is_none());
+    assert_eq!(compact["recentEvents"][0]["id"], event_id);
+    assert_eq!(
+        compact["recentEvents"][0]["content"],
+        "Keep the release decision"
+    );
+    assert!(compact["recentEvents"][0].get("contentHash").is_none());
+
+    let recalled = success_json(
+        &db,
+        &["event", "get", "--scope", "user:cli", "--id", event_id],
+    );
+    assert_eq!(recalled["id"], event_id);
+}
+
+#[test]
 fn cli_reports_replays_and_structured_idempotency_conflicts() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("memory.db");

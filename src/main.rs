@@ -432,6 +432,9 @@ struct ContextArgs {
     recent_raw_tokens: i64,
     #[arg(long)]
     query: Option<String>,
+    /// Emit the compact model payload, with record IDs for exact recall.
+    #[arg(long)]
+    compact: bool,
 }
 
 fn command_allows_key_reuse(command: &Command) -> bool {
@@ -821,14 +824,25 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Context(args) => {
-            let bundle = store.compose_context(
-                &args.scope,
-                &args.stream,
-                args.max_tokens,
-                args.recent_raw_tokens,
-                args.query.as_deref(),
-            )?;
-            print_json(&bundle)?;
+            if args.compact {
+                let bundle = store.compose_compact_context(
+                    &args.scope,
+                    &args.stream,
+                    args.max_tokens,
+                    args.recent_raw_tokens,
+                    args.query.as_deref(),
+                )?;
+                print_json(&bundle.compact_model_payload())?;
+            } else {
+                let bundle = store.compose_context(
+                    &args.scope,
+                    &args.stream,
+                    args.max_tokens,
+                    args.recent_raw_tokens,
+                    args.query.as_deref(),
+                )?;
+                print_json(&bundle)?;
+            }
         }
     }
     Ok(())

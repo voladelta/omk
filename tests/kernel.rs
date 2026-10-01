@@ -105,6 +105,164 @@ fn observer_result(event_id: &str, value: &str) -> ObserverResult {
 }
 
 #[test]
+fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let source = fixture.event(
+        "user",
+        "stream",
+        "Launch asset is ETH",
+        Sensitivity::Normal,
+        "source",
+    );
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&source.id, "ETH"), "commit")
+        .unwrap();
+    let secret = fixture.event(
+        "user",
+        "stream",
+        "private credential",
+        Sensitivity::Secret,
+        "secret",
+    );
+
+    let full = fixture
+        .store
+        .compose_context("user", "stream", 10_000, 10_000, None)
+        .unwrap();
+    let compact = fixture
+        .store
+        .compose_compact_context("user", "stream", 10_000, 10_000, None)
+        .unwrap();
+    let payload = compact.compact_model_payload();
+
+    assert!(payload.to_string().len() < full.model_payload().to_string().len());
+    assert_eq!(payload["pendingClaims"][0]["id"], commit.claims[0].id);
+    assert_eq!(payload["pendingClaims"][0]["status"], "pending");
+    assert_eq!(
+        payload["pendingClaims"][0]["modality"],
+        "explicit-assertion"
+    );
+    assert_eq!(payload["pendingClaims"][0]["authority"], "model-inference");
+    assert_eq!(payload["pendingClaims"][0]["value"], "ETH");
+    assert_eq!(payload["recentEvents"][0]["id"], source.id);
+    assert_eq!(payload["recentEvents"][1]["id"], secret.id);
+    assert_eq!(payload["recentEvents"][1]["content"]["redacted"], true);
+    assert!(!payload.to_string().contains("private credential"));
+    assert!(payload["recentEvents"][0].get("contentHash").is_none());
+    assert!(payload["recentEvents"][0].get("recordedAt").is_none());
+
+    let claim_sources = fixture
+        .store
+        .explain_claim(&access("user"), &commit.claims[0].id)
+        .unwrap();
+    assert_eq!(claim_sources.source_events[0].id, source.id);
+    assert_eq!(
+        fixture
+            .store
+            .get_event(&access("user"), &secret.id)
+            .unwrap()
+            .content,
+        json!({"redacted": true, "reason": "secret"})
+    );
+
+    let without_raw = fixture
+        .store
+        .compose_compact_context("user", "stream", 10_000, 0, None)
+        .unwrap()
+        .compact_model_payload();
+    assert_eq!(
+        without_raw["observations"][0]["id"],
+        commit.observations[0].id
+    );
+    assert_eq!(
+        without_raw["observations"][0]["content"],
+        "Launch asset is ETH"
+    );
+    let observation_sources = fixture
+        .store
+        .recall_by_observation(&access("user"), &commit.observations[0].id)
+        .unwrap();
+    assert_eq!(observation_sources[0].id, source.id);
+}
+
+#[test]
+fn compact_context_budget_prices_compact_records_and_keeps_active_claims_mandatory() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event(
+        "user",
+        "stream",
+        "A decision with useful context",
+        Sensitivity::Normal,
+        "source",
+    );
+
+    let compact_fits_before_full = (50..350).any(|budget| {
+        let Ok(full) = fixture
+            .store
+            .compose_context("user", "stream", budget, 300, None)
+        else {
+            return false;
+        };
+        let Ok(compact) = fixture
+            .store
+            .compose_compact_context("user", "stream", budget, 300, None)
+        else {
+            return false;
+        };
+
+        compact.recent_events.len() == 1
+            && full.recent_events.is_empty()
+            && compact
+                .compact_model_payload()
+                .to_string()
+                .chars()
+                .count()
+                .div_ceil(4) as i64
+                <= compact.diagnostics.estimated_tokens
+            && compact.diagnostics.estimated_tokens <= budget
+    });
+    assert!(compact_fits_before_full);
+
+    fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "release",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let empty_payload = json!({
+        "claims": [],
+        "pendingClaims": [],
+        "continuation": null,
+        "continuityViews": [],
+        "observations": [],
+        "recentEvents": [],
+        "recalledEvidence": [],
+    });
+    let budget = empty_payload.to_string().chars().count().div_ceil(4) as i64 + 1;
+    let error = fixture
+        .store
+        .compose_compact_context("user", "stream", budget, 0, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("minimumRequiredTokens"));
+}
+
+#[test]
 fn append_is_idempotent_and_privacy_boundaries_are_safe() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);

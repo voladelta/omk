@@ -1,6 +1,6 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -59,6 +59,34 @@ pub struct MemoryEvent {
     pub metadata: Value,
 }
 
+impl MemoryEvent {
+    pub(crate) fn compact_model_record(&self) -> Value {
+        let mut record = json!({
+            "id": self.id,
+            "streamId": self.stream_id,
+            "sequence": self.sequence,
+            "scopeId": self.scope_id,
+            "kind": self.kind,
+            "occurredAt": self.occurred_at,
+            "content": self.content,
+            "sensitivity": self.sensitivity,
+        });
+
+        if let Some(actor) = &self.actor_id {
+            record["actorId"] = json!(actor);
+        }
+        if self
+            .metadata
+            .as_object()
+            .is_none_or(|metadata| !metadata.is_empty())
+        {
+            record["metadata"] = self.metadata.clone();
+        }
+
+        record
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewEvent {
@@ -105,6 +133,27 @@ pub struct Observation {
     pub observer_model: String,
     pub prompt_version: String,
     pub created_at: String,
+}
+
+impl Observation {
+    pub(crate) fn compact_model_record(&self) -> Value {
+        let mut record = json!({
+            "id": self.id,
+            "scopeId": self.scope_id,
+            "kind": self.kind,
+            "content": self.content,
+            "confidence": self.confidence,
+        });
+
+        if let Some(start) = &self.event_time_from {
+            record["eventTimeFrom"] = json!(start);
+        }
+        if let Some(end) = &self.event_time_to {
+            record["eventTimeTo"] = json!(end);
+        }
+
+        record
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -180,6 +229,30 @@ pub struct Claim {
     pub updated_at: String,
 }
 
+impl Claim {
+    pub(crate) fn compact_model_record(&self) -> Value {
+        let mut record = json!({
+            "id": self.id,
+            "scopeId": self.scope_id,
+            "kind": self.kind,
+            "subject": self.subject,
+            "predicate": self.predicate,
+            "cardinality": self.cardinality,
+            "value": self.value,
+            "modality": self.modality,
+            "status": self.status,
+            "authority": self.authority,
+            "confidence": self.confidence,
+        });
+
+        if let Some(supersedes) = &self.supersedes_id {
+            record["supersedesId"] = json!(supersedes);
+        }
+
+        record
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ViewKind {
@@ -203,6 +276,19 @@ pub struct MemoryView {
     pub prompt_version: Option<String>,
     pub token_count: i64,
     pub created_at: String,
+}
+
+impl MemoryView {
+    pub(crate) fn compact_model_record(&self) -> Value {
+        json!({
+            "id": self.id,
+            "scopeId": self.scope_id,
+            "kind": self.kind,
+            "content": self.content,
+            "sourceFromSequence": self.source_from_sequence,
+            "sourceThroughSequence": self.source_through_sequence,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -424,6 +510,19 @@ impl ContextBundle {
             "continuation": self.continuation, "continuityViews": self.continuity_views,
             "observations": self.observations, "recentEvents": self.recent_events,
             "recalledEvidence": self.recalled_evidence})
+    }
+
+    /// Compact model input. Record IDs can be used with native exact recall.
+    pub fn compact_model_payload(&self) -> Value {
+        json!({
+            "claims": self.claims.iter().map(Claim::compact_model_record).collect::<Vec<_>>(),
+            "pendingClaims": self.pending_claims.iter().map(Claim::compact_model_record).collect::<Vec<_>>(),
+            "continuation": self.continuation,
+            "continuityViews": self.continuity_views.iter().map(MemoryView::compact_model_record).collect::<Vec<_>>(),
+            "observations": self.observations.iter().map(Observation::compact_model_record).collect::<Vec<_>>(),
+            "recentEvents": self.recent_events.iter().map(MemoryEvent::compact_model_record).collect::<Vec<_>>(),
+            "recalledEvidence": self.recalled_evidence.iter().map(MemoryEvent::compact_model_record).collect::<Vec<_>>(),
+        })
     }
 }
 
