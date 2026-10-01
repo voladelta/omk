@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use omk::{
-    ClaimCardinality, ClaimKind, ClaimStatus, EventKind, KernelError, KernelErrorKind,
-    MAX_OBSERVER_BYTES, MemoryStore, MutationResult, NewEvent, ObserverResult, ReadAccess,
-    SCHEMA_VERSION, ScopeKind, SearchMode, SearchOptions, Sensitivity, ViewKind, store::CreateView,
+    ClaimCardinality, ClaimKind, ClaimStatus, ContextQuery, EventKind, KernelError,
+    KernelErrorKind, MAX_OBSERVER_BYTES, MemoryStore, MutationResult, NewEvent, ObserverResult,
+    ReadAccess, SCHEMA_VERSION, ScopeKind, SearchMode, SearchOptions, Sensitivity, ViewKind,
+    store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -432,6 +433,12 @@ struct ContextArgs {
     recent_raw_tokens: i64,
     #[arg(long)]
     query: Option<String>,
+    /// Match all whitespace-separated literal terms in the evidence query.
+    #[arg(long, requires = "query", conflicts_with = "fts_query")]
+    terms: bool,
+    /// Interpret the evidence query as SQLite FTS5 syntax.
+    #[arg(long, requires = "query")]
+    fts_query: bool,
     /// Emit the compact model payload, with record IDs for exact recall.
     #[arg(long)]
     compact: bool,
@@ -824,22 +831,35 @@ fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Context(args) => {
+            let query = args.query.as_deref().map(|text| ContextQuery {
+                text,
+                options: SearchOptions {
+                    mode: if args.fts_query {
+                        SearchMode::Advanced
+                    } else if args.terms {
+                        SearchMode::Terms
+                    } else {
+                        SearchMode::Phrase
+                    },
+                    current_only: false,
+                },
+            });
             if args.compact {
-                let bundle = store.compose_compact_context(
+                let bundle = store.compose_compact_context_with_query(
                     &args.scope,
                     &args.stream,
                     args.max_tokens,
                     args.recent_raw_tokens,
-                    args.query.as_deref(),
+                    query,
                 )?;
                 print_json(&bundle.compact_model_payload())?;
             } else {
-                let bundle = store.compose_context(
+                let bundle = store.compose_context_with_query(
                     &args.scope,
                     &args.stream,
                     args.max_tokens,
                     args.recent_raw_tokens,
-                    args.query.as_deref(),
+                    query,
                 )?;
                 print_json(&bundle)?;
             }

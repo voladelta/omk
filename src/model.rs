@@ -504,6 +504,13 @@ pub struct SearchOptions {
     pub current_only: bool,
 }
 
+/// Evidence query used during context composition.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextQuery<'a> {
+    pub text: &'a str,
+    pub options: SearchOptions,
+}
+
 impl ContextBundle {
     pub fn model_payload(&self) -> Value {
         serde_json::json!({"claims": self.claims, "pendingClaims": self.pending_claims,

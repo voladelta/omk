@@ -270,6 +270,8 @@ Use `--fts-query` only when you need SQLite FTS5 syntax.
 
 Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. A project context can also render one named descendant stream.
 
+Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
+
 ## Protect private data
 
 OMK applies these privacy rules:

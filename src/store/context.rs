@@ -330,6 +330,27 @@ impl MemoryStore {
         recent_raw_tokens: i64,
         query: Option<&str>,
     ) -> Result<ContextBundle> {
+        self.compose_context_with_query(
+            scope_id,
+            stream_id,
+            max_tokens,
+            recent_raw_tokens,
+            query.map(|text| ContextQuery {
+                text,
+                options: SearchOptions::default(),
+            }),
+        )
+    }
+
+    /// Compose full context with explicit evidence search semantics.
+    pub fn compose_context_with_query(
+        &self,
+        scope_id: &str,
+        stream_id: &str,
+        max_tokens: i64,
+        recent_raw_tokens: i64,
+        query: Option<ContextQuery<'_>>,
+    ) -> Result<ContextBundle> {
         self.compose_context_with_rendering(
             scope_id,
             stream_id,
@@ -348,6 +369,27 @@ impl MemoryStore {
         recent_raw_tokens: i64,
         query: Option<&str>,
     ) -> Result<ContextBundle> {
+        self.compose_compact_context_with_query(
+            scope_id,
+            stream_id,
+            max_tokens,
+            recent_raw_tokens,
+            query.map(|text| ContextQuery {
+                text,
+                options: SearchOptions::default(),
+            }),
+        )
+    }
+
+    /// Compose compact context with explicit evidence search semantics.
+    pub fn compose_compact_context_with_query(
+        &self,
+        scope_id: &str,
+        stream_id: &str,
+        max_tokens: i64,
+        recent_raw_tokens: i64,
+        query: Option<ContextQuery<'_>>,
+    ) -> Result<ContextBundle> {
         self.compose_context_with_rendering(
             scope_id,
             stream_id,
@@ -364,7 +406,7 @@ impl MemoryStore {
         stream_id: &str,
         max_tokens: i64,
         recent_raw_tokens: i64,
-        query: Option<&str>,
+        query: Option<ContextQuery<'_>>,
         rendering: ContextRendering,
     ) -> Result<ContextBundle> {
         ensure!(
@@ -502,7 +544,7 @@ impl MemoryStore {
         let mut recalled_evidence = Vec::new();
         let read_access = ReadAccess::agent(scope_id);
         if let Some(query) = query {
-            let hits = self.search_full_text(scope_id, query, 10)?;
+            let hits = self.search_with_options(scope_id, query.text, 10, query.options)?;
             let mut recalled_ids = HashSet::new();
             for hit in hits {
                 let mut ids = if hit.record_type == "event" {

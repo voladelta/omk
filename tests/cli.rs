@@ -38,6 +38,164 @@ fn omk_with_stdin(db: &std::path::Path, args: &[&str], input: &[u8]) -> Output {
 }
 
 #[test]
+fn context_query_modes_recall_separated_terms_in_both_renderings() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("memory.db");
+    success_json(&db, &["init"]);
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "user:query",
+            "--kind",
+            "user",
+            "--idempotency-key",
+            "scope",
+        ],
+    );
+    let event = success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:query",
+            "--stream",
+            "old",
+            "--kind",
+            "tool-result",
+            "--content",
+            "rollback threshold CLOCK_SKEW_17",
+            "--idempotency-key",
+            "event",
+        ],
+    );
+    let id = event["data"]["id"].as_str().unwrap();
+    let secret = omk_with_stdin(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:query",
+            "--stream",
+            "old",
+            "--kind",
+            "tool-result",
+            "--sensitivity",
+            "secret",
+            "--idempotency-key",
+            "secret",
+        ],
+        b"rollback secret CLOCK_SKEW_17",
+    );
+    assert!(
+        secret.status.success(),
+        "{}",
+        String::from_utf8_lossy(&secret.stderr)
+    );
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "user:other",
+            "--kind",
+            "user",
+            "--idempotency-key",
+            "other-scope",
+        ],
+    );
+    success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:other",
+            "--stream",
+            "other",
+            "--kind",
+            "tool-result",
+            "--content",
+            "rollback other CLOCK_SKEW_17",
+            "--idempotency-key",
+            "other-event",
+        ],
+    );
+    for compact in [false, true] {
+        let mut args = vec![
+            "context",
+            "--scope",
+            "user:query",
+            "--stream",
+            "old",
+            "--recent-raw-tokens",
+            "0",
+            "--query",
+            "rollback CLOCK_SKEW_17",
+        ];
+        if compact {
+            args.push("--compact");
+        }
+        let phrase = success_json(&db, &args);
+        assert_eq!(phrase["recalledEvidence"].as_array().unwrap().len(), 0);
+        args.push("--terms");
+        let terms = success_json(&db, &args);
+        assert_eq!(terms["recalledEvidence"].as_array().unwrap().len(), 1);
+        assert_eq!(terms["recalledEvidence"][0]["id"], id);
+        args.pop();
+        args.push("--fts-query");
+        let advanced = success_json(&db, &args);
+        assert_eq!(advanced["recalledEvidence"].as_array().unwrap().len(), 1);
+        assert_eq!(advanced["recalledEvidence"][0]["id"], id);
+    }
+    for flags in [
+        vec!["--terms"],
+        vec!["--fts-query"],
+        vec!["--terms", "--fts-query", "--query", "rollback"],
+    ] {
+        let mut args = vec!["context", "--scope", "user:query", "--stream", "old"];
+        args.extend(flags);
+        let output = omk(&db, &args);
+        assert_eq!(output.status.code(), Some(2));
+    }
+    let invalid = omk(
+        &db,
+        &[
+            "context",
+            "--scope",
+            "user:query",
+            "--stream",
+            "old",
+            "--query",
+            "\"",
+            "--fts-query",
+        ],
+    );
+    assert!(!invalid.status.success());
+    let error: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    let recall_invalid = omk(
+        &db,
+        &[
+            "recall",
+            "search",
+            "--scope",
+            "user:query",
+            "--query",
+            "\"",
+            "--fts-query",
+        ],
+    );
+    assert!(!recall_invalid.status.success());
+    let recall_error: Value = serde_json::from_slice(&recall_invalid.stderr).unwrap();
+    assert_eq!(error["error"]["code"], recall_error["error"]["code"]);
+}
+
+#[test]
 fn compact_context_cli_emits_recallable_model_input_and_keeps_default_output() {
     let directory = tempfile::tempdir().unwrap();
     let db = directory.path().join("memory.db");
