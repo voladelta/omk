@@ -3291,3 +3291,136 @@ fn purges_find_operations_and_search_rows_through_side_tables() {
         0
     );
 }
+
+#[test]
+fn only_live_claims_can_be_corrected() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let original = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let corrected = fixture
+        .store
+        .correct_claim(&original.id, json!("BTC"), &[], "correct")
+        .unwrap();
+    let rejected = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "chain",
+            json!("L1"),
+            &[],
+            "propose",
+        )
+        .unwrap();
+    fixture.store.reject_claim(&rejected.id, "reject").unwrap();
+    let expired = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "venue",
+            json!("DEX"),
+            &[],
+            "propose-2",
+        )
+        .unwrap();
+    fixture.store.forget_claim(&expired.id, "forget").unwrap();
+    for (id, key) in [
+        (&original.id, "stale-superseded"),
+        (&rejected.id, "stale-rejected"),
+        (&expired.id, "stale-expired"),
+    ] {
+        let error = fixture
+            .store
+            .correct_claim(id, json!("late"), &[], key)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<KernelError>().map(KernelError::kind),
+            Some(KernelErrorKind::InvalidInput)
+        );
+    }
+    // Rejected corrections leave the current state alone and their keys reusable.
+    let active = fixture
+        .store
+        .list_claims("user", false, Some(ClaimStatus::Active))
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, corrected.id);
+    let pending = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "region",
+            json!("EU"),
+            &[],
+            "propose-3",
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .correct_claim(&pending.id, json!("US"), &[], "stale-superseded")
+            .unwrap()
+            .status,
+        ClaimStatus::Active
+    );
+}
+
+#[test]
+fn context_reads_one_snapshot_while_another_connection_commits() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event("user", "stream", "seed", Sensitivity::Normal, "seed");
+    let path = fixture._directory.path().join("memory.db");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|threads| {
+        let reader = threads.spawn(|| {
+            let reader = MemoryStore::open(&path).unwrap();
+            let mut checked = 0;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let context = reader
+                    .compose_context("user", "stream", 1_000_000, 0, None)
+                    .unwrap();
+                // Each commit adds one pending claim and one observation together.
+                assert_eq!(context.pending_claims.len(), context.observations.len());
+                checked += 1;
+            }
+            checked
+        });
+        for index in 0..60 {
+            let event = fixture.event(
+                "user",
+                "stream",
+                "work",
+                Sensitivity::Normal,
+                &format!("event-{index}"),
+            );
+            let plan = plan_run(&mut fixture, "user", "stream", &format!("plan-{index}"));
+            fixture
+                .store
+                .commit_observation(
+                    &plan.run_id,
+                    observer_result(&event.id, &format!("value-{index}")),
+                    &format!("commit-{index}"),
+                )
+                .unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(reader.join().unwrap() > 0);
+    });
+}

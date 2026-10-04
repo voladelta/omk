@@ -210,7 +210,7 @@ Add `--compact` to emit the direct model payload with the same top-level section
 
 OMK never silently removes active state. If it cannot fit, the command returns `budget_exceeded` and `minimumRequiredTokens`.
 
-The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
+Context reads all of its sections inside one SQLite read transaction, so a concurrent commit cannot split the bundle. The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
 
 The estimate covers JSON model input, including the record fields selected by the chosen context format. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` and `compact_model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
 
@@ -240,7 +240,7 @@ omk claim purge      Delete a claim and its provenance links.
 omk event purge      Delete an event and dependent records.
 ```
 
-Rescope keeps a disputed claim disputed and a pending claim pending; only an active claim stays active. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
+Correct accepts only an active, pending or disputed claim; correcting a superseded, rejected or expired claim returns `invalid_input`. Rescope keeps a disputed claim disputed and a pending claim pending; only an active claim stays active. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 

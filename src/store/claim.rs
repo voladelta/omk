@@ -298,6 +298,13 @@ impl MemoryStore {
             return Ok(MutationResult::replayed(prior));
         }
         let old = query_claim(&tx, claim_id)?;
+        ensure!(
+            matches!(
+                old.status,
+                ClaimStatus::Active | ClaimStatus::Pending | ClaimStatus::Disputed
+            ),
+            KernelError::invalid_input("claim must be active, pending, or disputed to correct")
+        );
         let old_id = old.id.clone();
         validate_claim_event_sources(&tx, &old.scope_id, source_event_ids)?;
         let command_event =

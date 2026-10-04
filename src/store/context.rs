@@ -431,6 +431,9 @@ impl MemoryStore {
                 "recent raw tokens cannot be negative",
             )
         );
+        // Read every section from one snapshot. Dropping the transaction
+        // rolls it back, which is all a read needs.
+        let _snapshot = self.conn.unchecked_transaction()?;
         let visible = visible_scope_ids(&self.conn, scope_id)?;
         let stream_scope: String = self
             .conn
