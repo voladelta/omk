@@ -189,6 +189,7 @@ impl MemoryStore {
             .map(|event| (event.id.clone(), event))
             .collect();
         validate_provenance(&result, &sources_by_id)?;
+        validate_claim_cardinalities(&tx, &run.scope_id, &result.claims)?;
         let timestamp = now();
         let mut observations = Vec::with_capacity(result.observations.len());
         for draft in &result.observations {

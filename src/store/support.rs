@@ -182,6 +182,43 @@ pub(super) fn validate_provenance(
     Ok(())
 }
 
+/// Reject drafts that could never be confirmed because their slot already
+/// uses another cardinality. Pending claims do not create slots.
+pub(super) fn validate_claim_cardinalities(
+    conn: &Connection,
+    scope_id: &str,
+    drafts: &[ClaimDraft],
+) -> Result<()> {
+    let mut batch: HashMap<(String, String, String), String> = HashMap::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        let kind = enum_text(&draft.kind);
+        let subject = draft.subject.trim();
+        let predicate = draft.predicate.trim();
+        let wanted = enum_text(&draft.cardinality);
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT cardinality FROM claim_slots
+                 WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4",
+                params![scope_id, kind, subject, predicate],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Drafts in one result must also agree with each other.
+        let existing = existing.or_else(|| {
+            batch.insert(
+                (kind, subject.to_owned(), predicate.to_owned()),
+                wanted.clone(),
+            )
+        });
+        if let Some(existing) = existing.filter(|existing| existing != &wanted) {
+            bail!(KernelError::invalid_input(format!(
+                "claim {index} uses {wanted} cardinality but its slot already uses {existing} cardinality"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_score(name: &str, score: f64) -> Result<()> {
     ensure!(
         score.is_finite() && (0.0..=1.0).contains(&score),

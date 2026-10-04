@@ -2765,3 +2765,56 @@ fn pending_claim_backlog_keeps_the_newest_claims_in_context() {
     assert_eq!(shown[0], ids[4]);
     assert_eq!(shown[255], ids[259]);
 }
+
+#[test]
+fn observer_claims_cannot_contradict_an_existing_slot_cardinality() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let event = fixture.event(
+        "user",
+        "stream",
+        "Launch assets",
+        Sensitivity::Normal,
+        "event",
+    );
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    let mut result = observer_result(&event.id, "BTC");
+    result.claims[0].cardinality = ClaimCardinality::Set;
+    let error = fixture
+        .store
+        .commit_observation(&plan.run_id, result, "commit")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    let message = error.to_string();
+    assert!(message.contains("claim 0") && message.contains("single"));
+    // Nothing was written, so the run and the key stay usable.
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Pending))
+            .unwrap()
+            .is_empty()
+    );
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "BTC"), "commit")
+        .unwrap();
+    let claim = &commit.claims[0];
+    let confirmed = fixture.store.confirm_claim(&claim.id, "confirm").unwrap();
+    assert_eq!(confirmed.status, ClaimStatus::Active);
+}

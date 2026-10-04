@@ -246,7 +246,7 @@ Direct claim commands create a `memory-command` event. This keeps commands sourc
 
 Claims default to `--cardinality single`. This allows one active value for each scope, kind, subject and predicate.
 
-Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident.
+Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident. Observation commit applies the same rule: it returns `invalid_input` before any write when an observer claim uses a different cardinality from its existing slot, so the same key stays reusable.
 
 Observer-produced claims stay pending, even if the model labels one as an accepted decision. Use a claim command to confirm it. You can promote it only to an ancestor scope.
 
