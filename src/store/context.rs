@@ -613,31 +613,22 @@ impl MemoryStore {
         if !observation_scopes.contains(&stream_scope) {
             observation_scopes.push(stream_scope);
         }
-        let mut candidates = query_observations_for_scopes(&self.conn, &observation_scopes)?;
+        // Newest first, so a backlog of older observations cannot hide new ones.
+        let mut candidates = query_observations_for_scopes(
+            &self.conn,
+            &observation_scopes,
+            &selected_continuity_ids,
+        )?;
         if candidates.len() > 256 {
             diagnostics.truncated = true;
             candidates.truncate(256);
         }
         let mut observations = Vec::new();
-        let candidate_ids: Vec<&str> = candidates
-            .iter()
-            .map(|observation| observation.id.as_str())
-            .collect();
-        let represented_observations =
-            observations_in_views(&self.conn, &candidate_ids, &selected_continuity_ids)?;
         for observation in candidates {
-            let duplicated_by_raw =
-                observation_has_events(&self.conn, &observation.id, &represented_event_ids)?;
-            let represented_by_view = represented_observations.contains(&observation.id);
-            if duplicated_by_raw || represented_by_view {
+            if observation_has_events(&self.conn, &observation.id, &represented_event_ids)? {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: observation.id,
-                    reason: if duplicated_by_raw {
-                        "source events already present in raw tail"
-                    } else {
-                        "already represented by continuity view"
-                    }
-                    .to_owned(),
+                    reason: "source events already present in raw tail".to_owned(),
                 });
                 continue;
             }

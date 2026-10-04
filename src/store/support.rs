@@ -890,19 +890,43 @@ pub(super) fn copy_claim_sources(
 pub(super) fn query_observations_for_scopes(
     conn: &Connection,
     scope_ids: &[String],
+    represented_view_ids: &[String],
 ) -> Result<Vec<Observation>> {
     if scope_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", scope_ids.len())
+    let scope_placeholders = std::iter::repeat_n("?", scope_ids.len())
         .collect::<Vec<_>>()
         .join(",");
+    let view_placeholders = std::iter::repeat_n("?", represented_view_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Observations represented by the selected view chain are excluded before
+    // LIMIT so reflected history cannot crowd out newer observations.
     let sql = format!(
-        "SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
-         FROM observations WHERE scope_id IN ({placeholders}) ORDER BY importance DESC,created_at,id LIMIT 257"
+        "WITH RECURSIVE view_chain(id) AS (
+            SELECT id FROM memory_views WHERE id IN ({view_placeholders})
+            UNION
+            SELECT view.previous_view_id
+            FROM memory_views view
+            JOIN view_chain current ON current.id=view.id
+            WHERE view.previous_view_id IS NOT NULL
+         )
+         SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
+         FROM observations
+         WHERE scope_id IN ({scope_placeholders})
+           AND NOT EXISTS (
+               SELECT 1 FROM view_sources source
+               JOIN view_chain ON view_chain.id=source.view_id
+               WHERE source.observation_id=observations.id
+           )
+         ORDER BY created_at DESC,id LIMIT 257"
     );
     let mut statement = conn.prepare(&sql)?;
-    collect_rows(statement.query_map(rusqlite::params_from_iter(scope_ids), row_observation)?)
+    collect_rows(statement.query_map(
+        rusqlite::params_from_iter(represented_view_ids.iter().chain(scope_ids)),
+        row_observation,
+    )?)
 }
 
 pub(super) fn observation_has_events(
@@ -917,48 +941,6 @@ pub(super) fn observation_has_events(
         params![observation_id, event_ids_json],
         |row| row.get(0),
     )?)
-}
-
-pub(super) fn observations_in_views(
-    conn: &Connection,
-    observation_ids: &[&str],
-    view_ids: &[String],
-) -> Result<HashSet<String>> {
-    if view_ids.is_empty() || observation_ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let placeholders = std::iter::repeat_n("?", view_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "WITH RECURSIVE view_chain(id) AS (
-            SELECT id FROM memory_views WHERE id IN ({placeholders})
-            UNION
-            SELECT view.previous_view_id
-            FROM memory_views view
-            JOIN view_chain current ON current.id=view.id
-            WHERE view.previous_view_id IS NOT NULL
-         )
-         SELECT DISTINCT source.observation_id
-         FROM view_chain
-         JOIN view_sources source ON source.view_id=view_chain.id
-         WHERE source.observation_id IN (SELECT value FROM json_each(?))"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let ids_json = serde_json::to_string(observation_ids)?;
-    Ok(collect_rows(
-        statement.query_map(
-            rusqlite::params_from_iter(
-                view_ids
-                    .iter()
-                    .map(String::as_str)
-                    .chain(std::iter::once(ids_json.as_str())),
-            ),
-            |row| row.get(0),
-        )?,
-    )?
-    .into_iter()
-    .collect())
 }
 
 pub(super) fn context_source_ids(

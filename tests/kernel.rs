@@ -2608,3 +2608,121 @@ fn unversioned_nonempty_databases_are_not_adopted() {
         .unwrap();
     assert_eq!(omk_table_count, 0);
 }
+
+fn observations_only(event_id: &str, label: &str, count: usize, importance: f64) -> ObserverResult {
+    ObserverResult {
+        observations: (0..count)
+            .map(|index| ObservationDraft {
+                kind: ObservationKind::Event,
+                content: format!("{label} {index}"),
+                importance,
+                confidence: 1.0,
+                source_event_ids: vec![event_id.to_owned()],
+                event_time_from: None,
+                event_time_to: None,
+            })
+            .collect(),
+        claims: vec![],
+        continuation: ContinuationDraft {
+            current_task: Some("Keep going".to_owned()),
+            ..ContinuationDraft::default()
+        },
+        ambiguities: vec![],
+        empty_reason: None,
+    }
+}
+
+fn plan_run(fixture: &mut Fixture, scope: &str, stream: &str, key: &str) -> ObservationPlan {
+    fixture
+        .store
+        .plan_observation(scope, stream, 100_000, "fake", "v1", key)
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap()
+}
+
+#[test]
+fn reflected_observations_do_not_starve_new_unreflected_observations() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let mut reflected = Vec::new();
+    for batch in 0..2 {
+        let event = fixture.event(
+            "user",
+            "stream",
+            "old work",
+            Sensitivity::Normal,
+            &format!("old-event-{batch}"),
+        );
+        let plan = plan_run(&mut fixture, "user", "stream", &format!("old-plan-{batch}"));
+        let commit = fixture
+            .store
+            .commit_observation(
+                &plan.run_id,
+                observations_only(&event.id, "reflected", 150, 0.9),
+                &format!("old-commit-{batch}"),
+            )
+            .unwrap();
+        reflected.extend(commit.observations.iter().map(|item| item.id.clone()));
+    }
+    fixture
+        .store
+        .create_view(CreateView {
+            scope_id: "user".to_owned(),
+            stream_id: "stream".to_owned(),
+            kind: ViewKind::Continuity,
+            content: "everything so far".to_owned(),
+            source_from_sequence: 1,
+            source_through_sequence: 2,
+            source_observation_ids: reflected,
+            expected_previous_view_id: None,
+            model: None,
+            prompt_version: None,
+            token_count: None,
+            idempotency_key: "view".to_owned(),
+        })
+        .unwrap();
+    let event = fixture.event(
+        "user",
+        "stream",
+        "new work",
+        Sensitivity::Normal,
+        "new-event",
+    );
+    let plan = plan_run(&mut fixture, "user", "stream", "new-plan");
+    let fresh = fixture
+        .store
+        .commit_observation(
+            &plan.run_id,
+            observations_only(&event.id, "fresh", 5, 0.5),
+            "new-commit",
+        )
+        .unwrap();
+    for compact in [false, true] {
+        let context = if compact {
+            fixture
+                .store
+                .compose_compact_context("user", "stream", 100_000, 0, None)
+        } else {
+            fixture
+                .store
+                .compose_context("user", "stream", 100_000, 0, None)
+        }
+        .unwrap();
+        let mut shown: Vec<&str> = context
+            .observations
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        shown.sort_unstable();
+        let mut expected: Vec<&str> = fresh
+            .observations
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(shown, expected);
+        assert!(!context.diagnostics.truncated);
+    }
+}
