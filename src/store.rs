@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::model::*;
 use crate::{KernelError, KernelErrorKind};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 mod claim;
 mod context;

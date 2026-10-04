@@ -260,6 +260,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
              SET status=CASE WHEN status='pending' THEN 'stale' ELSE status END,
                  source_integrity='privacy-purged',
                  ambiguities_json='[]',
+                 truncated_event_ids_json='[]',
                  error=CASE WHEN status='pending' THEN 'source evidence privacy-purged' ELSE error END,
                  updated_at=?1
              WHERE id=?2",

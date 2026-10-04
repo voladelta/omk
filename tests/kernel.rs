@@ -2551,7 +2551,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
 #[test]
 fn incompatible_database_versions_are_rejected_without_schema_writes() {
     let directory = tempfile::tempdir().unwrap();
-    for version in [1_i64, 2, 3, 4, 99] {
+    for version in [1_i64, 2, 3, 4, 6, 99] {
         let path = directory.path().join(format!("schema-{version}.db"));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -2983,4 +2983,72 @@ fn deeper_scope_single_claims_shadow_ancestors_in_context_and_plans() {
         .list_claims("thread", true, Some(ClaimStatus::Active))
         .unwrap();
     assert!(listed.iter().any(|claim| claim.id == shadowed.id));
+}
+
+#[test]
+fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let big = fixture.event(
+        "user",
+        "stream",
+        &"x".repeat(4_000),
+        Sensitivity::Normal,
+        "big",
+    );
+    let small = fixture.event("user", "stream", "small", Sensitivity::Normal, "small");
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 400, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let stub = &plan.events[0];
+    assert_eq!(stub.id, big.id);
+    assert_eq!(stub.content["truncated"], json!(true));
+    assert_eq!(stub.content["reason"], json!("exceeds observation budget"));
+    let preview = stub.content["preview"].as_str().unwrap();
+    assert!(!preview.is_empty() && preview.len() < 4_000);
+    assert_eq!(stub.metadata, json!({}));
+    assert_eq!(plan.to_sequence, 1);
+
+    // The stored event is intact, but the observer cannot cite the stub.
+    let error = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&big.id, "ETH"), "cite-stub")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(error.to_string().contains("truncated event"));
+    let empty = ObserverResult {
+        observations: vec![],
+        claims: vec![],
+        continuation: ContinuationDraft::default(),
+        ambiguities: vec![],
+        empty_reason: Some("only a truncated event".to_owned()),
+    };
+    fixture
+        .store
+        .commit_observation(&plan.run_id, empty, "commit-empty")
+        .unwrap();
+    let status = fixture
+        .store
+        .stream_status(&access("user"), "stream")
+        .unwrap();
+    assert_eq!(status.observed_through_sequence, 1);
+
+    let next = plan_run(&mut fixture, "user", "stream", "next-plan");
+    assert_eq!(next.events[0].id, small.id);
+    assert_eq!(next.events[0].content, json!("small"));
+    assert_eq!(
+        fixture
+            .store
+            .get_event(&reveal("user"), &big.id)
+            .unwrap()
+            .content,
+        json!("x".repeat(4_000))
+    );
 }

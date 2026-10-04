@@ -962,7 +962,7 @@ fn classify_error(
             "schema_mismatch",
             false,
             true,
-            Some("restore a valid schema v6 database from backup; do not delete existing data"),
+            Some("restore a valid schema v7 database from backup; do not delete existing data"),
         ),
         KernelErrorKind::IdempotencyConflict => (
             "idempotency_conflict",

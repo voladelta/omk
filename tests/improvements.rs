@@ -644,8 +644,16 @@ fn extreme_token_hints_fail_without_integer_overflow() {
             idempotency_key: "event".into(),
         })
         .unwrap();
-    let error = store
+    // The inflated hint cannot fit, so the first event is planned as a stub.
+    let plan = store
         .plan_observation("thread", "stream", i64::MAX, "test", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(plan.events[0].content["truncated"], json!(true));
+    let error = store
+        .plan_observation("thread", "stream", 1, "test", "v1", "tiny-plan")
         .unwrap_err();
     assert_eq!(
         error.downcast_ref::<KernelError>().unwrap().kind(),

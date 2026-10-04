@@ -10,13 +10,15 @@ pub(super) struct ObservationRun {
     pub(super) status: String,
     pub(super) observer_model: String,
     pub(super) prompt_version: String,
+    pub(super) truncated_event_ids: Vec<String>,
 }
 
 pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
     conn.query_row(
-        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version FROM observation_runs WHERE id=?1",
+        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json FROM observation_runs WHERE id=?1",
         [id],
         |row| {
+            let truncated_raw: String = row.get(8)?;
             Ok(ObservationRun {
                 scope_id: row.get(0)?,
                 stream_id: row.get(1)?,
@@ -26,6 +28,13 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
                 status: row.get(5)?,
                 observer_model: row.get(6)?,
                 prompt_version: row.get(7)?,
+                truncated_event_ids: serde_json::from_str(&truncated_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        truncated_raw.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             })
         },
     )
@@ -149,6 +158,7 @@ pub(super) fn observer_result_is_completely_empty(result: &ObserverResult) -> bo
 pub(super) fn validate_provenance(
     result: &ObserverResult,
     sources_by_id: &HashMap<String, MemoryEvent>,
+    truncated_event_ids: &[String],
 ) -> Result<()> {
     let all_ids = result
         .observations
@@ -176,6 +186,12 @@ pub(super) fn validate_provenance(
             event.sensitivity == Sensitivity::Normal,
             KernelError::invalid_input(format!(
                 "redacted event {event_id} cannot source derived memory"
+            ))
+        );
+        ensure!(
+            !truncated_event_ids.contains(event_id),
+            KernelError::invalid_input(format!(
+                "truncated event {event_id} cannot source derived memory"
             ))
         );
     }
@@ -235,6 +251,52 @@ pub(super) fn redact_for_agent(mut event: MemoryEvent) -> MemoryEvent {
         event.token_count = estimate_event_tokens(&event.content, &event.metadata);
     }
     event
+}
+
+/// Replace an event that cannot fit the observation budget with a stub whose
+/// preview keeps as much serialized content as `available_tokens` allows.
+/// Returns the cost of an empty stub when even that does not fit.
+pub(super) fn truncate_event_for_budget(
+    event: MemoryEvent,
+    available_tokens: i64,
+) -> std::result::Result<MemoryEvent, i64> {
+    let serialized = event.content.to_string();
+    let stub = |chars: usize| {
+        let content = json!({
+            "truncated": true,
+            "reason": "exceeds observation budget",
+            "preview": serialized.chars().take(chars).collect::<String>(),
+        });
+        let metadata = json!({});
+        MemoryEvent {
+            content_hash: hash_json(&content),
+            token_count: estimate_event_tokens(&content, &metadata),
+            content,
+            metadata,
+            ..event.clone()
+        }
+    };
+    let cost = |chars: usize| serialized_item_tokens(&stub(chars));
+    let empty_cost = cost(0);
+    if empty_cost > available_tokens {
+        return Err(empty_cost);
+    }
+    // Four characters per token bounds the preview, and cost grows with length.
+    let mut low = 0;
+    let mut high = serialized.chars().count().min(
+        usize::try_from(available_tokens)
+            .unwrap_or(usize::MAX / 4)
+            .saturating_mul(4),
+    );
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if cost(middle) <= available_tokens {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(stub(low))
 }
 
 pub(super) struct ResolvedReadAccess<'a> {

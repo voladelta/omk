@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS observation_runs (
     observer_model TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     ambiguities_json TEXT NOT NULL DEFAULT '[]',
+    truncated_event_ids_json TEXT NOT NULL DEFAULT '[]',
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

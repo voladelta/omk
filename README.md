@@ -214,7 +214,7 @@ The result separates pending and disputed claims from active claims. OMK treats 
 
 The estimate covers JSON model input, including the record fields selected by the chosen context format. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` and `compact_model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
 
-Observation planning reserves active inherited claims and previous continuation before selecting the next events. If required state and the first event cannot fit, it returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
+Observation planning reserves active inherited claims and previous continuation before selecting the next events. If the first event alone cannot fit but required state can, the plan includes that event as a stub with content `{"truncated": true, "reason": "exceeds observation budget", "preview": ...}` and empty metadata, so the run covers it and the cursor can advance. The preview keeps as much serialized content as fits, possibly none. The run records stubbed event IDs, and commit rejects any observation, claim or ambiguity that cites one with `invalid_input`. If required state and an empty stub cannot fit, planning returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
 
 Context omits an observation when any of its source events is already present in the selected raw tail or query evidence, or when a selected continuity view represents it. View coverage includes observations inherited through previous generations. OMK applies view coverage before it limits candidates, and it picks the newest remaining observations first, so a large reflected backlog cannot hide new ones. A continuity view that cannot fit the budget does not suppress observations. These rules apply to both full and compact context; exact recall still returns the stored evidence.
 
@@ -298,7 +298,7 @@ Matching operation tombstones discard both the saved result and request hash. Un
 
 ## Use the current schema
 
-OMK 0.6 uses schema v6. Existing schema v6 databases reopen without changes.
+OMK 0.7 uses schema v7. Existing schema v7 databases reopen without changes.
 
 Opening a database compares its required table, column, constraint, index, and FTS definitions against the schema created by OMK. A missing or changed definition returns `schema_mismatch` before record writes. The comparison is deliberately exact for OMK-created databases; it does not repair altered schemas or replace a full integrity check.
 
@@ -312,7 +312,7 @@ Omit `--expected-previous-view` only for generation 1.
 
 Each stream has its own view chain. Every view links to the exact previous view. A stale commit fails without writing. The previous view stays active after a failed reflection.
 
-OMK 0.6 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure.
+OMK 0.7 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure.
 
 `--scope` states the agent's intent and prevents accidental scope leaks. It does not authenticate a process that can choose another scope or read the database.
 

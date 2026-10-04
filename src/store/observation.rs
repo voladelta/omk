@@ -92,20 +92,29 @@ impl MemoryStore {
                 .as_ref()
                 .map_or(0, view_hint_extra),
         );
+        let mut truncated_event_ids = Vec::new();
         'pages: loop {
             let page_len = page.len();
             for event in page {
-                let event = redact_for_agent(event);
-                let cost = serialized_item_tokens(&event).saturating_add(event_hint_extra(&event));
+                let mut event = redact_for_agent(event);
+                let mut cost =
+                    serialized_item_tokens(&event).saturating_add(event_hint_extra(&event));
                 if cost > max_tokens - tokens {
-                    ensure!(
-                        !plan.events.is_empty(),
-                        KernelError::budget_exceeded(format!(
-                            "observation budget too small: minimumRequiredTokens={} for required state and first event",
-                            tokens.saturating_add(cost)
-                        ))
-                    );
-                    break 'pages;
+                    if !plan.events.is_empty() {
+                        break 'pages;
+                    }
+                    // An oversized first event would block the stream forever, so
+                    // cover it with a stub the observer cannot cite.
+                    event = truncate_event_for_budget(event, max_tokens - tokens).map_err(
+                        |stub_cost| {
+                            KernelError::budget_exceeded(format!(
+                                "observation budget too small: minimumRequiredTokens={} for required state and first event",
+                                tokens.saturating_add(stub_cost)
+                            ))
+                        },
+                    )?;
+                    cost = serialized_item_tokens(&event);
+                    truncated_event_ids.push(event.id.clone());
                 }
                 tokens += cost;
                 plan.events.push(event);
@@ -123,9 +132,9 @@ impl MemoryStore {
         let run_id = &plan.run_id;
         let timestamp = now();
         tx.execute(
-            "INSERT INTO observation_runs(id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?9)",
-            params![run_id, scope_id, stream_id, cursor, from_sequence, to_sequence, observer_model, prompt_version, timestamp],
+            "INSERT INTO observation_runs(id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?10)",
+            params![run_id, scope_id, stream_id, cursor, from_sequence, to_sequence, observer_model, prompt_version, serde_json::to_string(&truncated_event_ids)?, timestamp],
         )?;
         let outcome = ObservationPlanOutcome::ready(plan);
         save_operation(
@@ -189,7 +198,7 @@ impl MemoryStore {
             .into_iter()
             .map(|event| (event.id.clone(), event))
             .collect();
-        validate_provenance(&result, &sources_by_id)?;
+        validate_provenance(&result, &sources_by_id, &run.truncated_event_ids)?;
         validate_claim_cardinalities(&tx, &run.scope_id, &result.claims)?;
         let timestamp = now();
         let mut observations = Vec::with_capacity(result.observations.len());

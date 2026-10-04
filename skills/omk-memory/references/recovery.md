@@ -12,7 +12,7 @@ A successful envelope is not a failed test. It proves the write committed. Accep
 
 Before retrying after interruption, inspect the relevant event, run, view, claim, or stream status. A successful write may already have committed even when its output was lost. Prefer replaying the identical request over issuing a changed duplicate.
 
-For `claim_conflict` during rescope, inspect both values and obtain the user's intended resolution before an explicit confirmation or correction unless that intent is already supplied. The failed rescope changes no claims or sources and leaves its key reusable. For `schema_mismatch`, stop record writes and restore a valid v6 database from backup; do not delete data or reconstruct constraints automatically.
+For `claim_conflict` during rescope, inspect both values and obtain the user's intended resolution before an explicit confirmation or correction unless that intent is already supplied. The failed rescope changes no claims or sources and leaves its key reusable. For `schema_mismatch`, stop record writes and restore a valid v7 database from backup; do not delete data or reconstruct constraints automatically.
 
 For `scope_violation`, verify the intended anchor scope and the cited source IDs. Claim and observation recall check each source, so a visible parent record can still fail when one source is outside the allowed scope. Keep the scope tied to the current task; do not switch to a broader scope just to bypass the error. Scope visibility is resolved again on the next request.
 
