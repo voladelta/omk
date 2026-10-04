@@ -2818,3 +2818,61 @@ fn observer_claims_cannot_contradict_an_existing_slot_cardinality() {
     let confirmed = fixture.store.confirm_claim(&claim.id, "confirm").unwrap();
     assert_eq!(confirmed.status, ClaimStatus::Active);
 }
+
+#[test]
+fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("thread", ScopeKind::Thread, Some("user"));
+    let remember = |fixture: &mut Fixture, value: &str, key: &str| {
+        fixture
+            .store
+            .remember_claim(
+                "thread",
+                ClaimKind::Decision,
+                "launch",
+                "asset",
+                json!(value),
+                &[],
+                key,
+            )
+            .unwrap()
+            .data
+    };
+    remember(&mut fixture, "ETH", "remember-x");
+    let disputed = remember(&mut fixture, "BTC", "remember-y");
+    assert_eq!(disputed.status, ClaimStatus::Disputed);
+
+    let rescoped = fixture
+        .store
+        .rescope_claim(&disputed.id, "user", "rescope")
+        .unwrap();
+    assert_eq!(rescoped.status, ClaimStatus::Disputed);
+    let summary = fixture.store.reconcile("user", "reconcile").unwrap();
+    assert!(summary.activated.is_empty());
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .is_empty()
+    );
+
+    // A rejected claim that returns as pending still needs an explicit command.
+    fixture.store.reject_claim(&rescoped.id, "reject").unwrap();
+    let revived = fixture
+        .store
+        .rescope_claim(&rescoped.id, "user", "rescope-rejected")
+        .unwrap();
+    assert_eq!(revived.status, ClaimStatus::Pending);
+    let summary = fixture.store.reconcile("user", "reconcile-2").unwrap();
+    assert!(summary.activated.is_empty());
+    assert_eq!(summary.left_pending, vec![revived.id.clone()]);
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .is_empty()
+    );
+}

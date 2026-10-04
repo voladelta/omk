@@ -401,10 +401,12 @@ impl MemoryStore {
         let claim = Claim {
             id: Uuid::new_v4().to_string(),
             scope_id: new_scope_id.to_owned(),
-            status: if old.status == ClaimStatus::Active {
-                ClaimStatus::Active
-            } else {
-                ClaimStatus::Pending
+            // Only active state stays active. Disputed claims stay disputed, so a
+            // rescope cannot launder a conflict into something reconcile accepts.
+            status: match old.status {
+                ClaimStatus::Active => ClaimStatus::Active,
+                ClaimStatus::Disputed => ClaimStatus::Disputed,
+                _ => ClaimStatus::Pending,
             },
             supersedes_id: Some(old.id.clone()),
             created_at: timestamp.clone(),
@@ -594,6 +596,11 @@ impl MemoryStore {
                 &claim.value_hash,
             )?;
             match active {
+                // Only a trusted ingestion path may activate state here. Claims
+                // that carry user or model authority need an explicit claim command.
+                None if !matches!(claim.authority, ClaimAuthority::TrustedSource) => {
+                    summary.left_pending.push(claim.id);
+                }
                 None => {
                     ensure_claim_slot(&tx, &claim)?;
                     tx.execute(

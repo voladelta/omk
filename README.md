@@ -171,7 +171,7 @@ omk claim confirm --id CLAIM_ID --idempotency-key codex-thread-1-confirm-1
 omk claim reject --id CLAIM_ID --idempotency-key codex-thread-1-reject-1
 ```
 
-`claim reconcile` can classify trusted non-observer pending state, but it intentionally never promotes observer-origin claims.
+`claim reconcile` can classify pending state as duplicate or disputed, but it never activates a claim unless a trusted ingestion path has already given it `trusted-source` authority. OMK has no such path today, so every activation needs an explicit claim command. It never promotes observer-origin claims.
 
 ## Recover observation work
 
@@ -240,7 +240,7 @@ omk claim purge      Delete a claim and its provenance links.
 omk event purge      Delete an event and dependent records.
 ```
 
-Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
+Rescope keeps a disputed claim disputed and a pending claim pending; only an active claim stays active. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
