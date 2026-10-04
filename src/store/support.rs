@@ -409,7 +409,11 @@ pub(super) fn prior_result<T: DeserializeOwned>(
 ) -> Result<Option<T>> {
     let prior: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT operation,request_hash,result_json FROM memory_operations WHERE idempotency_key=?1",
+            "SELECT operation.operation,operation.request_hash,result.result_json
+             FROM memory_operations operation
+             LEFT JOIN memory_operation_results result
+               ON result.idempotency_key=operation.idempotency_key
+             WHERE operation.idempotency_key=?1",
             [key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -454,18 +458,20 @@ pub(super) fn save_operation<T: Serialize + ?Sized>(
     let result_json = serde_json::to_string(result)?;
     let timestamp = Utc::now();
     conn.execute(
-        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json,created_at) VALUES (?1,?2,?3,?4,?5)",
-        params![key, operation, request_hash, result_json, timestamp.to_rfc3339()],
+        "INSERT INTO memory_operations(idempotency_key,operation,request_hash) VALUES (?1,?2,?3)",
+        params![key, operation, request_hash],
     )?;
-    // Compact a bounded batch of expired results on every write, so the log
+    conn.execute(
+        "INSERT INTO memory_operation_results(idempotency_key,result_json,created_at) VALUES (?1,?2,?3)",
+        params![key, result_json, timestamp.to_rfc3339()],
+    )?;
+    // Compact on every write: look only at the oldest batch of results (they
+    // come first in commit order) and delete those past retention. The log
     // keeps keys and request hashes but sheds old result bodies.
     conn.execute(
-        "UPDATE memory_operations SET result_json=NULL
-         WHERE idempotency_key IN (
-             SELECT idempotency_key FROM memory_operations
-             WHERE result_json IS NOT NULL AND created_at < ?1
-             ORDER BY created_at LIMIT ?2
-         )",
+        "DELETE FROM memory_operation_results
+         WHERE id IN (SELECT id FROM memory_operation_results ORDER BY id LIMIT ?2)
+           AND created_at < ?1",
         params![
             (timestamp - chrono::Duration::days(RESULT_RETENTION_DAYS)).to_rfc3339(),
             COMPACTION_BATCH
@@ -515,7 +521,15 @@ pub(super) fn scrub_operations_referencing(conn: &Connection, record_ids: &[&str
     }
     let record_ids = serde_json::to_string(record_ids)?;
     conn.execute(
-        "UPDATE memory_operations SET request_hash=NULL,result_json=NULL
+        "UPDATE memory_operations SET request_hash=NULL
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
+    )?;
+    conn.execute(
+        "DELETE FROM memory_operation_results
          WHERE idempotency_key IN (
              SELECT idempotency_key FROM memory_operation_refs
              WHERE record_id IN (SELECT value FROM json_each(?1))
@@ -1213,7 +1227,7 @@ pub(super) fn split_shadowed_claims(
 /// Active claims may use at most this share of a context or plan budget.
 pub(super) const CLAIM_BUDGET_PERCENT: i64 = 50;
 /// User-scope claims are pinned first, up to this share of the claim budget.
-pub(super) const USER_CLAIM_PIN_PERCENT: i64 = 40;
+pub(super) const USER_CLAIM_PIN_PERCENT: i64 = 50;
 
 pub(super) fn percent_of(total: i64, percent: i64) -> i64 {
     (i128::from(total) * i128::from(percent) / 100) as i64

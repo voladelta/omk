@@ -2336,27 +2336,30 @@ fn current_schema_reopens_without_rewriting_data() {
             .iter()
             .any(|(name, _, _)| name == "purged")
     );
-    // Compaction ages saved results by when the operation committed.
     assert_eq!(
         operation_columns
             .iter()
-            .find(|(name, _, _)| name == "created_at")
-            .map(|(_, not_null, _)| *not_null),
-        Some(1)
+            .map(|(name, not_null, _)| (name.as_str(), *not_null))
+            .collect::<Vec<_>>(),
+        [
+            ("idempotency_key", 0),
+            ("operation", 1),
+            ("request_hash", 0)
+        ]
     );
+    // Result bodies live in their own table, in commit order, so compaction
+    // can delete the oldest rows and free whole pages.
     assert_eq!(
-        operation_columns
+        table_columns(&connection, "memory_operation_results")
             .iter()
-            .find(|(name, _, _)| name == "request_hash")
-            .map(|(_, not_null, _)| *not_null),
-        Some(0)
-    );
-    assert_eq!(
-        operation_columns
-            .iter()
-            .find(|(name, _, _)| name == "result_json")
-            .map(|(_, not_null, _)| *not_null),
-        Some(0)
+            .map(|(name, not_null, _)| (name.as_str(), *not_null))
+            .collect::<Vec<_>>(),
+        [
+            ("id", 0),
+            ("idempotency_key", 1),
+            ("result_json", 1),
+            ("created_at", 1)
+        ]
     );
 }
 
@@ -3189,7 +3192,7 @@ fn saved_append_results_never_hold_secret_content_or_metadata() {
     let saved: String = Connection::open(fixture._directory.path().join("memory.db"))
         .unwrap()
         .query_row(
-            "SELECT result_json FROM memory_operations WHERE idempotency_key='secret'",
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='secret'",
             [],
             |row| row.get(0),
         )
@@ -3490,8 +3493,8 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
         .map(|claim| serde_json::to_string(claim).unwrap().chars().count() as i64 / 4 + 2)
         .max()
         .unwrap();
-    // Room for ten claims: the pin share holds four user claims, and the
-    // newest six of the rest are project claims.
+    // Room for ten claims: the pin share holds five user claims, and the
+    // newest five of the rest are project claims.
     let claim_budget = largest * 10 + largest / 2;
     let context = fixture
         .store
@@ -3505,7 +3508,7 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
     kept.sort_unstable();
     assert_eq!(
         kept,
-        ["p4", "p5", "p6", "p7", "p8", "p9", "u6", "u7", "u8", "u9"]
+        ["p5", "p6", "p7", "p8", "p9", "u5", "u6", "u7", "u8", "u9"]
     );
     let mut omitted: Vec<&str> = context
         .diagnostics
@@ -3517,7 +3520,7 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
     omitted.sort_unstable();
     assert_eq!(
         omitted,
-        ["p0", "p1", "p2", "p3", "u0", "u1", "u2", "u3", "u4", "u5"]
+        ["p0", "p1", "p2", "p3", "p4", "u0", "u1", "u2", "u3", "u4"]
     );
 
     let plan = fixture
@@ -3555,7 +3558,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
     let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
     let saved: String = conn
         .query_row(
-            "SELECT result_json FROM memory_operations WHERE idempotency_key='plan'",
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='plan'",
             [],
             |row| row.get(0),
         )
@@ -3638,7 +3641,7 @@ fn old_results_compact_to_keys_that_still_block_duplicates() {
     let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
     let expired = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
     conn.execute(
-        "UPDATE memory_operations SET created_at=?1 WHERE idempotency_key='old'",
+        "UPDATE memory_operation_results SET created_at=?1 WHERE idempotency_key='old'",
         [&expired],
     )
     .unwrap();
@@ -3647,7 +3650,7 @@ fn old_results_compact_to_keys_that_still_block_duplicates() {
     fixture.event("user", "stream", "new", Sensitivity::Normal, "new");
     let (hash, result): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT request_hash,result_json FROM memory_operations WHERE idempotency_key='old'",
+            "SELECT request_hash,(SELECT result_json FROM memory_operation_results WHERE idempotency_key='old') FROM memory_operations WHERE idempotency_key='old'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -3656,7 +3659,7 @@ fn old_results_compact_to_keys_that_still_block_duplicates() {
     assert!(result.is_none());
     let fresh: Option<String> = conn
         .query_row(
-            "SELECT result_json FROM memory_operations WHERE idempotency_key='new'",
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='new'",
             [],
             |row| row.get(0),
         )

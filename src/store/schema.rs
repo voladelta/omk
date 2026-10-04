@@ -199,13 +199,17 @@ CREATE TABLE IF NOT EXISTS memory_fts_refs (
 CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
-    request_hash TEXT,
-    result_json TEXT,
-    created_at TEXT NOT NULL
+    request_hash TEXT
 );
 
-CREATE INDEX IF NOT EXISTS memory_operations_compactable
-ON memory_operations(created_at) WHERE result_json IS NOT NULL;
+-- Result bodies live apart from keys, in commit order, so compaction deletes
+-- the oldest rows and frees whole pages instead of hollowing out key pages.
+CREATE TABLE IF NOT EXISTS memory_operation_results (
+    id INTEGER PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE REFERENCES memory_operations(idempotency_key) ON DELETE CASCADE,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS memory_operation_refs (
     record_id TEXT NOT NULL,

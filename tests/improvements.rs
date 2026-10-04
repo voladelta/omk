@@ -256,7 +256,7 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
     // Installed after opening the store; these counters are fixture-only instrumentation.
     conn.execute_batch("CREATE TABLE run_updates(id TEXT);
         CREATE TRIGGER count_run_update AFTER UPDATE ON observation_runs BEGIN INSERT INTO run_updates VALUES (NEW.id); END;
-        INSERT INTO memory_operations VALUES ('already-purged','event.append',NULL,NULL,'2026-01-01T00:00:00+00:00');").unwrap();
+        INSERT INTO memory_operations VALUES ('already-purged','event.append',NULL);").unwrap();
     let purge = store.purge_event(&source.id, "purge").unwrap();
     assert_eq!(purge["purgedCommandEvents"], 2);
     assert_eq!(purge["affectedRunIds"].as_array().unwrap().len(), 3);
@@ -292,7 +292,7 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
         "commit",
         "already-purged",
     ] {
-        let tombstoned: bool = conn.query_row("SELECT request_hash IS NULL AND result_json IS NULL FROM memory_operations WHERE idempotency_key=?1", [key], |row| row.get(0)).unwrap();
+        let tombstoned: bool = conn.query_row("SELECT request_hash IS NULL AND NOT EXISTS (SELECT 1 FROM memory_operation_results WHERE idempotency_key=?1) FROM memory_operations WHERE idempotency_key=?1", [key], |row| row.get(0)).unwrap();
         assert!(tombstoned, "operation {key} retained purged evidence");
     }
     assert_eq!(event(&mut store, "unrelated", "unrelated").id, unrelated.id);
@@ -331,8 +331,16 @@ fn legacy_observer_replay_precedes_new_admission_limits() {
     hash.update(serde_json::to_vec(&(&plan.run_id, &legacy_result)).unwrap());
     let conn = Connection::open(&path).unwrap();
     // Stored v6 operation fixture accepted before item limits were introduced.
-    conn.execute("UPDATE memory_operations SET request_hash=?1,result_json=?2 WHERE idempotency_key='commit'",
-        rusqlite::params![format!("{:x}", hash.finalize()), serde_json::to_string(&commit).unwrap()]).unwrap();
+    conn.execute(
+        "UPDATE memory_operations SET request_hash=?1 WHERE idempotency_key='commit'",
+        [format!("{:x}", hash.finalize())],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE memory_operation_results SET result_json=?1 WHERE idempotency_key='commit'",
+        [serde_json::to_string(&commit).unwrap()],
+    )
+    .unwrap();
     conn.execute(
         "UPDATE memory_views SET content=?1,token_count=?2 WHERE id=?3",
         rusqlite::params![
@@ -387,7 +395,11 @@ fn legacy_observer_replay_precedes_new_admission_limits() {
             .kind(),
         KernelErrorKind::IdempotencyConflict
     );
-    conn.execute("UPDATE memory_operations SET request_hash=NULL,result_json=NULL WHERE idempotency_key='commit'", []).unwrap();
+    conn.execute_batch(
+        "UPDATE memory_operations SET request_hash=NULL WHERE idempotency_key='commit';
+        DELETE FROM memory_operation_results WHERE idempotency_key='commit';",
+    )
+    .unwrap();
     assert_eq!(
         store
             .commit_observation(&plan.run_id, legacy_result, "commit")

@@ -91,6 +91,8 @@ struct Sim {
     singles: HashMap<String, Vec<(String, String)>>,
     loops: Vec<(String, Option<i64>)>,
     conflicts: u64,
+    // An early append, replayed at the end to check compacted keys.
+    probe: Option<NewEvent>,
 }
 
 impl Sim {
@@ -102,25 +104,26 @@ impl Sim {
     fn event(&mut self, scope: &str, stream: &str, secret: bool) -> MemoryEvent {
         let key = self.key("event");
         let content = sentence(&mut self.rng, 40, 120);
-        self.s
-            .append_event(NewEvent {
-                scope_id: scope.into(),
-                stream_id: stream.into(),
-                kind: EventKind::UserMessage,
-                actor_id: None,
-                occurred_at: None,
-                content: Value::String(content),
-                token_count: None,
-                sensitivity: if secret {
-                    Sensitivity::Secret
-                } else {
-                    Sensitivity::Normal
-                },
-                metadata: json!({}),
-                idempotency_key: key,
-            })
-            .unwrap()
-            .data
+        let request = NewEvent {
+            scope_id: scope.into(),
+            stream_id: stream.into(),
+            kind: EventKind::UserMessage,
+            actor_id: None,
+            occurred_at: None,
+            content: Value::String(content),
+            token_count: None,
+            sensitivity: if secret {
+                Sensitivity::Secret
+            } else {
+                Sensitivity::Normal
+            },
+            metadata: json!({}),
+            idempotency_key: key,
+        };
+        if self.day == 5 && self.probe.is_none() {
+            self.probe = Some(request.clone());
+        }
+        self.s.append_event(request).unwrap().data
     }
 
     fn track(&mut self, id: &str) {
@@ -317,7 +320,14 @@ fn main() {
         singles: HashMap::new(),
         loops: Vec::new(),
         conflicts: 0,
+        probe: None,
     };
+    // Operations commit in real time, so each simulated day moves every saved
+    // operation one day into the past. That lets 30-day compaction run.
+    let clock = rusqlite::Connection::open(&db).unwrap();
+    clock
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     sim.s
         .create_scope("user:me", ScopeKind::User, None, None, "scope-user")
         .unwrap();
@@ -377,9 +387,43 @@ fn main() {
                                "updated": updated, "tok": (record.to_string().chars().count() + 4) / 4})
                     })
                     .collect();
-                writeln!(snap, "{}", json!({"day": day, "claims": claims})).unwrap();
+                // What a 16,000-token context actually keeps.
+                let budgeted = sim
+                    .s
+                    .compose_compact_context(&thread, &stream, 16_000, 2000, None);
+                let (ok, kept, over_budget) = match &budgeted {
+                    Ok(bundle) => (
+                        true,
+                        bundle
+                            .claims
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .collect::<Vec<_>>(),
+                        bundle
+                            .diagnostics
+                            .omitted_items
+                            .iter()
+                            .filter(|item| item.reason == "active claim budget")
+                            .count(),
+                    ),
+                    Err(_) => (false, Vec::new(), 0),
+                };
+                writeln!(
+                    snap,
+                    "{}",
+                    json!({"day": day, "claims": claims, "ok16k": ok, "kept16k": kept,
+                           "overBudget16k": over_budget})
+                )
+                .unwrap();
             }
         }
+        clock
+            .execute(
+                "UPDATE memory_operation_results
+                 SET created_at=strftime('%Y-%m-%dT%H:%M:%f+00:00',created_at,'-1 day')",
+                [],
+            )
+            .unwrap();
         if day % 30 == 29 {
             // Purge one old normal event from project a and time it.
             let victim: Option<String> = {
@@ -415,7 +459,7 @@ fn main() {
             let mut by_op = serde_json::Map::new();
             {
                 let mut statement = conn
-                    .prepare("SELECT operation,COUNT(*),SUM(length(result_json)) FROM memory_operations GROUP BY operation")
+                    .prepare("SELECT o.operation,COUNT(*),SUM(length(r.result_json)) FROM memory_operations o LEFT JOIN memory_operation_results r ON r.idempotency_key=o.idempotency_key GROUP BY o.operation")
                     .unwrap();
                 let rows = statement
                     .query_map([], |row| {
@@ -438,11 +482,16 @@ fn main() {
             let record = json!({
                 "day": day,
                 "dbBytes": file_bytes,
+                "liveBytes": q("SELECT (page_count - freelist_count) * page_size FROM pragma_page_count, pragma_freelist_count, pragma_page_size"),
+                "opTableBytes": q("SELECT SUM(pgsize) FROM dbstat WHERE name IN ('memory_operations','memory_operation_results')"),
                 "events": q("SELECT COUNT(*) FROM memory_events"),
                 "eventBytes": q("SELECT SUM(length(content_json)) FROM memory_events"),
                 "opRows": q("SELECT COUNT(*) FROM memory_operations"),
-                "opResultBytes": q("SELECT SUM(length(result_json)) FROM memory_operations"),
+                "opResultBytes": q("SELECT SUM(length(result_json)) FROM memory_operation_results"),
                 "opRefs": q("SELECT COUNT(*) FROM memory_operation_refs"),
+                "compactedRows": q("SELECT COUNT(*) FROM memory_operations o WHERE request_hash IS NOT NULL AND NOT EXISTS (SELECT 1 FROM memory_operation_results r WHERE r.idempotency_key=o.idempotency_key)"),
+                "expiredRetained": q("SELECT COUNT(*) FROM memory_operation_results WHERE 1
+                    AND created_at < strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-30 days')"),
                 "activeUser": q("SELECT COUNT(*) FROM claims WHERE status='active' AND scope_id='user:me'"),
                 "activeProjectA": q("SELECT COUNT(*) FROM claims WHERE status='active' AND scope_id='project:a'"),
                 "pendingAll": q("SELECT COUNT(*) FROM claims WHERE status='pending'"),
@@ -460,10 +509,27 @@ fn main() {
             samples = 0.0;
         }
     }
+    // Replay the early append: identical input must not run again, and
+    // changed input must still be rejected.
+    if let Some(probe) = sim.probe.take() {
+        let kind = |result: anyhow::Result<MutationResult<MemoryEvent>>| match result {
+            Ok(_) => "replayed-or-written".to_owned(),
+            Err(error) => error
+                .downcast_ref::<KernelError>()
+                .map_or_else(|| error.to_string(), |e| format!("{:?}", e.kind())),
+        };
+        let mut changed = probe.clone();
+        changed.content = json!("changed");
+        let identical = kind(sim.s.append_event(probe));
+        let changed = kind(sim.s.append_event(changed));
+        let record = json!({"identicalReplay": identical, "changedReplay": changed});
+        std::fs::write(out.join("final.json"), record.to_string()).unwrap();
+        eprintln!("{record}");
+    }
     let conn = rusqlite::Connection::open(&db).unwrap();
     let mut ops = BufWriter::new(File::create(out.join("ops.jsonl")).unwrap());
     let mut statement = conn
-        .prepare("SELECT idempotency_key,operation,length(result_json),length(request_hash),length(idempotency_key) FROM memory_operations")
+        .prepare("SELECT o.idempotency_key,o.operation,length(r.result_json),length(o.request_hash),length(o.idempotency_key) FROM memory_operations o LEFT JOIN memory_operation_results r ON r.idempotency_key=o.idempotency_key")
         .unwrap();
     let rows = statement
         .query_map([], |row| {
