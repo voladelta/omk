@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::model::*;
 use crate::{KernelError, KernelErrorKind};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 mod claim;
 mod context;
@@ -140,13 +140,19 @@ impl MemoryStore {
         let mut conn = Connection::open(path)
             .with_context(|| format!("opening memory database {}", path.display()))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
         let schema_version: i64 =
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
             schema_version == 0 || schema_version == SCHEMA_VERSION,
-            "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
+            KernelError::new(
+                KernelErrorKind::SchemaMismatch,
+                format!(
+                    "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
+                ),
+            )
         );
         if schema_version == 0 {
             let has_schema_objects: bool = conn.query_row(
@@ -159,7 +165,10 @@ impl MemoryStore {
             )?;
             ensure!(
                 !has_schema_objects,
-                "unversioned database is not empty; start with a fresh database"
+                KernelError::new(
+                    KernelErrorKind::SchemaMismatch,
+                    "unversioned database is not empty; start with a fresh database",
+                )
             );
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -202,6 +211,15 @@ impl MemoryStore {
             tx.commit()?;
             return Ok(MutationResult::replayed(prior));
         }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_scopes WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !exists,
+            KernelError::invalid_input(format!("scope {id} already exists"))
+        );
         if let Some(parent) = parent_id {
             ensure_scope_exists(&tx, parent)?;
         }
@@ -321,6 +339,8 @@ impl MemoryStore {
                 metadata: stored_metadata,
             },
         )?;
+        // Saved results never hold secret content; replay redacts anyway.
+        let stored = redact_for_agent(stored);
         save_operation(
             &tx,
             &event.idempotency_key,
@@ -329,7 +349,7 @@ impl MemoryStore {
             &stored,
         )?;
         tx.commit()?;
-        Ok(MutationResult::created(redact_for_agent(stored)))
+        Ok(MutationResult::created(stored))
     }
 
     pub fn recall_event_range(
@@ -401,5 +421,21 @@ impl MemoryStore {
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting SQLite write transaction")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryStore;
+
+    #[test]
+    fn opened_connections_overwrite_deleted_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(directory.path().join("memory.db")).unwrap();
+        let secure_delete: i64 = store
+            .conn
+            .pragma_query_value(None, "secure_delete", |row| row.get(0))
+            .unwrap();
+        assert_eq!(secure_delete, 1);
     }
 }

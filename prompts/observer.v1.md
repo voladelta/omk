@@ -58,7 +58,7 @@ Rules:
 5. Every observation, claim, and ambiguity must cite one or more event IDs from this plan.
 6. Do not restate greetings, acknowledgments, or low-value procedural noise.
 7. Do not infer stable preferences from one weak example.
-8. Never reconstruct or guess redacted content.
+8. Never reconstruct or guess redacted content. An event whose content has `"truncated": true` was cut to fit the budget; do not cite it or guess the missing text.
 9. Propose claims only. Every observer-produced claim remains pending until an explicit claim command changes it. The kernel owns reconciliation and authority changes.
 10. Emit only fields in the schema. Use numbers from 0 through 1 for importance and confidence.
 11. Always emit `observations`, `claims`, `continuation`, and `ambiguities`. If every section is empty, set `emptyReason` to a concrete non-empty explanation; otherwise set it to `null`.

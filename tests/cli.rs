@@ -967,3 +967,102 @@ fn cli_help_exposes_agent_critical_contracts() {
         "pipe input on stdin or pass the command's file option"
     );
 }
+
+#[test]
+fn cli_writes_report_busy_while_another_process_holds_the_write_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("memory.db");
+    success_json(&db, &["init"]);
+    success_json(
+        &db,
+        &[
+            "scope",
+            "add",
+            "--id",
+            "user:busy",
+            "--kind",
+            "user",
+            "--idempotency-key",
+            "scope",
+        ],
+    );
+    let append = [
+        "event",
+        "append",
+        "--scope",
+        "user:busy",
+        "--stream",
+        "busy-stream",
+        "--kind",
+        "user-message",
+        "--content",
+        "written after contention",
+        "--idempotency-key",
+        "busy-append",
+    ];
+    success_json(
+        &db,
+        &[
+            "event",
+            "append",
+            "--scope",
+            "user:busy",
+            "--stream",
+            "busy-stream",
+            "--kind",
+            "user-message",
+            "--content",
+            "written before contention",
+            "--idempotency-key",
+            "busy-seed",
+        ],
+    );
+
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // WAL readers proceed while another connection holds the write lock.
+    let context = success_json(
+        &db,
+        &[
+            "context",
+            "--scope",
+            "user:busy",
+            "--stream",
+            "busy-stream",
+            "--max-tokens",
+            "4000",
+            "--recent-raw-tokens",
+            "1000",
+        ],
+    );
+    assert_eq!(context["recentEvents"].as_array().unwrap().len(), 1);
+
+    let started = std::time::Instant::now();
+    let output = omk(&db, &append);
+    let waited = started.elapsed();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "busy");
+    assert_eq!(error["error"]["retryable"], true);
+    assert_eq!(error["error"]["sameKeyReusable"], true);
+    assert_eq!(
+        error["error"]["nextAction"],
+        "retry the identical request with the same key"
+    );
+    assert!(
+        waited >= std::time::Duration::from_secs(4),
+        "busy returned before the busy timeout: {waited:?}"
+    );
+
+    holder.execute_batch("ROLLBACK").unwrap();
+    drop(holder);
+
+    let retried = success_json(&db, &append);
+    assert_eq!(retried["operation"]["replayed"], false);
+    assert_eq!(retried["data"]["sequence"], 2);
+    let replayed = success_json(&db, &append);
+    assert_eq!(replayed["operation"]["replayed"], true);
+    assert_eq!(replayed["data"]["id"], retried["data"]["id"]);
+}

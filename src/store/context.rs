@@ -431,6 +431,9 @@ impl MemoryStore {
                 "recent raw tokens cannot be negative",
             )
         );
+        // Read every section from one snapshot. Dropping the transaction
+        // rolls it back, which is all a read needs.
+        let _snapshot = self.conn.unchecked_transaction()?;
         let visible = visible_scope_ids(&self.conn, scope_id)?;
         let stream_scope: String = self
             .conn
@@ -456,6 +459,7 @@ impl MemoryStore {
         );
         let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"))?;
         sort_claims_by_scope(&mut claims, &visible);
+        let (claims, shadowed_claims) = split_shadowed_claims(claims, &visible);
         let mut pending_claims =
             query_claim_candidates(&self.conn, &visible, Some("pending"), Some(257))?;
         pending_claims.extend(query_claim_candidates(
@@ -465,27 +469,55 @@ impl MemoryStore {
             Some(257),
         )?);
         let pending_truncated = pending_claims.len() > 256;
-        sort_claims_by_scope(&mut pending_claims, &visible);
+        pending_claims.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         pending_claims.truncate(256);
+        pending_claims.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        sort_claims_by_scope(&mut pending_claims, &visible);
         let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
             "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
-        let required_tokens: i64 = estimate_tokens(&empty_payload.to_string())
+        let overhead_tokens = estimate_tokens(&empty_payload.to_string());
+        ensure!(
+            overhead_tokens <= max_tokens,
+            KernelError::new(
+                KernelErrorKind::BudgetExceeded,
+                format!(
+                    "context budget too small: minimumRequiredTokens={overhead_tokens} for the context structure"
+                ),
+            )
+        );
+        let (claims, over_budget_claims) = budget_claims(
+            &self.conn,
+            claims,
+            percent_of(max_tokens, CLAIM_BUDGET_PERCENT),
+            |claim| rendering.claim_tokens(claim),
+        )?;
+        let required_tokens = overhead_tokens
             + claims
                 .iter()
                 .map(|claim| rendering.claim_tokens(claim))
                 .sum::<i64>();
-        ensure!(
-            required_tokens <= max_tokens,
-            KernelError::new(
-                KernelErrorKind::BudgetExceeded,
-                format!(
-                    "context budget too small: minimumRequiredTokens={required_tokens} for active claims"
-                ),
-            )
-        );
         let mut diagnostics = ContextDiagnostics {
             estimated_tokens: required_tokens,
-            omitted_items: Vec::new(),
+            omitted_items: shadowed_claims
+                .into_iter()
+                .map(|claim| OmittedItem {
+                    id: claim.id,
+                    reason: "shadowed by descendant scope claim".to_owned(),
+                })
+                .chain(over_budget_claims.into_iter().map(|claim| OmittedItem {
+                    id: claim.id,
+                    reason: "active claim budget".to_owned(),
+                }))
+                .collect(),
             truncated: pending_truncated,
         };
 
@@ -613,31 +645,22 @@ impl MemoryStore {
         if !observation_scopes.contains(&stream_scope) {
             observation_scopes.push(stream_scope);
         }
-        let mut candidates = query_observations_for_scopes(&self.conn, &observation_scopes)?;
+        // Newest first, so a backlog of older observations cannot hide new ones.
+        let mut candidates = query_observations_for_scopes(
+            &self.conn,
+            &observation_scopes,
+            &selected_continuity_ids,
+        )?;
         if candidates.len() > 256 {
             diagnostics.truncated = true;
             candidates.truncate(256);
         }
         let mut observations = Vec::new();
-        let candidate_ids: Vec<&str> = candidates
-            .iter()
-            .map(|observation| observation.id.as_str())
-            .collect();
-        let represented_observations =
-            observations_in_views(&self.conn, &candidate_ids, &selected_continuity_ids)?;
         for observation in candidates {
-            let duplicated_by_raw =
-                observation_has_events(&self.conn, &observation.id, &represented_event_ids)?;
-            let represented_by_view = represented_observations.contains(&observation.id);
-            if duplicated_by_raw || represented_by_view {
+            if observation_has_events(&self.conn, &observation.id, &represented_event_ids)? {
                 diagnostics.omitted_items.push(OmittedItem {
                     id: observation.id,
-                    reason: if duplicated_by_raw {
-                        "source events already present in raw tail"
-                    } else {
-                        "already represented by continuity view"
-                    }
-                    .to_owned(),
+                    reason: "source events already present in raw tail".to_owned(),
                 });
                 continue;
             }

@@ -195,7 +195,7 @@ fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content()
 }
 
 #[test]
-fn compact_context_budget_prices_compact_records_and_keeps_active_claims_mandatory() {
+fn compact_context_budget_prices_compact_records_and_reports_claims_over_budget() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
     fixture.event(
@@ -254,10 +254,20 @@ fn compact_context_budget_prices_compact_records_and_keeps_active_claims_mandato
         "recentEvents": [],
         "recalledEvidence": [],
     });
-    let budget = empty_payload.to_string().chars().count().div_ceil(4) as i64 + 1;
+    let overhead = empty_payload.to_string().chars().count().div_ceil(4) as i64;
+    let squeezed = fixture
+        .store
+        .compose_compact_context("user", "stream", overhead + 1, 0, None)
+        .unwrap();
+    assert!(squeezed.claims.is_empty());
+    assert_eq!(squeezed.diagnostics.omitted_items.len(), 1);
+    assert_eq!(
+        squeezed.diagnostics.omitted_items[0].reason,
+        "active claim budget"
+    );
     let error = fixture
         .store
-        .compose_compact_context("user", "stream", budget, 0, None)
+        .compose_compact_context("user", "stream", overhead - 1, 0, None)
         .unwrap_err();
     assert!(error.to_string().contains("minimumRequiredTokens"));
 }
@@ -2255,6 +2265,43 @@ fn current_schema_reopens_without_rewriting_data() {
     for removed in ["valid_from", "valid_to", "expires_at"] {
         assert!(!claim_columns.iter().any(|(name, _, _)| name == removed));
     }
+    for (table, columns) in [
+        (
+            "memory_operation_refs",
+            vec!["record_id", "idempotency_key"],
+        ),
+        (
+            "memory_fts_refs",
+            vec!["record_type", "record_id", "fts_rowid"],
+        ),
+    ] {
+        assert_eq!(
+            table_columns(&connection, table)
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            columns
+        );
+    }
+    // Purge drops tombstoned refs by key; without this index it scans every ref.
+    let ref_plan: Vec<String> = connection
+        .prepare("EXPLAIN QUERY PLAN DELETE FROM memory_operation_refs WHERE idempotency_key='k'")
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        ref_plan
+            .iter()
+            .any(|step| step.contains("memory_operation_refs_by_key")),
+        "{ref_plan:?}"
+    );
+    assert!(
+        table_columns(&connection, "observation_runs")
+            .iter()
+            .any(|(name, not_null, _)| name == "truncated_event_ids_json" && *not_null == 1)
+    );
     let claim_source_columns = table_columns(&connection, "claim_sources");
     assert_eq!(
         claim_source_columns
@@ -2289,24 +2336,30 @@ fn current_schema_reopens_without_rewriting_data() {
             .iter()
             .any(|(name, _, _)| name == "purged")
     );
-    assert!(
-        !operation_columns
-            .iter()
-            .any(|(name, _, _)| name == "created_at")
-    );
     assert_eq!(
         operation_columns
             .iter()
-            .find(|(name, _, _)| name == "request_hash")
-            .map(|(_, not_null, _)| *not_null),
-        Some(0)
+            .map(|(name, not_null, _)| (name.as_str(), *not_null))
+            .collect::<Vec<_>>(),
+        [
+            ("idempotency_key", 0),
+            ("operation", 1),
+            ("request_hash", 0)
+        ]
     );
+    // Result bodies live in their own table, in commit order, so compaction
+    // can delete the oldest rows and free whole pages.
     assert_eq!(
-        operation_columns
+        table_columns(&connection, "memory_operation_results")
             .iter()
-            .find(|(name, _, _)| name == "result_json")
-            .map(|(_, not_null, _)| *not_null),
-        Some(0)
+            .map(|(name, not_null, _)| (name.as_str(), *not_null))
+            .collect::<Vec<_>>(),
+        [
+            ("id", 0),
+            ("idempotency_key", 1),
+            ("result_json", 1),
+            ("created_at", 1)
+        ]
     );
 }
 
@@ -2551,7 +2604,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
 #[test]
 fn incompatible_database_versions_are_rejected_without_schema_writes() {
     let directory = tempfile::tempdir().unwrap();
-    for version in [1_i64, 2, 3, 4, 99] {
+    for version in [1_i64, 2, 3, 4, 6, 99] {
         let path = directory.path().join(format!("schema-{version}.db"));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -2563,6 +2616,10 @@ fn incompatible_database_versions_are_rejected_without_schema_writes() {
             Ok(_) => panic!("schema version {version} should be rejected"),
             Err(error) => error,
         };
+        assert_eq!(
+            error.downcast_ref::<KernelError>().map(KernelError::kind),
+            Some(KernelErrorKind::SchemaMismatch)
+        );
         assert!(error.to_string().contains(&format!(
             "is incompatible with OMK schema version {SCHEMA_VERSION}"
         )));
@@ -2592,6 +2649,10 @@ fn unversioned_nonempty_databases_are_not_adopted() {
         Ok(_) => panic!("unversioned nonempty database should be rejected"),
         Err(error) => error,
     };
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::SchemaMismatch)
+    );
     assert!(
         error
             .to_string()
@@ -2607,4 +2668,1044 @@ fn unversioned_nonempty_databases_are_not_adopted() {
         )
         .unwrap();
     assert_eq!(omk_table_count, 0);
+}
+
+fn observations_only(event_id: &str, label: &str, count: usize, importance: f64) -> ObserverResult {
+    ObserverResult {
+        observations: (0..count)
+            .map(|index| ObservationDraft {
+                kind: ObservationKind::Event,
+                content: format!("{label} {index}"),
+                importance,
+                confidence: 1.0,
+                source_event_ids: vec![event_id.to_owned()],
+                event_time_from: None,
+                event_time_to: None,
+            })
+            .collect(),
+        claims: vec![],
+        continuation: ContinuationDraft {
+            current_task: Some("Keep going".to_owned()),
+            ..ContinuationDraft::default()
+        },
+        ambiguities: vec![],
+        empty_reason: None,
+    }
+}
+
+fn plan_run(fixture: &mut Fixture, scope: &str, stream: &str, key: &str) -> ObservationPlan {
+    fixture
+        .store
+        .plan_observation(scope, stream, 100_000, "fake", "v1", key)
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap()
+}
+
+#[test]
+fn reflected_observations_do_not_starve_new_unreflected_observations() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let mut reflected = Vec::new();
+    for batch in 0..2 {
+        let event = fixture.event(
+            "user",
+            "stream",
+            "old work",
+            Sensitivity::Normal,
+            &format!("old-event-{batch}"),
+        );
+        let plan = plan_run(&mut fixture, "user", "stream", &format!("old-plan-{batch}"));
+        let commit = fixture
+            .store
+            .commit_observation(
+                &plan.run_id,
+                observations_only(&event.id, "reflected", 150, 0.9),
+                &format!("old-commit-{batch}"),
+            )
+            .unwrap();
+        reflected.extend(commit.observations.iter().map(|item| item.id.clone()));
+    }
+    fixture
+        .store
+        .create_view(CreateView {
+            scope_id: "user".to_owned(),
+            stream_id: "stream".to_owned(),
+            kind: ViewKind::Continuity,
+            content: "everything so far".to_owned(),
+            source_from_sequence: 1,
+            source_through_sequence: 2,
+            source_observation_ids: reflected,
+            expected_previous_view_id: None,
+            model: None,
+            prompt_version: None,
+            token_count: None,
+            idempotency_key: "view".to_owned(),
+        })
+        .unwrap();
+    let event = fixture.event(
+        "user",
+        "stream",
+        "new work",
+        Sensitivity::Normal,
+        "new-event",
+    );
+    let plan = plan_run(&mut fixture, "user", "stream", "new-plan");
+    let fresh = fixture
+        .store
+        .commit_observation(
+            &plan.run_id,
+            observations_only(&event.id, "fresh", 5, 0.5),
+            "new-commit",
+        )
+        .unwrap();
+    for compact in [false, true] {
+        let context = if compact {
+            fixture
+                .store
+                .compose_compact_context("user", "stream", 100_000, 0, None)
+        } else {
+            fixture
+                .store
+                .compose_context("user", "stream", 100_000, 0, None)
+        }
+        .unwrap();
+        let mut shown: Vec<&str> = context
+            .observations
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        shown.sort_unstable();
+        let mut expected: Vec<&str> = fresh
+            .observations
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(shown, expected);
+        assert!(!context.diagnostics.truncated);
+    }
+}
+
+#[test]
+fn pending_claim_backlog_keeps_the_newest_claims_in_context() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event("user", "stream", "seed", Sensitivity::Normal, "seed");
+    let mut ids = Vec::new();
+    for index in 0..260 {
+        let claim = fixture
+            .store
+            .propose_claim(
+                "user",
+                ClaimKind::Decision,
+                "backlog",
+                &format!("item-{index}"),
+                json!(index),
+                &[],
+                &format!("propose-{index}"),
+            )
+            .unwrap()
+            .data;
+        ids.push(claim.id);
+    }
+    let context = fixture
+        .store
+        .compose_context("user", "stream", 1_000_000, 0, None)
+        .unwrap();
+    let shown: Vec<&str> = context
+        .pending_claims
+        .iter()
+        .map(|claim| claim.id.as_str())
+        .collect();
+    assert_eq!(shown.len(), 256);
+    assert!(context.diagnostics.truncated);
+    assert!(shown.contains(&ids[259].as_str()));
+    assert!(!shown.contains(&ids[0].as_str()));
+    assert_eq!(shown[0], ids[4]);
+    assert_eq!(shown[255], ids[259]);
+}
+
+#[test]
+fn observer_claims_cannot_contradict_an_existing_slot_cardinality() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let event = fixture.event(
+        "user",
+        "stream",
+        "Launch assets",
+        Sensitivity::Normal,
+        "event",
+    );
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    let mut result = observer_result(&event.id, "BTC");
+    result.claims[0].cardinality = ClaimCardinality::Set;
+    let error = fixture
+        .store
+        .commit_observation(&plan.run_id, result, "commit")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    let message = error.to_string();
+    assert!(message.contains("claim 0") && message.contains("single"));
+    // Nothing was written, so the run and the key stay usable.
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Pending))
+            .unwrap()
+            .is_empty()
+    );
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "BTC"), "commit")
+        .unwrap();
+    let claim = &commit.claims[0];
+    let confirmed = fixture.store.confirm_claim(&claim.id, "confirm").unwrap();
+    assert_eq!(confirmed.status, ClaimStatus::Active);
+}
+
+#[test]
+fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("thread", ScopeKind::Thread, Some("user"));
+    let remember = |fixture: &mut Fixture, value: &str, key: &str| {
+        fixture
+            .store
+            .remember_claim(
+                "thread",
+                ClaimKind::Decision,
+                "launch",
+                "asset",
+                json!(value),
+                &[],
+                key,
+            )
+            .unwrap()
+            .data
+    };
+    remember(&mut fixture, "ETH", "remember-x");
+    let disputed = remember(&mut fixture, "BTC", "remember-y");
+    assert_eq!(disputed.status, ClaimStatus::Disputed);
+
+    let rescoped = fixture
+        .store
+        .rescope_claim(&disputed.id, "user", "rescope")
+        .unwrap();
+    assert_eq!(rescoped.status, ClaimStatus::Disputed);
+    let summary = fixture.store.reconcile("user", "reconcile").unwrap();
+    assert!(summary.activated.is_empty());
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .is_empty()
+    );
+
+    // A rejected claim that returns as pending still needs an explicit command.
+    fixture.store.reject_claim(&rescoped.id, "reject").unwrap();
+    let revived = fixture
+        .store
+        .rescope_claim(&rescoped.id, "user", "rescope-rejected")
+        .unwrap();
+    assert_eq!(revived.status, ClaimStatus::Pending);
+    let summary = fixture.store.reconcile("user", "reconcile-2").unwrap();
+    assert!(summary.activated.is_empty());
+    assert_eq!(summary.left_pending, vec![revived.id.clone()]);
+    assert!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn deeper_scope_single_claims_shadow_ancestors_in_context_and_plans() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("thread", ScopeKind::Thread, Some("user"));
+    let mut remember = |scope: &str, predicate: &str, cardinality, value: &str, key: &str| {
+        fixture
+            .store
+            .remember_claim_with_cardinality(
+                scope,
+                ClaimKind::Decision,
+                "launch",
+                predicate,
+                cardinality,
+                json!(value),
+                &[],
+                key,
+            )
+            .unwrap()
+            .data
+    };
+    let shadowed = remember(
+        "user",
+        "asset",
+        ClaimCardinality::Single,
+        "ETH",
+        "user-asset",
+    );
+    let winner = remember(
+        "thread",
+        "asset",
+        ClaimCardinality::Single,
+        "BTC",
+        "thread-asset",
+    );
+    let user_tag = remember("user", "tag", ClaimCardinality::Set, "a", "user-tag");
+    let thread_tag = remember("thread", "tag", ClaimCardinality::Set, "b", "thread-tag");
+    let user_only = remember(
+        "user",
+        "owner",
+        ClaimCardinality::Single,
+        "me",
+        "user-owner",
+    );
+    fixture.event("thread", "stream", "work", Sensitivity::Normal, "event");
+
+    let context = fixture
+        .store
+        .compose_context("thread", "stream", 100_000, 0, None)
+        .unwrap();
+    let mut ids: Vec<&str> = context
+        .claims
+        .iter()
+        .map(|claim| claim.id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = vec![
+        winner.id.as_str(),
+        user_tag.id.as_str(),
+        thread_tag.id.as_str(),
+        user_only.id.as_str(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+    let omitted: Vec<_> = context
+        .diagnostics
+        .omitted_items
+        .iter()
+        .filter(|item| item.reason == "shadowed by descendant scope claim")
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(omitted, vec![shadowed.id.as_str()]);
+    let compact = fixture
+        .store
+        .compose_compact_context("thread", "stream", 100_000, 0, None)
+        .unwrap();
+    assert_eq!(compact.claims.len(), 4);
+
+    // Shadowed claims do not count toward the claim budget: twice the tokens
+    // the four in-force claims need gives them their whole half-share.
+    let required = context.diagnostics.estimated_tokens;
+    let tight = fixture
+        .store
+        .compose_context("thread", "stream", required * 2, 0, None)
+        .unwrap();
+    assert_eq!(tight.claims.len(), 4);
+    assert!(
+        !tight
+            .diagnostics
+            .omitted_items
+            .iter()
+            .any(|item| item.reason == "active claim budget")
+    );
+
+    let plan = plan_run(&mut fixture, "thread", "stream", "plan");
+    assert!(
+        plan.active_claims
+            .iter()
+            .all(|claim| claim.id != shadowed.id)
+    );
+    assert_eq!(plan.active_claims.len(), 4);
+
+    let listed = fixture
+        .store
+        .list_claims("thread", true, Some(ClaimStatus::Active))
+        .unwrap();
+    assert!(listed.iter().any(|claim| claim.id == shadowed.id));
+}
+
+#[test]
+fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let big = fixture.event(
+        "user",
+        "stream",
+        &"x".repeat(4_000),
+        Sensitivity::Normal,
+        "big",
+    );
+    let small = fixture.event("user", "stream", "small", Sensitivity::Normal, "small");
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 400, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let stub = &plan.events[0];
+    assert_eq!(stub.id, big.id);
+    assert_eq!(stub.content["truncated"], json!(true));
+    assert_eq!(stub.content["reason"], json!("exceeds observation budget"));
+    let preview = stub.content["preview"].as_str().unwrap();
+    assert!(!preview.is_empty() && preview.len() < 4_000);
+    assert_eq!(stub.metadata, json!({}));
+    assert_eq!(plan.to_sequence, 1);
+
+    // The stored event is intact, but the observer cannot cite the stub.
+    let error = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&big.id, "ETH"), "cite-stub")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(error.to_string().contains("truncated event"));
+    let empty = ObserverResult {
+        observations: vec![],
+        claims: vec![],
+        continuation: ContinuationDraft::default(),
+        ambiguities: vec![],
+        empty_reason: Some("only a truncated event".to_owned()),
+    };
+    fixture
+        .store
+        .commit_observation(&plan.run_id, empty, "commit-empty")
+        .unwrap();
+    let status = fixture
+        .store
+        .stream_status(&access("user"), "stream")
+        .unwrap();
+    assert_eq!(status.observed_through_sequence, 1);
+
+    let next = plan_run(&mut fixture, "user", "stream", "next-plan");
+    assert_eq!(next.events[0].id, small.id);
+    assert_eq!(next.events[0].content, json!("small"));
+    assert_eq!(
+        fixture
+            .store
+            .get_event(&reveal("user"), &big.id)
+            .unwrap()
+            .content,
+        json!("x".repeat(4_000))
+    );
+}
+
+#[test]
+fn duplicate_scopes_and_finished_runs_fail_with_typed_errors() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let duplicate = fixture
+        .store
+        .create_scope("user", ScopeKind::User, None, None, "scope-again")
+        .unwrap_err();
+    assert_eq!(
+        duplicate
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(duplicate.to_string().contains("scope user already exists"));
+    // The rejected key was not recorded, so it can create a different scope.
+    fixture
+        .store
+        .create_scope("project", ScopeKind::Project, None, None, "scope-again")
+        .unwrap();
+
+    let event = fixture.event("user", "stream", "work", Sensitivity::Normal, "event");
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "ETH"), "commit")
+        .unwrap();
+    let committed = fixture
+        .store
+        .fail_observation(&plan.run_id, "late failure", "fail")
+        .unwrap_err();
+    assert_eq!(
+        committed
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(committed.to_string().contains("is committed, not pending"));
+    let again = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "BTC"), "commit-2")
+        .unwrap_err();
+    assert_eq!(
+        again.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+}
+
+fn raw_count(fixture: &Fixture, sql: &str, value: &str) -> i64 {
+    Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row(sql, [value], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn saved_append_results_never_hold_secret_content_or_metadata() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let appended = fixture
+        .store
+        .append_event(NewEvent {
+            scope_id: "user".to_owned(),
+            stream_id: "stream".to_owned(),
+            kind: EventKind::ToolResult,
+            actor_id: None,
+            occurred_at: None,
+            content: json!("SECRET-CONTENT-7"),
+            token_count: None,
+            sensitivity: Sensitivity::Secret,
+            metadata: json!({"token": "SECRET-METADATA-9"}),
+            idempotency_key: "secret".to_owned(),
+        })
+        .unwrap();
+    let saved: String = Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row(
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='secret'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!saved.contains("SECRET-CONTENT-7"));
+    assert!(!saved.contains("SECRET-METADATA-9"));
+    assert!(saved.contains(&appended.data.id));
+    assert_eq!(
+        fixture
+            .store
+            .get_event(&reveal("user"), &appended.data.id)
+            .unwrap()
+            .content,
+        json!("SECRET-CONTENT-7")
+    );
+}
+
+#[test]
+fn purges_find_operations_and_search_rows_through_side_tables() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let doomed = fixture.event(
+        "user",
+        "stream",
+        "doomed marker",
+        Sensitivity::Normal,
+        "doomed-event",
+    );
+    let kept = fixture.event(
+        "user",
+        "stream",
+        "kept marker",
+        Sensitivity::Normal,
+        "kept-event",
+    );
+    let claim = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            std::slice::from_ref(&kept.id),
+            "claim",
+        )
+        .unwrap();
+    let refs = "SELECT COUNT(*) FROM memory_operation_refs WHERE record_id=?1";
+    let fts = "SELECT COUNT(*) FROM memory_fts_refs WHERE record_id=?1";
+    let rows = "SELECT COUNT(*) FROM memory_fts WHERE record_id=?1";
+    assert_eq!(raw_count(&fixture, refs, &doomed.id), 1);
+    assert_eq!(raw_count(&fixture, fts, &doomed.id), 1);
+    assert_eq!(raw_count(&fixture, rows, &doomed.id), 1);
+
+    fixture
+        .store
+        .purge_event(&doomed.id, "purge-doomed")
+        .unwrap();
+    assert_eq!(raw_count(&fixture, fts, &doomed.id), 0);
+    assert_eq!(raw_count(&fixture, rows, &doomed.id), 0);
+    // The tombstoned append no longer keeps its record IDs; the purge result does.
+    assert_eq!(raw_count(&fixture, refs, &doomed.id), 1);
+    assert_eq!(
+        raw_count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_operation_refs WHERE idempotency_key=?1",
+            "doomed-event"
+        ),
+        0
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .append_event(NewEvent {
+                scope_id: "user".to_owned(),
+                stream_id: "stream".to_owned(),
+                kind: EventKind::UserMessage,
+                actor_id: Some("user".to_owned()),
+                occurred_at: None,
+                content: Value::String("doomed marker".to_owned()),
+                token_count: Some(10),
+                sensitivity: Sensitivity::Normal,
+                metadata: json!({}),
+                idempotency_key: "doomed-event".to_owned(),
+            })
+            .unwrap_err()
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::PrivacyPurged)
+    ));
+    // Unrelated operations and search rows survive.
+    assert_eq!(raw_count(&fixture, rows, &kept.id), 1);
+    assert_eq!(
+        fixture
+            .store
+            .search_full_text("user", "kept marker", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        fixture
+            .store
+            .remember_claim(
+                "user",
+                ClaimKind::Decision,
+                "launch",
+                "asset",
+                json!("ETH"),
+                std::slice::from_ref(&kept.id),
+                "claim",
+            )
+            .unwrap()
+            .operation
+            .replayed
+    );
+
+    fixture.store.purge_claim(&claim.id, "purge-claim").unwrap();
+    assert_eq!(raw_count(&fixture, fts, &claim.id), 0);
+    assert_eq!(raw_count(&fixture, rows, &claim.id), 0);
+    assert_eq!(
+        raw_count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_operation_refs WHERE idempotency_key=?1",
+            "claim"
+        ),
+        0
+    );
+}
+
+#[test]
+fn only_live_claims_can_be_corrected() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let original = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let corrected = fixture
+        .store
+        .correct_claim(&original.id, json!("BTC"), &[], "correct")
+        .unwrap();
+    let rejected = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "chain",
+            json!("L1"),
+            &[],
+            "propose",
+        )
+        .unwrap();
+    fixture.store.reject_claim(&rejected.id, "reject").unwrap();
+    let expired = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "venue",
+            json!("DEX"),
+            &[],
+            "propose-2",
+        )
+        .unwrap();
+    fixture.store.forget_claim(&expired.id, "forget").unwrap();
+    for (id, key) in [
+        (&original.id, "stale-superseded"),
+        (&rejected.id, "stale-rejected"),
+        (&expired.id, "stale-expired"),
+    ] {
+        let error = fixture
+            .store
+            .correct_claim(id, json!("late"), &[], key)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<KernelError>().map(KernelError::kind),
+            Some(KernelErrorKind::InvalidInput)
+        );
+    }
+    // Rejected corrections leave the current state alone and their keys reusable.
+    let active = fixture
+        .store
+        .list_claims("user", false, Some(ClaimStatus::Active))
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, corrected.id);
+    let pending = fixture
+        .store
+        .propose_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "region",
+            json!("EU"),
+            &[],
+            "propose-3",
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .correct_claim(&pending.id, json!("US"), &[], "stale-superseded")
+            .unwrap()
+            .status,
+        ClaimStatus::Active
+    );
+}
+
+#[test]
+fn context_reads_one_snapshot_while_another_connection_commits() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event("user", "stream", "seed", Sensitivity::Normal, "seed");
+    let path = fixture._directory.path().join("memory.db");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|threads| {
+        let reader = threads.spawn(|| {
+            let reader = MemoryStore::open(&path).unwrap();
+            let mut checked = 0;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let context = reader
+                    .compose_context("user", "stream", 1_000_000, 0, None)
+                    .unwrap();
+                // Each commit adds one pending claim and one observation together.
+                assert_eq!(context.pending_claims.len(), context.observations.len());
+                checked += 1;
+            }
+            checked
+        });
+        for index in 0..60 {
+            let event = fixture.event(
+                "user",
+                "stream",
+                "work",
+                Sensitivity::Normal,
+                &format!("event-{index}"),
+            );
+            let plan = plan_run(&mut fixture, "user", "stream", &format!("plan-{index}"));
+            fixture
+                .store
+                .commit_observation(
+                    &plan.run_id,
+                    observer_result(&event.id, &format!("value-{index}")),
+                    &format!("commit-{index}"),
+                )
+                .unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(reader.join().unwrap() > 0);
+    });
+}
+
+#[test]
+fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("project", ScopeKind::Project, Some("user"));
+    fixture.event("project", "stream", "start", Sensitivity::Normal, "seed");
+    let mut ids = std::collections::HashMap::new();
+    for (scope, prefix) in [("user", "u"), ("project", "p")] {
+        for index in 0..10 {
+            let subject = format!("{prefix}{index}");
+            let claim = fixture
+                .store
+                .remember_claim(
+                    scope,
+                    ClaimKind::Fact,
+                    &subject,
+                    "value",
+                    json!("v".repeat(400)),
+                    &[],
+                    &format!("remember-{subject}"),
+                )
+                .unwrap()
+                .data;
+            ids.insert(claim.id, subject);
+        }
+    }
+    let all = fixture
+        .store
+        .compose_context("project", "stream", 1_000_000, 0, None)
+        .unwrap();
+    assert_eq!(all.claims.len(), 20);
+    let largest = all
+        .claims
+        .iter()
+        .map(|claim| serde_json::to_string(claim).unwrap().chars().count() as i64 / 4 + 2)
+        .max()
+        .unwrap();
+    // Room for ten claims: the pin share holds five user claims, and the
+    // newest five of the rest are project claims.
+    let claim_budget = largest * 10 + largest / 2;
+    let context = fixture
+        .store
+        .compose_context("project", "stream", claim_budget * 2, 0, None)
+        .unwrap();
+    let mut kept: Vec<&str> = context
+        .claims
+        .iter()
+        .map(|claim| ids[&claim.id].as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["p5", "p6", "p7", "p8", "p9", "u5", "u6", "u7", "u8", "u9"]
+    );
+    let mut omitted: Vec<&str> = context
+        .diagnostics
+        .omitted_items
+        .iter()
+        .filter(|item| item.reason == "active claim budget")
+        .map(|item| ids[&item.id].as_str())
+        .collect();
+    omitted.sort_unstable();
+    assert_eq!(
+        omitted,
+        ["p0", "p1", "p2", "p3", "p4", "u0", "u1", "u2", "u3", "u4"]
+    );
+
+    let plan = fixture
+        .store
+        .plan_observation("project", "stream", claim_budget * 2, "test", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(plan.active_claims.len(), 10);
+}
+
+#[test]
+fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let before = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Preference,
+            "editor",
+            "value",
+            json!("vim"),
+            &[],
+            "remember-before",
+        )
+        .unwrap()
+        .data;
+    let first = fixture.event("user", "stream", "first", Sensitivity::Normal, "e1");
+    let second = fixture.event("user", "stream", "second", Sensitivity::Normal, "e2");
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    assert_eq!(plan.active_claims.len(), 1);
+
+    let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
+    let saved: String = conn
+        .query_row(
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='plan'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved).unwrap(),
+        json!({"plannedRunId": plan.run_id})
+    );
+
+    // Replay keeps the run and its exact events but shows current claims.
+    let added = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Preference,
+            "shell",
+            "value",
+            json!("zsh"),
+            &[],
+            "remember-after",
+        )
+        .unwrap()
+        .data;
+    let replay = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap();
+    assert!(replay.operation.replayed);
+    let replayed = replay.data.into_plan().unwrap();
+    assert_eq!(replayed.run_id, plan.run_id);
+    assert_eq!(
+        replayed.events.iter().map(|e| &e.id).collect::<Vec<_>>(),
+        [&first.id, &second.id]
+    );
+    assert_eq!(
+        serde_json::to_value(&replayed.events).unwrap(),
+        serde_json::to_value(&plan.events).unwrap()
+    );
+    let mut claim_ids: Vec<&str> = replayed
+        .active_claims
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    claim_ids.sort_unstable();
+    let mut expected = vec![before.id.as_str(), added.id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(claim_ids, expected);
+
+    // Purging a claim the plan showed leaves the plan replayable.
+    fixture
+        .store
+        .purge_claim(&before.id, "purge-claim")
+        .unwrap();
+    let after_purge = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(after_purge.active_claims.len(), 1);
+
+    // Purging one of the run's events tombstones the saved plan.
+    fixture.store.purge_event(&first.id, "purge-event").unwrap();
+    let error = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::PrivacyPurged
+    );
+}
+
+#[test]
+fn old_results_compact_to_keys_that_still_block_duplicates() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let old = fixture.event("user", "stream", "old", Sensitivity::Normal, "old");
+    let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
+    let expired = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+    conn.execute(
+        "UPDATE memory_operation_results SET created_at=?1 WHERE idempotency_key='old'",
+        [&expired],
+    )
+    .unwrap();
+
+    // Any later write compacts the expired result but keeps key and hash.
+    fixture.event("user", "stream", "new", Sensitivity::Normal, "new");
+    let (hash, result): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT request_hash,(SELECT result_json FROM memory_operation_results WHERE idempotency_key='old') FROM memory_operations WHERE idempotency_key='old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(hash.is_some());
+    assert!(result.is_none());
+    let fresh: Option<String> = conn
+        .query_row(
+            "SELECT result_json FROM memory_operation_results WHERE idempotency_key='new'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(fresh.is_some());
+
+    let replay = |content: &str| NewEvent {
+        scope_id: "user".to_owned(),
+        stream_id: "stream".to_owned(),
+        kind: EventKind::UserMessage,
+        actor_id: Some("user".to_owned()),
+        occurred_at: None,
+        content: json!(content),
+        token_count: Some(10),
+        sensitivity: Sensitivity::Normal,
+        metadata: json!({}),
+        idempotency_key: "old".to_owned(),
+    };
+    let error = fixture.store.append_event(replay("old")).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::OperationExpired
+    );
+    let error = fixture.store.append_event(replay("changed")).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::IdempotencyConflict
+    );
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(events, 2);
+
+    // Refs survive compaction, so a purge still clears the request hash.
+    fixture.store.purge_event(&old.id, "purge").unwrap();
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT request_hash FROM memory_operations WHERE idempotency_key='old'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(hash.is_none());
+    let error = fixture.store.append_event(replay("old")).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::PrivacyPurged
+    );
 }

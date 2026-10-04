@@ -10,13 +10,16 @@ pub(super) struct ObservationRun {
     pub(super) status: String,
     pub(super) observer_model: String,
     pub(super) prompt_version: String,
+    pub(super) truncated_event_ids: Vec<String>,
+    pub(super) source_integrity: String,
 }
 
 pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
     conn.query_row(
-        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version FROM observation_runs WHERE id=?1",
+        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json,source_integrity FROM observation_runs WHERE id=?1",
         [id],
         |row| {
+            let truncated_raw: String = row.get(8)?;
             Ok(ObservationRun {
                 scope_id: row.get(0)?,
                 stream_id: row.get(1)?,
@@ -26,6 +29,14 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
                 status: row.get(5)?,
                 observer_model: row.get(6)?,
                 prompt_version: row.get(7)?,
+                truncated_event_ids: serde_json::from_str(&truncated_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        truncated_raw.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                source_integrity: row.get(9)?,
             })
         },
     )
@@ -42,7 +53,10 @@ pub(super) fn ensure_run_pending(run: &ObservationRun, id: &str) -> Result<()> {
             "observation run {id} is stale, not pending"
         ),));
     }
-    bail!("observation run {id} is {}, not pending", run.status)
+    bail!(KernelError::invalid_input(format!(
+        "observation run {id} is {}, not pending",
+        run.status
+    )))
 }
 
 pub(super) fn validate_observer_size(result: &ObserverResult) -> Result<()> {
@@ -149,6 +163,7 @@ pub(super) fn observer_result_is_completely_empty(result: &ObserverResult) -> bo
 pub(super) fn validate_provenance(
     result: &ObserverResult,
     sources_by_id: &HashMap<String, MemoryEvent>,
+    truncated_event_ids: &[String],
 ) -> Result<()> {
     let all_ids = result
         .observations
@@ -178,6 +193,49 @@ pub(super) fn validate_provenance(
                 "redacted event {event_id} cannot source derived memory"
             ))
         );
+        ensure!(
+            !truncated_event_ids.contains(event_id),
+            KernelError::invalid_input(format!(
+                "truncated event {event_id} cannot source derived memory"
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Reject drafts that could never be confirmed because their slot already
+/// uses another cardinality. Pending claims do not create slots.
+pub(super) fn validate_claim_cardinalities(
+    conn: &Connection,
+    scope_id: &str,
+    drafts: &[ClaimDraft],
+) -> Result<()> {
+    let mut batch: HashMap<(String, String, String), String> = HashMap::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        let kind = enum_text(&draft.kind);
+        let subject = draft.subject.trim();
+        let predicate = draft.predicate.trim();
+        let wanted = enum_text(&draft.cardinality);
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT cardinality FROM claim_slots
+                 WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4",
+                params![scope_id, kind, subject, predicate],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Drafts in one result must also agree with each other.
+        let existing = existing.or_else(|| {
+            batch.insert(
+                (kind, subject.to_owned(), predicate.to_owned()),
+                wanted.clone(),
+            )
+        });
+        if let Some(existing) = existing.filter(|existing| existing != &wanted) {
+            bail!(KernelError::invalid_input(format!(
+                "claim {index} uses {wanted} cardinality but its slot already uses {existing} cardinality"
+            )));
+        }
     }
     Ok(())
 }
@@ -198,6 +256,52 @@ pub(super) fn redact_for_agent(mut event: MemoryEvent) -> MemoryEvent {
         event.token_count = estimate_event_tokens(&event.content, &event.metadata);
     }
     event
+}
+
+/// Replace an event that cannot fit the observation budget with a stub whose
+/// preview keeps as much serialized content as `available_tokens` allows.
+/// Returns the cost of an empty stub when even that does not fit.
+pub(super) fn truncate_event_for_budget(
+    event: MemoryEvent,
+    available_tokens: i64,
+) -> std::result::Result<MemoryEvent, i64> {
+    let serialized = event.content.to_string();
+    let stub = |chars: usize| {
+        let content = json!({
+            "truncated": true,
+            "reason": "exceeds observation budget",
+            "preview": serialized.chars().take(chars).collect::<String>(),
+        });
+        let metadata = json!({});
+        MemoryEvent {
+            content_hash: hash_json(&content),
+            token_count: estimate_event_tokens(&content, &metadata),
+            content,
+            metadata,
+            ..event.clone()
+        }
+    };
+    let cost = |chars: usize| serialized_item_tokens(&stub(chars));
+    let empty_cost = cost(0);
+    if empty_cost > available_tokens {
+        return Err(empty_cost);
+    }
+    // Four characters per token bounds the preview, and cost grows with length.
+    let mut low = 0;
+    let mut high = serialized.chars().count().min(
+        usize::try_from(available_tokens)
+            .unwrap_or(usize::MAX / 4)
+            .saturating_mul(4),
+    );
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if cost(middle) <= available_tokens {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(stub(low))
 }
 
 pub(super) struct ResolvedReadAccess<'a> {
@@ -292,6 +396,11 @@ pub(super) fn ensure_scope_exists(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Saved results older than this are compacted to their key and request hash.
+pub(super) const RESULT_RETENTION_DAYS: i64 = 30;
+/// Most expired results one write compacts, which bounds the work per write.
+const COMPACTION_BATCH: i64 = 64;
+
 pub(super) fn prior_result<T: DeserializeOwned>(
     conn: &Connection,
     key: &str,
@@ -300,7 +409,11 @@ pub(super) fn prior_result<T: DeserializeOwned>(
 ) -> Result<Option<T>> {
     let prior: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT operation,request_hash,result_json FROM memory_operations WHERE idempotency_key=?1",
+            "SELECT operation.operation,operation.request_hash,result.result_json
+             FROM memory_operations operation
+             LEFT JOIN memory_operation_results result
+               ON result.idempotency_key=operation.idempotency_key
+             WHERE operation.idempotency_key=?1",
             [key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -314,9 +427,6 @@ pub(super) fn prior_result<T: DeserializeOwned>(
             "idempotency key was already used for {operation}, not {expected_operation}"
         ),)
     );
-    let result_json = result_json.ok_or_else(|| {
-        KernelError::privacy_purged("the prior result for this idempotency key was privacy-purged")
-    })?;
     let request_hash = request_hash.ok_or_else(|| {
         KernelError::privacy_purged("the prior request for this idempotency key was privacy-purged")
     })?;
@@ -326,6 +436,13 @@ pub(super) fn prior_result<T: DeserializeOwned>(
             "idempotency conflict: this key was already used with different request input",
         )
     );
+    // A compacted operation keeps its request hash, so the key still blocks
+    // a duplicate write even though the result can no longer be replayed.
+    let result_json = result_json.ok_or_else(|| {
+        KernelError::operation_expired(format!(
+            "the result for this idempotency key is older than {RESULT_RETENTION_DAYS} days and was compacted"
+        ))
+    })?;
     Ok(Some(serde_json::from_str(&result_json).with_context(
         || format!("reading stored result for idempotency key {key}"),
     )?))
@@ -338,11 +455,56 @@ pub(super) fn save_operation<T: Serialize + ?Sized>(
     request_hash: &str,
     result: &T,
 ) -> Result<()> {
+    let result_json = serde_json::to_string(result)?;
+    let timestamp = Utc::now();
     conn.execute(
-        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json) VALUES (?1,?2,?3,?4)",
-        params![key, operation, request_hash, serde_json::to_string(result)?],
+        "INSERT INTO memory_operations(idempotency_key,operation,request_hash) VALUES (?1,?2,?3)",
+        params![key, operation, request_hash],
     )?;
+    conn.execute(
+        "INSERT INTO memory_operation_results(idempotency_key,result_json,created_at) VALUES (?1,?2,?3)",
+        params![key, result_json, timestamp.to_rfc3339()],
+    )?;
+    // Compact on every write: look only at the oldest batch of results (they
+    // come first in commit order) and delete those past retention. The log
+    // keeps keys and request hashes but sheds old result bodies.
+    conn.execute(
+        "DELETE FROM memory_operation_results
+         WHERE id IN (SELECT id FROM memory_operation_results ORDER BY id LIMIT ?2)
+           AND created_at < ?1",
+        params![
+            (timestamp - chrono::Duration::days(RESULT_RETENTION_DAYS)).to_rfc3339(),
+            COMPACTION_BATCH
+        ],
+    )?;
+    // Index every record ID in the result so a purge can find the operations
+    // to tombstone without scanning them all.
+    let mut record_ids = HashSet::new();
+    collect_uuid_strings(&serde_json::from_str(&result_json)?, &mut record_ids);
+    let mut insert = conn.prepare_cached(
+        "INSERT OR IGNORE INTO memory_operation_refs(record_id,idempotency_key) VALUES (?1,?2)",
+    )?;
+    for record_id in record_ids {
+        insert.execute(params![record_id, key])?;
+    }
     Ok(())
+}
+
+fn collect_uuid_strings(value: &Value, found: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            if Uuid::parse_str(text).is_ok() {
+                found.insert(text.clone());
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_uuid_strings(item, found)),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|item| collect_uuid_strings(item, found)),
+        _ => {}
+    }
 }
 
 pub(super) fn operation_request_hash(operation: &str, request: &impl Serialize) -> Result<String> {
@@ -357,10 +519,31 @@ pub(super) fn scrub_operations_referencing(conn: &Connection, record_ids: &[&str
     if record_ids.is_empty() {
         return Ok(());
     }
+    let record_ids = serde_json::to_string(record_ids)?;
     conn.execute(
-        "UPDATE memory_operations SET request_hash=NULL,result_json=NULL
-         WHERE EXISTS (SELECT 1 FROM json_each(?1) WHERE instr(result_json,value)>0)",
-        [serde_json::to_string(record_ids)?],
+        "UPDATE memory_operations SET request_hash=NULL
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
+    )?;
+    conn.execute(
+        "DELETE FROM memory_operation_results
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
+    )?;
+    // A tombstone keeps no result, so it keeps no record IDs either.
+    conn.execute(
+        "DELETE FROM memory_operation_refs
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
     )?;
     Ok(())
 }
@@ -428,6 +611,29 @@ pub(super) fn insert_fts(
         "INSERT INTO memory_fts(record_type,record_id,scope_id,text) VALUES (?1,?2,?3,?4)",
         params![record_type, record_id, scope_id, text],
     )?;
+    // record_id is UNINDEXED, so remember the rowid for deletes by key.
+    conn.execute(
+        "INSERT INTO memory_fts_refs(record_type,record_id,fts_rowid) VALUES (?1,?2,?3)",
+        params![record_type, record_id, conn.last_insert_rowid()],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_fts(conn: &Connection, record_type: &str, record_id: &str) -> Result<()> {
+    let rowid: Option<i64> = conn
+        .query_row(
+            "SELECT fts_rowid FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
+            params![record_type, record_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(rowid) = rowid {
+        conn.execute("DELETE FROM memory_fts WHERE rowid=?1", [rowid])?;
+        conn.execute(
+            "DELETE FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
+            params![record_type, record_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -710,9 +916,11 @@ pub(super) fn query_claim_candidates(
         sql.push_str(" AND status=?");
         values.push(status.to_owned());
     }
-    sql.push_str(" ORDER BY created_at,id");
+    // A limited read keeps the newest candidates; callers reorder for display.
     if let Some(limit) = limit {
-        sql.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(&format!(" ORDER BY created_at DESC,id LIMIT {limit}"));
+    } else {
+        sql.push_str(" ORDER BY created_at,id");
     }
     let mut statement = conn.prepare(&sql)?;
     collect_rows(statement.query_map(rusqlite::params_from_iter(values), row_claim)?)
@@ -890,19 +1098,43 @@ pub(super) fn copy_claim_sources(
 pub(super) fn query_observations_for_scopes(
     conn: &Connection,
     scope_ids: &[String],
+    represented_view_ids: &[String],
 ) -> Result<Vec<Observation>> {
     if scope_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", scope_ids.len())
+    let scope_placeholders = std::iter::repeat_n("?", scope_ids.len())
         .collect::<Vec<_>>()
         .join(",");
+    let view_placeholders = std::iter::repeat_n("?", represented_view_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Observations represented by the selected view chain are excluded before
+    // LIMIT so reflected history cannot crowd out newer observations.
     let sql = format!(
-        "SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
-         FROM observations WHERE scope_id IN ({placeholders}) ORDER BY importance DESC,created_at,id LIMIT 257"
+        "WITH RECURSIVE view_chain(id) AS (
+            SELECT id FROM memory_views WHERE id IN ({view_placeholders})
+            UNION
+            SELECT view.previous_view_id
+            FROM memory_views view
+            JOIN view_chain current ON current.id=view.id
+            WHERE view.previous_view_id IS NOT NULL
+         )
+         SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
+         FROM observations
+         WHERE scope_id IN ({scope_placeholders})
+           AND NOT EXISTS (
+               SELECT 1 FROM view_sources source
+               JOIN view_chain ON view_chain.id=source.view_id
+               WHERE source.observation_id=observations.id
+           )
+         ORDER BY created_at DESC,id LIMIT 257"
     );
     let mut statement = conn.prepare(&sql)?;
-    collect_rows(statement.query_map(rusqlite::params_from_iter(scope_ids), row_observation)?)
+    collect_rows(statement.query_map(
+        rusqlite::params_from_iter(represented_view_ids.iter().chain(scope_ids)),
+        row_observation,
+    )?)
 }
 
 pub(super) fn observation_has_events(
@@ -917,48 +1149,6 @@ pub(super) fn observation_has_events(
         params![observation_id, event_ids_json],
         |row| row.get(0),
     )?)
-}
-
-pub(super) fn observations_in_views(
-    conn: &Connection,
-    observation_ids: &[&str],
-    view_ids: &[String],
-) -> Result<HashSet<String>> {
-    if view_ids.is_empty() || observation_ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let placeholders = std::iter::repeat_n("?", view_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "WITH RECURSIVE view_chain(id) AS (
-            SELECT id FROM memory_views WHERE id IN ({placeholders})
-            UNION
-            SELECT view.previous_view_id
-            FROM memory_views view
-            JOIN view_chain current ON current.id=view.id
-            WHERE view.previous_view_id IS NOT NULL
-         )
-         SELECT DISTINCT source.observation_id
-         FROM view_chain
-         JOIN view_sources source ON source.view_id=view_chain.id
-         WHERE source.observation_id IN (SELECT value FROM json_each(?))"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let ids_json = serde_json::to_string(observation_ids)?;
-    Ok(collect_rows(
-        statement.query_map(
-            rusqlite::params_from_iter(
-                view_ids
-                    .iter()
-                    .map(String::as_str)
-                    .chain(std::iter::once(ids_json.as_str())),
-            ),
-            |row| row.get(0),
-        )?,
-    )?
-    .into_iter()
-    .collect())
 }
 
 pub(super) fn context_source_ids(
@@ -1002,6 +1192,95 @@ pub(super) fn sort_claims_by_scope(claims: &mut [Claim], scope_order: &[String])
             .position(|scope_id| scope_id == &claim.scope_id)
             .unwrap_or(usize::MAX)
     });
+}
+
+/// Split active claims into those in force and those shadowed by a deeper
+/// scope. A `single` claim loses to any claim for the same logical key in a
+/// descendant scope; `set` claims are unioned and never shadowed.
+pub(super) fn split_shadowed_claims(
+    claims: Vec<Claim>,
+    scope_order: &[String],
+) -> (Vec<Claim>, Vec<Claim>) {
+    let depth = |claim: &Claim| {
+        scope_order
+            .iter()
+            .position(|scope_id| scope_id == &claim.scope_id)
+            .unwrap_or(0)
+    };
+    let key = |claim: &Claim| {
+        (
+            enum_text(&claim.kind),
+            claim.subject.clone(),
+            claim.predicate.clone(),
+        )
+    };
+    let mut deepest: HashMap<(String, String, String), usize> = HashMap::new();
+    for claim in &claims {
+        let entry = deepest.entry(key(claim)).or_insert(0);
+        *entry = (*entry).max(depth(claim));
+    }
+    claims.into_iter().partition(|claim| {
+        claim.cardinality != ClaimCardinality::Single || depth(claim) >= deepest[&key(claim)]
+    })
+}
+
+/// Active claims may use at most this share of a context or plan budget.
+pub(super) const CLAIM_BUDGET_PERCENT: i64 = 50;
+/// User-scope claims are pinned first, up to this share of the claim budget.
+pub(super) const USER_CLAIM_PIN_PERCENT: i64 = 50;
+
+pub(super) fn percent_of(total: i64, percent: i64) -> i64 {
+    (i128::from(total) * i128::from(percent) / 100) as i64
+}
+
+/// Choose the active claims that fit `budget` tokens. User-scope claims go
+/// first, newest update first, up to the pinned share; every other claim and
+/// any user claim left over then fill the rest, newest update first. Both
+/// returned lists keep the input order.
+pub(super) fn budget_claims(
+    conn: &Connection,
+    claims: Vec<Claim>,
+    budget: i64,
+    cost: impl Fn(&Claim) -> i64,
+) -> Result<(Vec<Claim>, Vec<Claim>)> {
+    let scope_ids: Vec<&str> = claims.iter().map(|claim| claim.scope_id.as_str()).collect();
+    let user_scopes: HashSet<String> = {
+        let mut statement = conn.prepare(
+            "SELECT id FROM memory_scopes WHERE kind='user' AND id IN (SELECT value FROM json_each(?1))",
+        )?;
+        collect_rows(statement.query_map([serde_json::to_string(&scope_ids)?], |row| row.get(0))?)?
+            .into_iter()
+            .collect()
+    };
+    let costs: Vec<i64> = claims.iter().map(&cost).collect();
+    let mut newest_first: Vec<usize> = (0..claims.len()).collect();
+    newest_first.sort_by(|&left, &right| {
+        claims[right]
+            .updated_at
+            .cmp(&claims[left].updated_at)
+            .then_with(|| claims[left].id.cmp(&claims[right].id))
+    });
+    let mut kept = vec![false; claims.len()];
+    let mut used = 0;
+    let pin_budget = percent_of(budget, USER_CLAIM_PIN_PERCENT);
+    for &index in &newest_first {
+        if user_scopes.contains(&claims[index].scope_id) && costs[index] <= pin_budget - used {
+            used += costs[index];
+            kept[index] = true;
+        }
+    }
+    for &index in &newest_first {
+        if !kept[index] && costs[index] <= budget - used {
+            used += costs[index];
+            kept[index] = true;
+        }
+    }
+    let (kept_claims, omitted): (Vec<_>, Vec<_>) =
+        claims.into_iter().zip(kept).partition(|(_, kept)| *kept);
+    Ok((
+        kept_claims.into_iter().map(|(claim, _)| claim).collect(),
+        omitted.into_iter().map(|(claim, _)| claim).collect(),
+    ))
 }
 
 pub(super) fn search_fts(

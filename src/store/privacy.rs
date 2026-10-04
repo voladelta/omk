@@ -221,15 +221,15 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         .iter()
         .chain(closure.observation_ids.iter())
         .chain(closure.view_ids.iter())
+        // Saved plans hold only their run ID, so a run that loses evidence
+        // tombstones the plan that created it.
+        .chain(closure.affected_run_ids.iter())
         .map(String::as_str)
         .chain(closure.events.iter().map(|event| event.0.as_str()))
         .collect();
     scrub_operations_referencing(conn, &record_ids)?;
     for claim_id in &closure.claim_ids {
-        conn.execute(
-            "DELETE FROM memory_fts WHERE record_type='claim' AND record_id=?1",
-            [claim_id],
-        )?;
+        delete_fts(conn, "claim", claim_id)?;
         conn.execute("DELETE FROM claims WHERE id=?1", [claim_id])?;
     }
     for slot in &closure.claim_slots {
@@ -244,10 +244,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         )?;
     }
     for observation_id in &closure.observation_ids {
-        conn.execute(
-            "DELETE FROM memory_fts WHERE record_type='observation' AND record_id=?1",
-            [observation_id],
-        )?;
+        delete_fts(conn, "observation", observation_id)?;
         conn.execute("DELETE FROM observations WHERE id=?1", [observation_id])?;
     }
     for view_id in &closure.direct_view_ids {
@@ -260,6 +257,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
              SET status=CASE WHEN status='pending' THEN 'stale' ELSE status END,
                  source_integrity='privacy-purged',
                  ambiguities_json='[]',
+                 truncated_event_ids_json='[]',
                  error=CASE WHEN status='pending' THEN 'source evidence privacy-purged' ELSE error END,
                  updated_at=?1
              WHERE id=?2",
@@ -267,10 +265,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         )?;
     }
     for (event_id, _, _, _) in &closure.events {
-        conn.execute(
-            "DELETE FROM memory_fts WHERE record_type='event' AND record_id=?1",
-            [event_id],
-        )?;
+        delete_fts(conn, "event", event_id)?;
         conn.execute("DELETE FROM memory_events WHERE id=?1", [event_id])?;
     }
     Ok(())

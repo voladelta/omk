@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS observation_runs (
     observer_model TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     ambiguities_json TEXT NOT NULL DEFAULT '[]',
+    truncated_event_ids_json TEXT NOT NULL DEFAULT '[]',
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -188,10 +189,34 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     text
 );
 
+CREATE TABLE IF NOT EXISTS memory_fts_refs (
+    record_type TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    fts_rowid INTEGER NOT NULL,
+    PRIMARY KEY(record_type, record_id)
+);
+
 CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
-    request_hash TEXT,
-    result_json TEXT
+    request_hash TEXT
 );
+
+-- Result bodies live apart from keys, in commit order, so compaction deletes
+-- the oldest rows and frees whole pages instead of hollowing out key pages.
+CREATE TABLE IF NOT EXISTS memory_operation_results (
+    id INTEGER PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE REFERENCES memory_operations(idempotency_key) ON DELETE CASCADE,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_operation_refs (
+    record_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL REFERENCES memory_operations(idempotency_key) ON DELETE CASCADE,
+    PRIMARY KEY(record_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS memory_operation_refs_by_key
+ON memory_operation_refs(idempotency_key);
 "#;

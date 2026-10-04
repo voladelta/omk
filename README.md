@@ -43,9 +43,13 @@ The operation fields tell you how to recover:
 - `sameKeyReusable` means validation failed before OMK recorded the operation
 - `nextAction` tells you what to do before you retry
 
-An identical retry returns the original data with `replayed: true`. OMK rejects a reused key if any input changes.
+An identical retry returns the original data with `replayed: true`. If another process holds the database past the five second busy timeout, OMK returns code `busy` with `retryable` and `sameKeyReusable` both true. Retry the identical request with the same key. OMK rejects a reused key if any input changes.
 
 `do-not-store` is the exception. It replays requests when only the payload, metadata or token hint changes. OMK keeps no fingerprint derived from that data.
+
+Saved results are kept for 30 days. After that, each write compacts a small batch of expired operations down to their key, operation name and request hash. A compacted key still rejects changed input with `idempotency_conflict`. An identical retry returns `operation_expired` instead of running the operation again: it already committed, so inspect its records instead of retrying. A purge still tombstones compacted operations that mention a purged record.
+
+`observe plan` saves only its run ID. A replay rebuilds the plan: it keeps the same run and exact event range, but active claims and the previous continuation reflect the store at replay time. Storing whole plans made them most of the operation log, because each plan copied every active claim.
 
 Failures are JSON on standard error:
 
@@ -53,7 +57,7 @@ Failures are JSON on standard error:
 {
   "error": {
     "code": "budget_exceeded",
-    "message": "context budget too small: minimumRequiredTokens=12 for active claims",
+    "message": "context budget too small: minimumRequiredTokens=12 for the context structure",
     "retryable": false,
     "sameKeyReusable": true,
     "nextAction": "increase the token budget and retry with the same key"
@@ -171,7 +175,7 @@ omk claim confirm --id CLAIM_ID --idempotency-key codex-thread-1-confirm-1
 omk claim reject --id CLAIM_ID --idempotency-key codex-thread-1-reject-1
 ```
 
-`claim reconcile` can classify trusted non-observer pending state, but it intentionally never promotes observer-origin claims.
+`claim reconcile` can classify pending state as duplicate or disputed, but it never activates a claim unless a trusted ingestion path has already given it `trusted-source` authority. OMK has no such path today, so every activation needs an explicit claim command. It never promotes observer-origin claims.
 
 ## Recover observation work
 
@@ -208,17 +212,19 @@ omk context \
 
 Add `--compact` to emit the direct model payload with the same top-level sections and a budget calculated from compact records. The default command still returns the complete context bundle with diagnostics. Compact records keep claim status, modality, authority, confidence, scope and value; events keep their kind, scope, time, content and sensitivity. Record UUIDs remain intact for `omk event get`, `omk recall explain-claim`, and `omk recall observation`. Routine storage fields such as hashes, token counts, observer model and creation timestamps are omitted. Compact output has no diagnostics field; use the default command when you need omitted-item details. The library equivalents are `compose_compact_context(...)` and `ContextBundle::compact_model_payload()`.
 
-OMK never silently removes active state. If it cannot fit, the command returns `budget_exceeded` and `minimumRequiredTokens`.
+Active claims may use at most half of the budget. OMK fills that half in two passes. First it pins user-scope claims, newest update first, up to half of the claim share. Then it fills the rest with any remaining claims, newest update first. Each claim that does not fit appears in `diagnostics.omittedItems` with reason `active claim budget`. It stays active and is still returned by `recall search --current-only` and exact recall. Context fails with `budget_exceeded` and `minimumRequiredTokens` only when the budget cannot hold the empty context structure.
 
-The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
+Simulated agent use showed why: active claims passed 16,000 tokens after about 100 days, so a context that required every claim would fail every day after that. With a 16,000-token budget, this ranking never failed over two simulated years and kept 73–83% of the claims an agent needed when needs favor recent claims and user preferences, and 57–67% when they favor durable facts. Ranking by recency alone scored 10–14 points lower. An unlimited user pin did no better than recency alone in the second year at this budget, and up to 22 points worse at 8,000 tokens, once user preferences filled the share. These rates depend on the simulated workload and need models. Run `cargo run --release --example sim -- OUT_DIR [DAYS] [HYGIENE]` to reproduce them.
+
+Context reads all of its sections inside one SQLite read transaction, so a concurrent commit cannot split the bundle. The result separates pending and disputed claims from active claims. OMK treats `--token-count` as a conservative hint and never stores a value below its estimate. Visible redaction markers also use part of the budget.
 
 The estimate covers JSON model input, including the record fields selected by the chosen context format. For plans, the fields are `scope`, `events`, `activeClaims`, and `previousContinuation`. For context, they are all bundle fields except `diagnostics`. The Rust `model_payload()` and `compact_model_payload()` methods return these objects. OMK uses one token per four Unicode characters, rounded up per selected item with array separators, plus any excess token hints. Commands, run routing fields, diagnostics, prompts, and renderer overhead are outside this estimate. The caller must check the final rendered input with the target model's tokenizer before sending it.
 
-Observation planning reserves active inherited claims and previous continuation before selecting the next events. If required state and the first event cannot fit, it returns `budget_exceeded` without saving a run. Context keeps active claims mandatory and assigns query evidence space before optional continuity views and observations.
+Observation planning reserves the budgeted active claims (the same half-share ranking as context, without diagnostics) and previous continuation before selecting the next events. If the first event alone cannot fit but required state can, the plan includes that event as a stub with content `{"truncated": true, "reason": "exceeds observation budget", "preview": ...}` and empty metadata, so the run covers it and the cursor can advance. The preview keeps as much serialized content as fits, possibly none. The run records stubbed event IDs, and commit rejects any observation, claim or ambiguity that cites one with `invalid_input`. If required state and an empty stub cannot fit, planning returns `budget_exceeded` without saving a run. Context places budgeted active claims first and assigns query evidence space before optional continuity views and observations.
 
-Context omits an observation when any of its source events is already present in the selected raw tail or query evidence, or when a selected continuity view represents it. View coverage includes observations inherited through previous generations. A continuity view that cannot fit the budget does not suppress observations. These rules apply to both full and compact context; exact recall still returns the stored evidence.
+Context omits an observation when any of its source events is already present in the selected raw tail or query evidence, or when a selected continuity view represents it. View coverage includes observations inherited through previous generations. OMK applies view coverage before it limits candidates, and it picks the newest remaining observations first, so a large reflected backlog cannot hide new ones. A continuity view that cannot fit the budget does not suppress observations. These rules apply to both full and compact context; exact recall still returns the stored evidence.
 
-Plans and recent context read events in pages of 32. Context considers at most 256 general observations and 256 pending/disputed claims (reading at most 257 observations and 257 claims per status to detect truncation). Each of at most 10 search hits expands to at most 256 source events. `diagnostics.truncated` marks candidate, source, or raw-tail truncation; `omittedItems` describes inspected items only. Exact recall remains complete. Active claims are all inspected. These bounds limit decoded rows and source loading; SQLite sorting, scope traversal, and view-chain checks can still scan growing history, so they do not guarantee constant latency.
+Plans and recent context read events in pages of 32. Context considers at most 256 general observations and 256 pending/disputed claims (reading at most 257 observations and 257 claims per status to detect truncation). When a backlog exceeds a limit, OMK keeps the newest records and presents them in a stable order. Each of at most 10 search hits expands to at most 256 source events. `diagnostics.truncated` marks candidate, source, or raw-tail truncation; `omittedItems` describes inspected items only. Exact recall remains complete. Every active claim is inspected before the claim budget is applied. These bounds limit decoded rows and source loading; SQLite sorting, scope traversal, and view-chain checks can still scan growing history, so they do not guarantee constant latency.
 
 Observer input is limited to 1,048,576 bytes before CLI JSON parsing and after store serialization, 256 total observations/claims/ambiguities/continuation list items, and 256 source IDs per item. Oversized input fails with `invalid_input` before commit.
 
@@ -240,13 +246,13 @@ omk claim purge      Delete a claim and its provenance links.
 omk event purge      Delete an event and dependent records.
 ```
 
-Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
+Correct accepts only an active, pending or disputed claim; correcting a superseded, rejected or expired claim returns `invalid_input`. Rescope keeps a disputed claim disputed and a pending claim pending; only an active claim stays active. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
 Claims default to `--cardinality single`. This allows one active value for each scope, kind, subject and predicate.
 
-Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident.
+Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident. Observation commit applies the same rule: it returns `invalid_input` before any write when an observer claim uses a different cardinality from its existing slot, so the same key stays reusable.
 
 Observer-produced claims stay pending, even if the model labels one as an accepted decision. Use a claim command to confirm it. You can promote it only to an ancestor scope.
 
@@ -274,7 +280,7 @@ Search returns a preview of at most 512 Unicode characters in `text`, with `clai
 
 Use `--fts-query` only when you need SQLite FTS5 syntax.
 
-Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. A project context can also render one named descendant stream.
+Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. When a `single` claim has the same kind, subject and predicate in several visible scopes, the deepest scope wins: context and observation plans drop the shadowed ancestor claim, and context lists it in `diagnostics.omittedItems` as `shadowed by descendant scope claim`. Shadowed claims do not count toward the required budget. `set` claims are combined across scopes without shadowing. `claim list` and exact recall still return every claim. A project context can also render one named descendant stream.
 
 Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
 
@@ -291,14 +297,16 @@ OMK applies these privacy rules:
 - event purge reports `dependentViews`, `dependentViewIds` and `affectedRunIds`
 - event purge also reports affected observations and claims
 - claim and event purge remove owned command events and records derived from them
+- saved operation results hold the redacted event, never secret content or metadata
+- OMK enables SQLite `secure_delete`, so deleted rows are overwritten with zeros
 
 Each purge commits dependency deletion, search cleanup, run invalidation and operation tombstones in one transaction. It follows owned command evidence and removes dependent views along with their later generations. Each affected run is updated once: pending runs become stale, while committed and failed runs keep their status. All affected runs report `sourceIntegrity: "privacy-purged"` and have their ambiguities cleared.
 
-Matching operation tombstones discard both the saved result and request hash. Unrelated operations remain replayable, and an identical retry of the purge returns its saved result.
+OMK indexes the record IDs in each saved operation result and the search row of each record. A purge uses those indexes to find matching operations and search rows instead of scanning every operation or search entry. Matching operation tombstones discard both the saved result and request hash. Unrelated operations remain replayable, and an identical retry of the purge returns its saved result.
 
 ## Use the current schema
 
-OMK 0.6 uses schema v6. Existing schema v6 databases reopen without changes.
+OMK 0.7 uses schema v7. Existing schema v7 databases reopen without changes.
 
 Opening a database compares its required table, column, constraint, index, and FTS definitions against the schema created by OMK. A missing or changed definition returns `schema_mismatch` before record writes. The comparison is deliberately exact for OMK-created databases; it does not repair altered schemas or replace a full integrity check.
 
@@ -312,7 +320,7 @@ Omit `--expected-previous-view` only for generation 1.
 
 Each stream has its own view chain. Every view links to the exact previous view. A stale commit fails without writing. The previous view stays active after a failed reflection.
 
-OMK 0.6 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure.
+OMK 0.7 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure: `secure_delete` does not reach copies in the write-ahead log (WAL) before a checkpoint, backups or filesystem snapshots.
 
 `--scope` states the agent's intent and prevents accidental scope leaks. It does not authenticate a process that can choose another scope or read the database.
 
