@@ -561,7 +561,20 @@ fn required_model_state_and_continuation_are_budgeted() {
             <= bundle.diagnostics.estimated_tokens
     );
     assert!(bundle.diagnostics.estimated_tokens <= 1000);
-    assert_eq!(bundle.claims.len(), 1);
+    // The large claim exceeds half of this budget, so context reports it
+    // instead of failing; a budget whose claim share fits it includes it.
+    assert!(bundle.claims.is_empty());
+    assert!(
+        bundle
+            .diagnostics
+            .omitted_items
+            .iter()
+            .any(|item| item.reason == "active claim budget")
+    );
+    let roomier = store
+        .compose_context("thread", "stream", 1400, 400, None)
+        .unwrap();
+    assert_eq!(roomier.claims.len(), 1);
 }
 
 #[test]

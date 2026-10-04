@@ -195,7 +195,7 @@ fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content()
 }
 
 #[test]
-fn compact_context_budget_prices_compact_records_and_keeps_active_claims_mandatory() {
+fn compact_context_budget_prices_compact_records_and_reports_claims_over_budget() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
     fixture.event(
@@ -254,10 +254,20 @@ fn compact_context_budget_prices_compact_records_and_keeps_active_claims_mandato
         "recentEvents": [],
         "recalledEvidence": [],
     });
-    let budget = empty_payload.to_string().chars().count().div_ceil(4) as i64 + 1;
+    let overhead = empty_payload.to_string().chars().count().div_ceil(4) as i64;
+    let squeezed = fixture
+        .store
+        .compose_compact_context("user", "stream", overhead + 1, 0, None)
+        .unwrap();
+    assert!(squeezed.claims.is_empty());
+    assert_eq!(squeezed.diagnostics.omitted_items.len(), 1);
+    assert_eq!(
+        squeezed.diagnostics.omitted_items[0].reason,
+        "active claim budget"
+    );
     let error = fixture
         .store
-        .compose_compact_context("user", "stream", budget, 0, None)
+        .compose_compact_context("user", "stream", overhead - 1, 0, None)
         .unwrap_err();
     assert!(error.to_string().contains("minimumRequiredTokens"));
 }
@@ -3000,19 +3010,20 @@ fn deeper_scope_single_claims_shadow_ancestors_in_context_and_plans() {
         .unwrap();
     assert_eq!(compact.claims.len(), 4);
 
-    // Shadowed claims do not count toward the required budget.
+    // Shadowed claims do not count toward the claim budget: twice the tokens
+    // the four in-force claims need gives them their whole half-share.
     let required = context.diagnostics.estimated_tokens;
+    let tight = fixture
+        .store
+        .compose_context("thread", "stream", required * 2, 0, None)
+        .unwrap();
+    assert_eq!(tight.claims.len(), 4);
     assert!(
-        fixture
-            .store
-            .compose_context("thread", "stream", required, 0, None)
-            .is_ok()
-    );
-    assert!(
-        fixture
-            .store
-            .compose_context("thread", "stream", required - 1, 0, None)
-            .is_err()
+        !tight
+            .diagnostics
+            .omitted_items
+            .iter()
+            .any(|item| item.reason == "active claim budget")
     );
 
     let plan = plan_run(&mut fixture, "thread", "stream", "plan");
@@ -3437,4 +3448,81 @@ fn context_reads_one_snapshot_while_another_connection_commits() {
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(reader.join().unwrap() > 0);
     });
+}
+
+#[test]
+fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("project", ScopeKind::Project, Some("user"));
+    fixture.event("project", "stream", "start", Sensitivity::Normal, "seed");
+    let mut ids = std::collections::HashMap::new();
+    for (scope, prefix) in [("user", "u"), ("project", "p")] {
+        for index in 0..10 {
+            let subject = format!("{prefix}{index}");
+            let claim = fixture
+                .store
+                .remember_claim(
+                    scope,
+                    ClaimKind::Fact,
+                    &subject,
+                    "value",
+                    json!("v".repeat(400)),
+                    &[],
+                    &format!("remember-{subject}"),
+                )
+                .unwrap()
+                .data;
+            ids.insert(claim.id, subject);
+        }
+    }
+    let all = fixture
+        .store
+        .compose_context("project", "stream", 1_000_000, 0, None)
+        .unwrap();
+    assert_eq!(all.claims.len(), 20);
+    let largest = all
+        .claims
+        .iter()
+        .map(|claim| serde_json::to_string(claim).unwrap().chars().count() as i64 / 4 + 2)
+        .max()
+        .unwrap();
+    // Room for ten claims: the pin share holds four user claims, and the
+    // newest six of the rest are project claims.
+    let claim_budget = largest * 10 + largest / 2;
+    let context = fixture
+        .store
+        .compose_context("project", "stream", claim_budget * 2, 0, None)
+        .unwrap();
+    let mut kept: Vec<&str> = context
+        .claims
+        .iter()
+        .map(|claim| ids[&claim.id].as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["p4", "p5", "p6", "p7", "p8", "p9", "u6", "u7", "u8", "u9"]
+    );
+    let mut omitted: Vec<&str> = context
+        .diagnostics
+        .omitted_items
+        .iter()
+        .filter(|item| item.reason == "active claim budget")
+        .map(|item| ids[&item.id].as_str())
+        .collect();
+    omitted.sort_unstable();
+    assert_eq!(
+        omitted,
+        ["p0", "p1", "p2", "p3", "u0", "u1", "u2", "u3", "u4", "u5"]
+    );
+
+    let plan = fixture
+        .store
+        .plan_observation("project", "stream", claim_budget * 2, "test", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(plan.active_claims.len(), 10);
 }

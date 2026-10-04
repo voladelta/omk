@@ -484,20 +484,27 @@ impl MemoryStore {
         sort_claims_by_scope(&mut pending_claims, &visible);
         let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
             "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
-        let required_tokens: i64 = estimate_tokens(&empty_payload.to_string())
+        let overhead_tokens = estimate_tokens(&empty_payload.to_string());
+        ensure!(
+            overhead_tokens <= max_tokens,
+            KernelError::new(
+                KernelErrorKind::BudgetExceeded,
+                format!(
+                    "context budget too small: minimumRequiredTokens={overhead_tokens} for the context structure"
+                ),
+            )
+        );
+        let (claims, over_budget_claims) = budget_claims(
+            &self.conn,
+            claims,
+            percent_of(max_tokens, CLAIM_BUDGET_PERCENT),
+            |claim| rendering.claim_tokens(claim),
+        )?;
+        let required_tokens = overhead_tokens
             + claims
                 .iter()
                 .map(|claim| rendering.claim_tokens(claim))
                 .sum::<i64>();
-        ensure!(
-            required_tokens <= max_tokens,
-            KernelError::new(
-                KernelErrorKind::BudgetExceeded,
-                format!(
-                    "context budget too small: minimumRequiredTokens={required_tokens} for active claims"
-                ),
-            )
-        );
         let mut diagnostics = ContextDiagnostics {
             estimated_tokens: required_tokens,
             omitted_items: shadowed_claims
@@ -506,6 +513,10 @@ impl MemoryStore {
                     id: claim.id,
                     reason: "shadowed by descendant scope claim".to_owned(),
                 })
+                .chain(over_budget_claims.into_iter().map(|claim| OmittedItem {
+                    id: claim.id,
+                    reason: "active claim budget".to_owned(),
+                }))
                 .collect(),
             truncated: pending_truncated,
         };

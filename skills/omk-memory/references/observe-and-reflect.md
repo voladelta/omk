@@ -14,7 +14,7 @@ Read this branch when compacting an OMK stream or creating a continuity view.
 
 The observation cycle is complete when the plan is caught up or the exact run commits, the stream cursor advances once, and every pending claim is surfaced without an authority change.
 
-Plans reserve inherited active claims and previous continuation before events. An oversized first event is planned as a truncated stub so the stream can advance; raise the budget if you need its full content. On `budget_exceeded`, raise the budget without dropping required state. Keep observer JSON below 1,048,576 bytes, with at most 256 total observations, claims, ambiguities, and continuation list items, and at most 256 source IDs per item. Exceeding a limit leaves the commit key reusable.
+Plans reserve the budgeted active claims (at most half the budget, user-scope claims pinned first, then newest) and previous continuation before events. An oversized first event is planned as a truncated stub so the stream can advance; raise the budget if you need its full content. On `budget_exceeded`, raise the budget. Keep observer JSON below 1,048,576 bytes, with at most 256 total observations, claims, ambiguities, and continuation list items, and at most 256 source IDs per item. Exceeding a limit leaves the commit key reusable.
 
 ## Recover an interrupted observation
 

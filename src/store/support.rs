@@ -1184,6 +1184,65 @@ pub(super) fn split_shadowed_claims(
     })
 }
 
+/// Active claims may use at most this share of a context or plan budget.
+pub(super) const CLAIM_BUDGET_PERCENT: i64 = 50;
+/// User-scope claims are pinned first, up to this share of the claim budget.
+pub(super) const USER_CLAIM_PIN_PERCENT: i64 = 40;
+
+pub(super) fn percent_of(total: i64, percent: i64) -> i64 {
+    (i128::from(total) * i128::from(percent) / 100) as i64
+}
+
+/// Choose the active claims that fit `budget` tokens. User-scope claims go
+/// first, newest update first, up to the pinned share; every other claim and
+/// any user claim left over then fill the rest, newest update first. Both
+/// returned lists keep the input order.
+pub(super) fn budget_claims(
+    conn: &Connection,
+    claims: Vec<Claim>,
+    budget: i64,
+    cost: impl Fn(&Claim) -> i64,
+) -> Result<(Vec<Claim>, Vec<Claim>)> {
+    let scope_ids: Vec<&str> = claims.iter().map(|claim| claim.scope_id.as_str()).collect();
+    let user_scopes: HashSet<String> = {
+        let mut statement = conn.prepare(
+            "SELECT id FROM memory_scopes WHERE kind='user' AND id IN (SELECT value FROM json_each(?1))",
+        )?;
+        collect_rows(statement.query_map([serde_json::to_string(&scope_ids)?], |row| row.get(0))?)?
+            .into_iter()
+            .collect()
+    };
+    let costs: Vec<i64> = claims.iter().map(&cost).collect();
+    let mut newest_first: Vec<usize> = (0..claims.len()).collect();
+    newest_first.sort_by(|&left, &right| {
+        claims[right]
+            .updated_at
+            .cmp(&claims[left].updated_at)
+            .then_with(|| claims[left].id.cmp(&claims[right].id))
+    });
+    let mut kept = vec![false; claims.len()];
+    let mut used = 0;
+    let pin_budget = percent_of(budget, USER_CLAIM_PIN_PERCENT);
+    for &index in &newest_first {
+        if user_scopes.contains(&claims[index].scope_id) && costs[index] <= pin_budget - used {
+            used += costs[index];
+            kept[index] = true;
+        }
+    }
+    for &index in &newest_first {
+        if !kept[index] && costs[index] <= budget - used {
+            used += costs[index];
+            kept[index] = true;
+        }
+    }
+    let (kept_claims, omitted): (Vec<_>, Vec<_>) =
+        claims.into_iter().zip(kept).partition(|(_, kept)| *kept);
+    Ok((
+        kept_claims.into_iter().map(|(claim, _)| claim).collect(),
+        omitted.into_iter().map(|(claim, _)| claim).collect(),
+    ))
+}
+
 pub(super) fn search_fts(
     conn: &Connection,
     scope_ids: &[String],
