@@ -42,7 +42,7 @@ Use claims for structured state, with `subject` and `predicate` stable across co
 - `claim correct`, `forget`, `purge`, and `rescope` require the corresponding user intent; inspect their help before use.
 - Observer-origin claims remain pending. Confirm or reject them only after an explicit user decision about that claim.
 
-Use `single` when one value may be active in the logical slot and `set` when distinct values may coexist. A claim is correctly represented only when its scope, modality, cardinality, provenance, and status all match the source.
+Use `single` when one value may be active in the logical slot and `set` when distinct values may coexist. In context and plans, a `single` claim in a deeper scope shadows the same slot in an ancestor scope; the shadowed claim appears only in `diagnostics.omittedItems`. A claim is correctly represented only when its scope, modality, cardinality, provenance, and status all match the source.
 
 ## Maintain and retrieve memory
 

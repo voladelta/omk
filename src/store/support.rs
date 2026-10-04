@@ -1025,6 +1025,36 @@ pub(super) fn sort_claims_by_scope(claims: &mut [Claim], scope_order: &[String])
     });
 }
 
+/// Split active claims into those in force and those shadowed by a deeper
+/// scope. A `single` claim loses to any claim for the same logical key in a
+/// descendant scope; `set` claims are unioned and never shadowed.
+pub(super) fn split_shadowed_claims(
+    claims: Vec<Claim>,
+    scope_order: &[String],
+) -> (Vec<Claim>, Vec<Claim>) {
+    let depth = |claim: &Claim| {
+        scope_order
+            .iter()
+            .position(|scope_id| scope_id == &claim.scope_id)
+            .unwrap_or(0)
+    };
+    let key = |claim: &Claim| {
+        (
+            enum_text(&claim.kind),
+            claim.subject.clone(),
+            claim.predicate.clone(),
+        )
+    };
+    let mut deepest: HashMap<(String, String, String), usize> = HashMap::new();
+    for claim in &claims {
+        let entry = deepest.entry(key(claim)).or_insert(0);
+        *entry = (*entry).max(depth(claim));
+    }
+    claims.into_iter().partition(|claim| {
+        claim.cardinality != ClaimCardinality::Single || depth(claim) >= deepest[&key(claim)]
+    })
+}
+
 pub(super) fn search_fts(
     conn: &Connection,
     scope_ids: &[String],

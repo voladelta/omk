@@ -75,6 +75,7 @@ impl MemoryStore {
         let visible = visible_scope_ids(&tx, scope_id)?;
         let mut active_claims = query_claims_for_scopes(&tx, &visible, Some("active"))?;
         sort_claims_by_scope(&mut active_claims, &visible);
+        let (active_claims, _) = split_shadowed_claims(active_claims, &visible);
         let previous_continuation = latest_view(&tx, stream_id, "continuation")?;
         let mut plan = ObservationPlan {
             run_id: Uuid::new_v4().to_string(),

@@ -304,7 +304,7 @@ enum ClaimCommand {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Deterministically activate safe source-backed claims and surface conflicts.
+    /// Classify pending claims as duplicates or conflicts; only trusted-source claims activate.
     Reconcile {
         #[arg(long)]
         scope: String,

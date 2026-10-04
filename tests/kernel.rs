@@ -2876,3 +2876,111 @@ fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
             .is_empty()
     );
 }
+
+#[test]
+fn deeper_scope_single_claims_shadow_ancestors_in_context_and_plans() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("thread", ScopeKind::Thread, Some("user"));
+    let mut remember = |scope: &str, predicate: &str, cardinality, value: &str, key: &str| {
+        fixture
+            .store
+            .remember_claim_with_cardinality(
+                scope,
+                ClaimKind::Decision,
+                "launch",
+                predicate,
+                cardinality,
+                json!(value),
+                &[],
+                key,
+            )
+            .unwrap()
+            .data
+    };
+    let shadowed = remember(
+        "user",
+        "asset",
+        ClaimCardinality::Single,
+        "ETH",
+        "user-asset",
+    );
+    let winner = remember(
+        "thread",
+        "asset",
+        ClaimCardinality::Single,
+        "BTC",
+        "thread-asset",
+    );
+    let user_tag = remember("user", "tag", ClaimCardinality::Set, "a", "user-tag");
+    let thread_tag = remember("thread", "tag", ClaimCardinality::Set, "b", "thread-tag");
+    let user_only = remember(
+        "user",
+        "owner",
+        ClaimCardinality::Single,
+        "me",
+        "user-owner",
+    );
+    fixture.event("thread", "stream", "work", Sensitivity::Normal, "event");
+
+    let context = fixture
+        .store
+        .compose_context("thread", "stream", 100_000, 0, None)
+        .unwrap();
+    let mut ids: Vec<&str> = context
+        .claims
+        .iter()
+        .map(|claim| claim.id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = vec![
+        winner.id.as_str(),
+        user_tag.id.as_str(),
+        thread_tag.id.as_str(),
+        user_only.id.as_str(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+    let omitted: Vec<_> = context
+        .diagnostics
+        .omitted_items
+        .iter()
+        .filter(|item| item.reason == "shadowed by descendant scope claim")
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(omitted, vec![shadowed.id.as_str()]);
+    let compact = fixture
+        .store
+        .compose_compact_context("thread", "stream", 100_000, 0, None)
+        .unwrap();
+    assert_eq!(compact.claims.len(), 4);
+
+    // Shadowed claims do not count toward the required budget.
+    let required = context.diagnostics.estimated_tokens;
+    assert!(
+        fixture
+            .store
+            .compose_context("thread", "stream", required, 0, None)
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .store
+            .compose_context("thread", "stream", required - 1, 0, None)
+            .is_err()
+    );
+
+    let plan = plan_run(&mut fixture, "thread", "stream", "plan");
+    assert!(
+        plan.active_claims
+            .iter()
+            .all(|claim| claim.id != shadowed.id)
+    );
+    assert_eq!(plan.active_claims.len(), 4);
+
+    let listed = fixture
+        .store
+        .list_claims("thread", true, Some(ClaimStatus::Active))
+        .unwrap();
+    assert!(listed.iter().any(|claim| claim.id == shadowed.id));
+}

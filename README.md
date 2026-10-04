@@ -274,7 +274,7 @@ Search returns a preview of at most 512 Unicode characters in `text`, with `clai
 
 Use `--fts-query` only when you need SQLite FTS5 syntax.
 
-Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. A project context can also render one named descendant stream.
+Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. When a `single` claim has the same kind, subject and predicate in several visible scopes, the deepest scope wins: context and observation plans drop the shadowed ancestor claim, and context lists it in `diagnostics.omittedItems` as `shadowed by descendant scope claim`. Shadowed claims do not count toward the required budget. `set` claims are combined across scopes without shadowing. `claim list` and exact recall still return every claim. A project context can also render one named descendant stream.
 
 Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
 

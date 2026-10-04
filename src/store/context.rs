@@ -456,6 +456,7 @@ impl MemoryStore {
         );
         let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"))?;
         sort_claims_by_scope(&mut claims, &visible);
+        let (claims, shadowed_claims) = split_shadowed_claims(claims, &visible);
         let mut pending_claims =
             query_claim_candidates(&self.conn, &visible, Some("pending"), Some(257))?;
         pending_claims.extend(query_claim_candidates(
@@ -496,7 +497,13 @@ impl MemoryStore {
         );
         let mut diagnostics = ContextDiagnostics {
             estimated_tokens: required_tokens,
-            omitted_items: Vec::new(),
+            omitted_items: shadowed_claims
+                .into_iter()
+                .map(|claim| OmittedItem {
+                    id: claim.id,
+                    reason: "shadowed by descendant scope claim".to_owned(),
+                })
+                .collect(),
             truncated: pending_truncated,
         };
 
