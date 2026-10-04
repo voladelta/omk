@@ -43,7 +43,7 @@ The operation fields tell you how to recover:
 - `sameKeyReusable` means validation failed before OMK recorded the operation
 - `nextAction` tells you what to do before you retry
 
-An identical retry returns the original data with `replayed: true`. OMK rejects a reused key if any input changes.
+An identical retry returns the original data with `replayed: true`. If another process holds the database past the five second busy timeout, OMK returns code `busy` with `retryable` and `sameKeyReusable` both true. Retry the identical request with the same key. OMK rejects a reused key if any input changes.
 
 `do-not-store` is the exception. It replays requests when only the payload, metadata or token hint changes. OMK keeps no fingerprint derived from that data.
 

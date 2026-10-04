@@ -944,10 +944,31 @@ fn parse_json_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
 }
 
+/// SQLite reports SQLITE_BUSY or SQLITE_LOCKED when another connection holds
+/// the database past the busy timeout. Nothing was written, so a retry is safe.
+fn is_sqlite_contention(cause: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        cause.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn classify_error(
     error: &anyhow::Error,
     key_reusable_for_command: bool,
 ) -> (&'static str, bool, bool, Option<&'static str>) {
+    if error.chain().any(is_sqlite_contention) {
+        return (
+            "busy",
+            true,
+            true,
+            Some("retry the identical request with the same key"),
+        );
+    }
     let Some(error) = error.downcast_ref::<KernelError>() else {
         return ("kernel_error", false, false, None);
     };
@@ -1133,5 +1154,37 @@ mod tests {
         assert_eq!(classified.0, "invalid_input");
         assert!(!classified.1);
         assert!(classified.2);
+    }
+
+    fn sqlite_failure(code: i32) -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+        .context("starting SQLite write transaction")
+    }
+
+    #[test]
+    fn sqlite_contention_is_a_retryable_busy_error_for_the_same_key() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let classified = classify_error(&sqlite_failure(code), false);
+            assert_eq!(classified.0, "busy");
+            assert!(classified.1);
+            assert!(classified.2);
+            assert_eq!(
+                classified.3,
+                Some("retry the identical request with the same key")
+            );
+        }
+        let other = classify_error(&sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT), true);
+        assert_eq!(other.0, "kernel_error");
+        assert!(!other.1);
+    }
+
+    #[test]
+    fn schema_mismatch_recovery_names_the_current_schema() {
+        let classified = classified(KernelErrorKind::SchemaMismatch, "schema mismatch", false);
+        assert_eq!(classified.0, "schema_mismatch");
+        assert!(classified.3.is_some_and(|action| action.contains("v7")));
     }
 }

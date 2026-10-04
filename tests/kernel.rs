@@ -2563,6 +2563,10 @@ fn incompatible_database_versions_are_rejected_without_schema_writes() {
             Ok(_) => panic!("schema version {version} should be rejected"),
             Err(error) => error,
         };
+        assert_eq!(
+            error.downcast_ref::<KernelError>().map(KernelError::kind),
+            Some(KernelErrorKind::SchemaMismatch)
+        );
         assert!(error.to_string().contains(&format!(
             "is incompatible with OMK schema version {SCHEMA_VERSION}"
         )));
@@ -2592,6 +2596,10 @@ fn unversioned_nonempty_databases_are_not_adopted() {
         Ok(_) => panic!("unversioned nonempty database should be rejected"),
         Err(error) => error,
     };
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::SchemaMismatch)
+    );
     assert!(
         error
             .to_string()
@@ -3050,5 +3058,53 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
             .unwrap()
             .content,
         json!("x".repeat(4_000))
+    );
+}
+
+#[test]
+fn duplicate_scopes_and_finished_runs_fail_with_typed_errors() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let duplicate = fixture
+        .store
+        .create_scope("user", ScopeKind::User, None, None, "scope-again")
+        .unwrap_err();
+    assert_eq!(
+        duplicate
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(duplicate.to_string().contains("scope user already exists"));
+    // The rejected key was not recorded, so it can create a different scope.
+    fixture
+        .store
+        .create_scope("project", ScopeKind::Project, None, None, "scope-again")
+        .unwrap();
+
+    let event = fixture.event("user", "stream", "work", Sensitivity::Normal, "event");
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "ETH"), "commit")
+        .unwrap();
+    let committed = fixture
+        .store
+        .fail_observation(&plan.run_id, "late failure", "fail")
+        .unwrap_err();
+    assert_eq!(
+        committed
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert!(committed.to_string().contains("is committed, not pending"));
+    let again = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "BTC"), "commit-2")
+        .unwrap_err();
+    assert_eq!(
+        again.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
     );
 }

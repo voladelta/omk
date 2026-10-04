@@ -146,7 +146,12 @@ impl MemoryStore {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
             schema_version == 0 || schema_version == SCHEMA_VERSION,
-            "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
+            KernelError::new(
+                KernelErrorKind::SchemaMismatch,
+                format!(
+                    "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
+                ),
+            )
         );
         if schema_version == 0 {
             let has_schema_objects: bool = conn.query_row(
@@ -159,7 +164,10 @@ impl MemoryStore {
             )?;
             ensure!(
                 !has_schema_objects,
-                "unversioned database is not empty; start with a fresh database"
+                KernelError::new(
+                    KernelErrorKind::SchemaMismatch,
+                    "unversioned database is not empty; start with a fresh database",
+                )
             );
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -202,6 +210,15 @@ impl MemoryStore {
             tx.commit()?;
             return Ok(MutationResult::replayed(prior));
         }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_scopes WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !exists,
+            KernelError::invalid_input(format!("scope {id} already exists"))
+        );
         if let Some(parent) = parent_id {
             ensure_scope_exists(&tx, parent)?;
         }

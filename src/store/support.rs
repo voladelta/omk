@@ -51,7 +51,10 @@ pub(super) fn ensure_run_pending(run: &ObservationRun, id: &str) -> Result<()> {
             "observation run {id} is stale, not pending"
         ),));
     }
-    bail!("observation run {id} is {}, not pending", run.status)
+    bail!(KernelError::invalid_input(format!(
+        "observation run {id} is {}, not pending",
+        run.status
+    )))
 }
 
 pub(super) fn validate_observer_size(result: &ObserverResult) -> Result<()> {

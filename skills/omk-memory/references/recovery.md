@@ -5,6 +5,7 @@ Read this branch after a failed, interrupted, or uncertain OMK command.
 Parse the JSON error envelope before choosing a retry:
 
 - `retryable: true`: satisfy `nextAction`, then retry the identical request with the same idempotency key.
+- `busy` (retryable): another process held the database lock. Nothing was recorded; retry the identical request with the same key, with a short pause if it repeats.
 - `sameKeyReusable: true`: correct the rejected pre-write input and retry with that same key. Completion requires the corrected operation to retain the original key.
 - `sameKeyReusable: false`: preserve the failure. Replay only the identical request with that key. When the user intends a distinct changed operation, give that separate operation a new globally unique key.
 
