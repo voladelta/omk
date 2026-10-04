@@ -28,14 +28,17 @@ impl MemoryStore {
             }),
         )?;
         let tx = self.immediate()?;
-        if let Some(prior) = prior_result::<ObservationPlanOutcome>(
-            &tx,
-            idempotency_key,
-            "observation.plan",
-            &request_hash,
-        )? {
+        if let Some(prior) =
+            prior_result::<SavedPlan>(&tx, idempotency_key, "observation.plan", &request_hash)?
+        {
+            let outcome = match prior {
+                SavedPlan::Outcome(outcome) => outcome,
+                SavedPlan::Run { planned_run_id } => ObservationPlanOutcome::ready(
+                    render_planned_run(&tx, &planned_run_id, max_tokens)?,
+                ),
+            };
             tx.commit()?;
-            return Ok(MutationResult::replayed(prior));
+            return Ok(MutationResult::replayed(outcome));
         }
         let scope = query_scope(&tx, scope_id)?;
         let (stream_scope, cursor): (String, i64) = tx
@@ -72,17 +75,8 @@ impl MemoryStore {
             tx.commit()?;
             return Ok(MutationResult::created(outcome));
         }
-        let visible = visible_scope_ids(&tx, scope_id)?;
-        let mut active_claims = query_claims_for_scopes(&tx, &visible, Some("active"))?;
-        sort_claims_by_scope(&mut active_claims, &visible);
-        let (active_claims, _) = split_shadowed_claims(active_claims, &visible);
-        let (active_claims, _) = budget_claims(
-            &tx,
-            active_claims,
-            percent_of(max_tokens, CLAIM_BUDGET_PERCENT),
-            estimate_claim_tokens,
-        )?;
-        let previous_continuation = latest_view(&tx, stream_id, "continuation")?;
+        let (active_claims, previous_continuation) =
+            plan_required_state(&tx, scope_id, stream_id, max_tokens)?;
         let mut plan = ObservationPlan {
             run_id: Uuid::new_v4().to_string(),
             scope,
@@ -142,16 +136,19 @@ impl MemoryStore {
              VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?10)",
             params![run_id, scope_id, stream_id, cursor, from_sequence, to_sequence, observer_model, prompt_version, serde_json::to_string(&truncated_event_ids)?, timestamp],
         )?;
-        let outcome = ObservationPlanOutcome::ready(plan);
+        // Save only the run: a stored plan copied every active claim and grew
+        // the log by hundreds of kilobytes per plan. Replay rebuilds it.
         save_operation(
             &tx,
             idempotency_key,
             "observation.plan",
             &request_hash,
-            &outcome,
+            &SavedPlan::Run {
+                planned_run_id: run_id.clone(),
+            },
         )?;
         tx.commit()?;
-        Ok(MutationResult::created(outcome))
+        Ok(MutationResult::created(ObservationPlanOutcome::ready(plan)))
     }
 
     pub fn commit_observation(
@@ -479,4 +476,80 @@ impl MemoryStore {
             runs: self.list_observation_runs(access, Some(stream_id), None)?,
         })
     }
+}
+
+/// What `observation.plan` keeps in the operation log.
+#[derive(Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum SavedPlan {
+    #[serde(rename_all = "camelCase")]
+    Run {
+        planned_run_id: String,
+    },
+    Outcome(ObservationPlanOutcome),
+}
+
+/// The budgeted active claims and previous continuation a plan reserves.
+fn plan_required_state(
+    conn: &Connection,
+    scope_id: &str,
+    stream_id: &str,
+    max_tokens: i64,
+) -> Result<(Vec<Claim>, Option<MemoryView>)> {
+    let visible = visible_scope_ids(conn, scope_id)?;
+    let mut active_claims = query_claims_for_scopes(conn, &visible, Some("active"))?;
+    sort_claims_by_scope(&mut active_claims, &visible);
+    let (active_claims, _) = split_shadowed_claims(active_claims, &visible);
+    let (active_claims, _) = budget_claims(
+        conn,
+        active_claims,
+        percent_of(max_tokens, CLAIM_BUDGET_PERCENT),
+        estimate_claim_tokens,
+    )?;
+    Ok((active_claims, latest_view(conn, stream_id, "continuation")?))
+}
+
+/// Rebuild a replayed plan from its run. Events are the run's exact range;
+/// active claims and continuation reflect the store at replay time.
+fn render_planned_run(conn: &Connection, run_id: &str, max_tokens: i64) -> Result<ObservationPlan> {
+    let run = query_run(conn, run_id)?;
+    ensure!(
+        run.source_integrity == "intact",
+        KernelError::privacy_purged(format!(
+            "observation run {run_id} lost source evidence to a privacy purge"
+        ))
+    );
+    let (active_claims, previous_continuation) =
+        plan_required_state(conn, &run.scope_id, &run.stream_id, max_tokens)?;
+    let mut plan = ObservationPlan {
+        run_id: run_id.to_owned(),
+        scope: query_scope(conn, &run.scope_id)?,
+        stream_id: run.stream_id.clone(),
+        from_sequence: run.from_sequence,
+        to_sequence: run.to_sequence,
+        events: Vec::new(),
+        active_claims,
+        previous_continuation,
+    };
+    let tokens = estimate_tokens(&plan.model_payload().to_string()).saturating_add(
+        plan.previous_continuation
+            .as_ref()
+            .map_or(0, view_hint_extra),
+    );
+    plan.events = query_events_range(conn, &run.stream_id, run.from_sequence, run.to_sequence)?
+        .into_iter()
+        .map(redact_for_agent)
+        .map(|event| {
+            if !run.truncated_event_ids.contains(&event.id) {
+                return event;
+            }
+            truncate_event_for_budget(event.clone(), max_tokens - tokens).unwrap_or_else(
+                |empty_cost| {
+                    truncate_event_for_budget(event, empty_cost)
+                        .expect("an empty stub fits its cost")
+                },
+            )
+        })
+        .collect();
+    Ok(plan)
 }

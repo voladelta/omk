@@ -11,11 +11,12 @@ pub(super) struct ObservationRun {
     pub(super) observer_model: String,
     pub(super) prompt_version: String,
     pub(super) truncated_event_ids: Vec<String>,
+    pub(super) source_integrity: String,
 }
 
 pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
     conn.query_row(
-        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json FROM observation_runs WHERE id=?1",
+        "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json,source_integrity FROM observation_runs WHERE id=?1",
         [id],
         |row| {
             let truncated_raw: String = row.get(8)?;
@@ -35,6 +36,7 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
                         Box::new(error),
                     )
                 })?,
+                source_integrity: row.get(9)?,
             })
         },
     )

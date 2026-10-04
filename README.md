@@ -47,6 +47,8 @@ An identical retry returns the original data with `replayed: true`. If another p
 
 `do-not-store` is the exception. It replays requests when only the payload, metadata or token hint changes. OMK keeps no fingerprint derived from that data.
 
+`observe plan` saves only its run ID. A replay rebuilds the plan: it keeps the same run and exact event range, but active claims and the previous continuation reflect the store at replay time. Storing whole plans made them most of the operation log, because each plan copied every active claim.
+
 Failures are JSON on standard error:
 
 ```json

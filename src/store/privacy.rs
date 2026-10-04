@@ -221,6 +221,9 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         .iter()
         .chain(closure.observation_ids.iter())
         .chain(closure.view_ids.iter())
+        // Saved plans hold only their run ID, so a run that loses evidence
+        // tombstones the plan that created it.
+        .chain(closure.affected_run_ids.iter())
         .map(String::as_str)
         .chain(closure.events.iter().map(|event| event.0.as_str()))
         .collect();

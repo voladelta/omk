@@ -3526,3 +3526,103 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
         .unwrap();
     assert_eq!(plan.active_claims.len(), 10);
 }
+
+#[test]
+fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let before = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Preference,
+            "editor",
+            "value",
+            json!("vim"),
+            &[],
+            "remember-before",
+        )
+        .unwrap()
+        .data;
+    let first = fixture.event("user", "stream", "first", Sensitivity::Normal, "e1");
+    let second = fixture.event("user", "stream", "second", Sensitivity::Normal, "e2");
+    let plan = plan_run(&mut fixture, "user", "stream", "plan");
+    assert_eq!(plan.active_claims.len(), 1);
+
+    let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
+    let saved: String = conn
+        .query_row(
+            "SELECT result_json FROM memory_operations WHERE idempotency_key='plan'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved).unwrap(),
+        json!({"plannedRunId": plan.run_id})
+    );
+
+    // Replay keeps the run and its exact events but shows current claims.
+    let added = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Preference,
+            "shell",
+            "value",
+            json!("zsh"),
+            &[],
+            "remember-after",
+        )
+        .unwrap()
+        .data;
+    let replay = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap();
+    assert!(replay.operation.replayed);
+    let replayed = replay.data.into_plan().unwrap();
+    assert_eq!(replayed.run_id, plan.run_id);
+    assert_eq!(
+        replayed.events.iter().map(|e| &e.id).collect::<Vec<_>>(),
+        [&first.id, &second.id]
+    );
+    assert_eq!(
+        serde_json::to_value(&replayed.events).unwrap(),
+        serde_json::to_value(&plan.events).unwrap()
+    );
+    let mut claim_ids: Vec<&str> = replayed
+        .active_claims
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    claim_ids.sort_unstable();
+    let mut expected = vec![before.id.as_str(), added.id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(claim_ids, expected);
+
+    // Purging a claim the plan showed leaves the plan replayable.
+    fixture
+        .store
+        .purge_claim(&before.id, "purge-claim")
+        .unwrap();
+    let after_purge = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_eq!(after_purge.active_claims.len(), 1);
+
+    // Purging one of the run's events tombstones the saved plan.
+    fixture.store.purge_event(&first.id, "purge-event").unwrap();
+    let error = fixture
+        .store
+        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::PrivacyPurged
+    );
+}
