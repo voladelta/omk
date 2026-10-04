@@ -2273,6 +2273,20 @@ fn current_schema_reopens_without_rewriting_data() {
             columns
         );
     }
+    // Purge drops tombstoned refs by key; without this index it scans every ref.
+    let ref_plan: Vec<String> = connection
+        .prepare("EXPLAIN QUERY PLAN DELETE FROM memory_operation_refs WHERE idempotency_key='k'")
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        ref_plan
+            .iter()
+            .any(|step| step.contains("memory_operation_refs_by_key")),
+        "{ref_plan:?}"
+    );
     assert!(
         table_columns(&connection, "observation_runs")
             .iter()

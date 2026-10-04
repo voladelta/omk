@@ -208,4 +208,7 @@ CREATE TABLE IF NOT EXISTS memory_operation_refs (
     idempotency_key TEXT NOT NULL REFERENCES memory_operations(idempotency_key) ON DELETE CASCADE,
     PRIMARY KEY(record_id, idempotency_key)
 );
+
+CREATE INDEX IF NOT EXISTS memory_operation_refs_by_key
+ON memory_operation_refs(idempotency_key);
 "#;
