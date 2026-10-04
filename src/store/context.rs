@@ -465,8 +465,19 @@ impl MemoryStore {
             Some(257),
         )?);
         let pending_truncated = pending_claims.len() > 256;
-        sort_claims_by_scope(&mut pending_claims, &visible);
+        pending_claims.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         pending_claims.truncate(256);
+        pending_claims.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        sort_claims_by_scope(&mut pending_claims, &visible);
         let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
             "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
         let required_tokens: i64 = estimate_tokens(&empty_payload.to_string())

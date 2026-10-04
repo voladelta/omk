@@ -2726,3 +2726,42 @@ fn reflected_observations_do_not_starve_new_unreflected_observations() {
         assert!(!context.diagnostics.truncated);
     }
 }
+
+#[test]
+fn pending_claim_backlog_keeps_the_newest_claims_in_context() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.event("user", "stream", "seed", Sensitivity::Normal, "seed");
+    let mut ids = Vec::new();
+    for index in 0..260 {
+        let claim = fixture
+            .store
+            .propose_claim(
+                "user",
+                ClaimKind::Decision,
+                "backlog",
+                &format!("item-{index}"),
+                json!(index),
+                &[],
+                &format!("propose-{index}"),
+            )
+            .unwrap()
+            .data;
+        ids.push(claim.id);
+    }
+    let context = fixture
+        .store
+        .compose_context("user", "stream", 1_000_000, 0, None)
+        .unwrap();
+    let shown: Vec<&str> = context
+        .pending_claims
+        .iter()
+        .map(|claim| claim.id.as_str())
+        .collect();
+    assert_eq!(shown.len(), 256);
+    assert!(context.diagnostics.truncated);
+    assert!(shown.contains(&ids[259].as_str()));
+    assert!(!shown.contains(&ids[0].as_str()));
+    assert_eq!(shown[0], ids[4]);
+    assert_eq!(shown[255], ids[259]);
+}

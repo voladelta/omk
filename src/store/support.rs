@@ -710,9 +710,11 @@ pub(super) fn query_claim_candidates(
         sql.push_str(" AND status=?");
         values.push(status.to_owned());
     }
-    sql.push_str(" ORDER BY created_at,id");
+    // A limited read keeps the newest candidates; callers reorder for display.
     if let Some(limit) = limit {
-        sql.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(&format!(" ORDER BY created_at DESC,id LIMIT {limit}"));
+    } else {
+        sql.push_str(" ORDER BY created_at,id");
     }
     let mut statement = conn.prepare(&sql)?;
     collect_rows(statement.query_map(rusqlite::params_from_iter(values), row_claim)?)
