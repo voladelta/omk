@@ -2336,10 +2336,13 @@ fn current_schema_reopens_without_rewriting_data() {
             .iter()
             .any(|(name, _, _)| name == "purged")
     );
-    assert!(
-        !operation_columns
+    // Compaction ages saved results by when the operation committed.
+    assert_eq!(
+        operation_columns
             .iter()
-            .any(|(name, _, _)| name == "created_at")
+            .find(|(name, _, _)| name == "created_at")
+            .map(|(_, not_null, _)| *not_null),
+        Some(1)
     );
     assert_eq!(
         operation_columns
@@ -3621,6 +3624,83 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
         .store
         .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
         .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::PrivacyPurged
+    );
+}
+
+#[test]
+fn old_results_compact_to_keys_that_still_block_duplicates() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let old = fixture.event("user", "stream", "old", Sensitivity::Normal, "old");
+    let conn = Connection::open(fixture._directory.path().join("memory.db")).unwrap();
+    let expired = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+    conn.execute(
+        "UPDATE memory_operations SET created_at=?1 WHERE idempotency_key='old'",
+        [&expired],
+    )
+    .unwrap();
+
+    // Any later write compacts the expired result but keeps key and hash.
+    fixture.event("user", "stream", "new", Sensitivity::Normal, "new");
+    let (hash, result): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT request_hash,result_json FROM memory_operations WHERE idempotency_key='old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(hash.is_some());
+    assert!(result.is_none());
+    let fresh: Option<String> = conn
+        .query_row(
+            "SELECT result_json FROM memory_operations WHERE idempotency_key='new'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(fresh.is_some());
+
+    let replay = |content: &str| NewEvent {
+        scope_id: "user".to_owned(),
+        stream_id: "stream".to_owned(),
+        kind: EventKind::UserMessage,
+        actor_id: Some("user".to_owned()),
+        occurred_at: None,
+        content: json!(content),
+        token_count: Some(10),
+        sensitivity: Sensitivity::Normal,
+        metadata: json!({}),
+        idempotency_key: "old".to_owned(),
+    };
+    let error = fixture.store.append_event(replay("old")).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::OperationExpired
+    );
+    let error = fixture.store.append_event(replay("changed")).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().unwrap().kind(),
+        KernelErrorKind::IdempotencyConflict
+    );
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(events, 2);
+
+    // Refs survive compaction, so a purge still clears the request hash.
+    fixture.store.purge_event(&old.id, "purge").unwrap();
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT request_hash FROM memory_operations WHERE idempotency_key='old'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(hash.is_none());
+    let error = fixture.store.append_event(replay("old")).unwrap_err();
     assert_eq!(
         error.downcast_ref::<KernelError>().unwrap().kind(),
         KernelErrorKind::PrivacyPurged

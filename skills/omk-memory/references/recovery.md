@@ -23,4 +23,6 @@ For privacy purges, inspect the reported dependent records, `dependentViewIds`, 
 
 Purged operation tombstones discard both the saved result and request hash. A `privacy_purged` replay error is not a reason to use a new key to restore deleted evidence. Unrelated operations remain replayable. If the purge response was lost, retry the identical purge with its original key to read its saved result.
 
+For `operation_expired`, the operation committed more than 30 days ago and its saved result was compacted. Do not retry with a new key; read the target event, claim, run or view directly. Replays of `observe plan` rebuild the plan from its run, so its active claims and continuation reflect current state.
+
 Recovery is complete when inspection proves either one accepted write, a safe corrected retry path, or an explicit unresolved blocker. Report the operation code, whether the key remains reusable, and the required next action.

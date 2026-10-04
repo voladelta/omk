@@ -47,6 +47,8 @@ An identical retry returns the original data with `replayed: true`. If another p
 
 `do-not-store` is the exception. It replays requests when only the payload, metadata or token hint changes. OMK keeps no fingerprint derived from that data.
 
+Saved results are kept for 30 days. After that, each write compacts a small batch of expired operations down to their key, operation name and request hash. A compacted key still rejects changed input with `idempotency_conflict`. An identical retry returns `operation_expired` instead of running the operation again: it already committed, so inspect its records instead of retrying. A purge still tombstones compacted operations that mention a purged record.
+
 `observe plan` saves only its run ID. A replay rebuilds the plan: it keeps the same run and exact event range, but active claims and the previous continuation reflect the store at replay time. Storing whole plans made them most of the operation log, because each plan copied every active claim.
 
 Failures are JSON on standard error:

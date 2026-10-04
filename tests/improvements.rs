@@ -256,7 +256,7 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
     // Installed after opening the store; these counters are fixture-only instrumentation.
     conn.execute_batch("CREATE TABLE run_updates(id TEXT);
         CREATE TRIGGER count_run_update AFTER UPDATE ON observation_runs BEGIN INSERT INTO run_updates VALUES (NEW.id); END;
-        INSERT INTO memory_operations VALUES ('already-purged','event.append',NULL,NULL);").unwrap();
+        INSERT INTO memory_operations VALUES ('already-purged','event.append',NULL,NULL,'2026-01-01T00:00:00+00:00');").unwrap();
     let purge = store.purge_event(&source.id, "purge").unwrap();
     assert_eq!(purge["purgedCommandEvents"], 2);
     assert_eq!(purge["affectedRunIds"].as_array().unwrap().len(), 3);

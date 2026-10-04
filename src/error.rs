@@ -9,6 +9,7 @@ pub enum KernelErrorKind {
     StaleView,
     StaleObservationRun,
     PrivacyPurged,
+    OperationExpired,
     NotFound,
     ScopeViolation,
     InvalidSearchQuery,
@@ -52,6 +53,10 @@ impl KernelError {
 
     pub fn privacy_purged(message: impl Into<String>) -> Self {
         Self::new(KernelErrorKind::PrivacyPurged, message)
+    }
+
+    pub fn operation_expired(message: impl Into<String>) -> Self {
+        Self::new(KernelErrorKind::OperationExpired, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {

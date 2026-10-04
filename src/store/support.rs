@@ -396,6 +396,11 @@ pub(super) fn ensure_scope_exists(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Saved results older than this are compacted to their key and request hash.
+pub(super) const RESULT_RETENTION_DAYS: i64 = 30;
+/// Most expired results one write compacts, which bounds the work per write.
+const COMPACTION_BATCH: i64 = 64;
+
 pub(super) fn prior_result<T: DeserializeOwned>(
     conn: &Connection,
     key: &str,
@@ -418,9 +423,6 @@ pub(super) fn prior_result<T: DeserializeOwned>(
             "idempotency key was already used for {operation}, not {expected_operation}"
         ),)
     );
-    let result_json = result_json.ok_or_else(|| {
-        KernelError::privacy_purged("the prior result for this idempotency key was privacy-purged")
-    })?;
     let request_hash = request_hash.ok_or_else(|| {
         KernelError::privacy_purged("the prior request for this idempotency key was privacy-purged")
     })?;
@@ -430,6 +432,13 @@ pub(super) fn prior_result<T: DeserializeOwned>(
             "idempotency conflict: this key was already used with different request input",
         )
     );
+    // A compacted operation keeps its request hash, so the key still blocks
+    // a duplicate write even though the result can no longer be replayed.
+    let result_json = result_json.ok_or_else(|| {
+        KernelError::operation_expired(format!(
+            "the result for this idempotency key is older than {RESULT_RETENTION_DAYS} days and was compacted"
+        ))
+    })?;
     Ok(Some(serde_json::from_str(&result_json).with_context(
         || format!("reading stored result for idempotency key {key}"),
     )?))
@@ -443,9 +452,24 @@ pub(super) fn save_operation<T: Serialize + ?Sized>(
     result: &T,
 ) -> Result<()> {
     let result_json = serde_json::to_string(result)?;
+    let timestamp = Utc::now();
     conn.execute(
-        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json) VALUES (?1,?2,?3,?4)",
-        params![key, operation, request_hash, result_json],
+        "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json,created_at) VALUES (?1,?2,?3,?4,?5)",
+        params![key, operation, request_hash, result_json, timestamp.to_rfc3339()],
+    )?;
+    // Compact a bounded batch of expired results on every write, so the log
+    // keeps keys and request hashes but sheds old result bodies.
+    conn.execute(
+        "UPDATE memory_operations SET result_json=NULL
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operations
+             WHERE result_json IS NOT NULL AND created_at < ?1
+             ORDER BY created_at LIMIT ?2
+         )",
+        params![
+            (timestamp - chrono::Duration::days(RESULT_RETENTION_DAYS)).to_rfc3339(),
+            COMPACTION_BATCH
+        ],
     )?;
     // Index every record ID in the result so a purge can find the operations
     // to tombstone without scanning them all.

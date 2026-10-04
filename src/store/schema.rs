@@ -200,8 +200,12 @@ CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
     request_hash TEXT,
-    result_json TEXT
+    result_json TEXT,
+    created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS memory_operations_compactable
+ON memory_operations(created_at) WHERE result_json IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS memory_operation_refs (
     record_id TEXT NOT NULL,

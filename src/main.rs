@@ -1021,6 +1021,12 @@ fn classify_error(
             false,
             Some("use a new idempotency key without restoring purged data"),
         ),
+        KernelErrorKind::OperationExpired => (
+            "operation_expired",
+            false,
+            false,
+            Some("the operation already committed; inspect the target records instead of retrying"),
+        ),
         KernelErrorKind::NotFound => {
             if key_reusable_for_command {
                 (
@@ -1186,5 +1192,18 @@ mod tests {
         let classified = classified(KernelErrorKind::SchemaMismatch, "schema mismatch", false);
         assert_eq!(classified.0, "schema_mismatch");
         assert!(classified.3.is_some_and(|action| action.contains("v7")));
+    }
+
+    #[test]
+    fn expired_operations_are_final_and_point_at_the_records() {
+        let classified = classified(KernelErrorKind::OperationExpired, "expired", true);
+        assert_eq!(classified.0, "operation_expired");
+        assert!(!classified.1);
+        assert!(!classified.2);
+        assert!(
+            classified
+                .3
+                .is_some_and(|action| action.contains("inspect"))
+        );
     }
 }
