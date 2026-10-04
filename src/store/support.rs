@@ -440,11 +440,39 @@ pub(super) fn save_operation<T: Serialize + ?Sized>(
     request_hash: &str,
     result: &T,
 ) -> Result<()> {
+    let result_json = serde_json::to_string(result)?;
     conn.execute(
         "INSERT INTO memory_operations(idempotency_key,operation,request_hash,result_json) VALUES (?1,?2,?3,?4)",
-        params![key, operation, request_hash, serde_json::to_string(result)?],
+        params![key, operation, request_hash, result_json],
     )?;
+    // Index every record ID in the result so a purge can find the operations
+    // to tombstone without scanning them all.
+    let mut record_ids = HashSet::new();
+    collect_uuid_strings(&serde_json::from_str(&result_json)?, &mut record_ids);
+    let mut insert = conn.prepare_cached(
+        "INSERT OR IGNORE INTO memory_operation_refs(record_id,idempotency_key) VALUES (?1,?2)",
+    )?;
+    for record_id in record_ids {
+        insert.execute(params![record_id, key])?;
+    }
     Ok(())
+}
+
+fn collect_uuid_strings(value: &Value, found: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            if Uuid::parse_str(text).is_ok() {
+                found.insert(text.clone());
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_uuid_strings(item, found)),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|item| collect_uuid_strings(item, found)),
+        _ => {}
+    }
 }
 
 pub(super) fn operation_request_hash(operation: &str, request: &impl Serialize) -> Result<String> {
@@ -459,10 +487,23 @@ pub(super) fn scrub_operations_referencing(conn: &Connection, record_ids: &[&str
     if record_ids.is_empty() {
         return Ok(());
     }
+    let record_ids = serde_json::to_string(record_ids)?;
     conn.execute(
         "UPDATE memory_operations SET request_hash=NULL,result_json=NULL
-         WHERE EXISTS (SELECT 1 FROM json_each(?1) WHERE instr(result_json,value)>0)",
-        [serde_json::to_string(record_ids)?],
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
+    )?;
+    // A tombstone keeps no result, so it keeps no record IDs either.
+    conn.execute(
+        "DELETE FROM memory_operation_refs
+         WHERE idempotency_key IN (
+             SELECT idempotency_key FROM memory_operation_refs
+             WHERE record_id IN (SELECT value FROM json_each(?1))
+         )",
+        [&record_ids],
     )?;
     Ok(())
 }
@@ -530,6 +571,29 @@ pub(super) fn insert_fts(
         "INSERT INTO memory_fts(record_type,record_id,scope_id,text) VALUES (?1,?2,?3,?4)",
         params![record_type, record_id, scope_id, text],
     )?;
+    // record_id is UNINDEXED, so remember the rowid for deletes by key.
+    conn.execute(
+        "INSERT INTO memory_fts_refs(record_type,record_id,fts_rowid) VALUES (?1,?2,?3)",
+        params![record_type, record_id, conn.last_insert_rowid()],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_fts(conn: &Connection, record_type: &str, record_id: &str) -> Result<()> {
+    let rowid: Option<i64> = conn
+        .query_row(
+            "SELECT fts_rowid FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
+            params![record_type, record_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(rowid) = rowid {
+        conn.execute("DELETE FROM memory_fts WHERE rowid=?1", [rowid])?;
+        conn.execute(
+            "DELETE FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
+            params![record_type, record_id],
+        )?;
+    }
     Ok(())
 }
 

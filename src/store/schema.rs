@@ -189,10 +189,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     text
 );
 
+CREATE TABLE IF NOT EXISTS memory_fts_refs (
+    record_type TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    fts_rowid INTEGER NOT NULL,
+    PRIMARY KEY(record_type, record_id)
+);
+
 CREATE TABLE IF NOT EXISTS memory_operations (
     idempotency_key TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
     request_hash TEXT,
     result_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_operation_refs (
+    record_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL REFERENCES memory_operations(idempotency_key) ON DELETE CASCADE,
+    PRIMARY KEY(record_id, idempotency_key)
 );
 "#;

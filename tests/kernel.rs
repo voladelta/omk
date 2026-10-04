@@ -2255,6 +2255,29 @@ fn current_schema_reopens_without_rewriting_data() {
     for removed in ["valid_from", "valid_to", "expires_at"] {
         assert!(!claim_columns.iter().any(|(name, _, _)| name == removed));
     }
+    for (table, columns) in [
+        (
+            "memory_operation_refs",
+            vec!["record_id", "idempotency_key"],
+        ),
+        (
+            "memory_fts_refs",
+            vec!["record_type", "record_id", "fts_rowid"],
+        ),
+    ] {
+        assert_eq!(
+            table_columns(&connection, table)
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            columns
+        );
+    }
+    assert!(
+        table_columns(&connection, "observation_runs")
+            .iter()
+            .any(|(name, not_null, _)| name == "truncated_event_ids_json" && *not_null == 1)
+    );
     let claim_source_columns = table_columns(&connection, "claim_sources");
     assert_eq!(
         claim_source_columns
@@ -3106,5 +3129,165 @@ fn duplicate_scopes_and_finished_runs_fail_with_typed_errors() {
     assert_eq!(
         again.downcast_ref::<KernelError>().map(KernelError::kind),
         Some(KernelErrorKind::InvalidInput)
+    );
+}
+
+fn raw_count(fixture: &Fixture, sql: &str, value: &str) -> i64 {
+    Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row(sql, [value], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn saved_append_results_never_hold_secret_content_or_metadata() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let appended = fixture
+        .store
+        .append_event(NewEvent {
+            scope_id: "user".to_owned(),
+            stream_id: "stream".to_owned(),
+            kind: EventKind::ToolResult,
+            actor_id: None,
+            occurred_at: None,
+            content: json!("SECRET-CONTENT-7"),
+            token_count: None,
+            sensitivity: Sensitivity::Secret,
+            metadata: json!({"token": "SECRET-METADATA-9"}),
+            idempotency_key: "secret".to_owned(),
+        })
+        .unwrap();
+    let saved: String = Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row(
+            "SELECT result_json FROM memory_operations WHERE idempotency_key='secret'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!saved.contains("SECRET-CONTENT-7"));
+    assert!(!saved.contains("SECRET-METADATA-9"));
+    assert!(saved.contains(&appended.data.id));
+    assert_eq!(
+        fixture
+            .store
+            .get_event(&reveal("user"), &appended.data.id)
+            .unwrap()
+            .content,
+        json!("SECRET-CONTENT-7")
+    );
+}
+
+#[test]
+fn purges_find_operations_and_search_rows_through_side_tables() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let doomed = fixture.event(
+        "user",
+        "stream",
+        "doomed marker",
+        Sensitivity::Normal,
+        "doomed-event",
+    );
+    let kept = fixture.event(
+        "user",
+        "stream",
+        "kept marker",
+        Sensitivity::Normal,
+        "kept-event",
+    );
+    let claim = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            json!("ETH"),
+            std::slice::from_ref(&kept.id),
+            "claim",
+        )
+        .unwrap();
+    let refs = "SELECT COUNT(*) FROM memory_operation_refs WHERE record_id=?1";
+    let fts = "SELECT COUNT(*) FROM memory_fts_refs WHERE record_id=?1";
+    let rows = "SELECT COUNT(*) FROM memory_fts WHERE record_id=?1";
+    assert_eq!(raw_count(&fixture, refs, &doomed.id), 1);
+    assert_eq!(raw_count(&fixture, fts, &doomed.id), 1);
+    assert_eq!(raw_count(&fixture, rows, &doomed.id), 1);
+
+    fixture
+        .store
+        .purge_event(&doomed.id, "purge-doomed")
+        .unwrap();
+    assert_eq!(raw_count(&fixture, fts, &doomed.id), 0);
+    assert_eq!(raw_count(&fixture, rows, &doomed.id), 0);
+    // The tombstoned append no longer keeps its record IDs; the purge result does.
+    assert_eq!(raw_count(&fixture, refs, &doomed.id), 1);
+    assert_eq!(
+        raw_count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_operation_refs WHERE idempotency_key=?1",
+            "doomed-event"
+        ),
+        0
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .append_event(NewEvent {
+                scope_id: "user".to_owned(),
+                stream_id: "stream".to_owned(),
+                kind: EventKind::UserMessage,
+                actor_id: Some("user".to_owned()),
+                occurred_at: None,
+                content: Value::String("doomed marker".to_owned()),
+                token_count: Some(10),
+                sensitivity: Sensitivity::Normal,
+                metadata: json!({}),
+                idempotency_key: "doomed-event".to_owned(),
+            })
+            .unwrap_err()
+            .downcast_ref::<KernelError>()
+            .map(KernelError::kind),
+        Some(KernelErrorKind::PrivacyPurged)
+    ));
+    // Unrelated operations and search rows survive.
+    assert_eq!(raw_count(&fixture, rows, &kept.id), 1);
+    assert_eq!(
+        fixture
+            .store
+            .search_full_text("user", "kept marker", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        fixture
+            .store
+            .remember_claim(
+                "user",
+                ClaimKind::Decision,
+                "launch",
+                "asset",
+                json!("ETH"),
+                std::slice::from_ref(&kept.id),
+                "claim",
+            )
+            .unwrap()
+            .operation
+            .replayed
+    );
+
+    fixture.store.purge_claim(&claim.id, "purge-claim").unwrap();
+    assert_eq!(raw_count(&fixture, fts, &claim.id), 0);
+    assert_eq!(raw_count(&fixture, rows, &claim.id), 0);
+    assert_eq!(
+        raw_count(
+            &fixture,
+            "SELECT COUNT(*) FROM memory_operation_refs WHERE idempotency_key=?1",
+            "claim"
+        ),
+        0
     );
 }
