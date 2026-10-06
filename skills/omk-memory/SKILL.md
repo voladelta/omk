@@ -48,7 +48,7 @@ Use `single` when one value may be active in the logical slot and `set` when dis
 
 OMK matches a slot on the exact subject string. The same thing under two names becomes two active `single` claims, and a correction under one name leaves the other stale. Keep one subject per entity:
 
-1. Before writing a claim about a named thing, run `recall search --current-only --terms` on the name the source used. Reuse the subject of any matching claim verbatim.
+1. Before writing a claim about a named thing, run `recall search --current-only --terms` on the name the source used. Read only hits that carry `claimStatus`; event hits echo every claim write. Reuse the subject of any matching claim verbatim.
 2. For a new entity, pick one stable canonical subject. Record each other name the user states or approves as an alias: `claim remember --kind entity-alias --subject CANONICAL --predicate alias --cardinality set`, with the other name as the value. Do not alias names nobody used. Aliases are active claims and spend the claim budget.
 3. When the name resolves to aliases of more than one subject, or to none and you cannot tell whether it is new, stop and ask. Do not write under the raw name. Search also matches subject text, so check that the alias value, not the canonical subject, matched.
 4. For links between entities, use `--kind relationship` with the canonical subject, a stable predicate such as `depends_on`, `--cardinality set`, and the target's canonical name as the value.
