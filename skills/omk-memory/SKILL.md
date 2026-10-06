@@ -44,6 +44,17 @@ Use claims for structured state, with `subject` and `predicate` stable across co
 
 Use `single` when one value may be active in the logical slot and `set` when distinct values may coexist. In context and plans, a `single` claim in a deeper scope shadows the same slot in an ancestor scope; the shadowed claim appears only in `diagnostics.omittedItems`. A claim is correctly represented only when its scope, modality, cardinality, provenance, and status all match the source.
 
+### Name entities once
+
+OMK matches a slot on the exact subject string. The same thing under two names becomes two active `single` claims, and a correction under one name leaves the other stale. Keep one subject per entity:
+
+1. Before writing a claim about a named thing, run `recall search --current-only --terms` on the name the source used. Reuse the subject of any matching claim verbatim.
+2. For a new entity, pick one stable canonical subject. Record each other name the user states or approves as an alias: `claim remember --kind entity-alias --subject CANONICAL --predicate alias --cardinality set`, with the other name as the value. Do not alias names nobody used. Aliases are active claims and spend the claim budget.
+3. When the name resolves to aliases of more than one subject, or to none and you cannot tell whether it is new, stop and ask. Do not write under the raw name. Search also matches subject text, so check that the alias value, not the canonical subject, matched.
+4. For links between entities, use `--kind relationship` with the canonical subject, a stable predicate such as `depends_on`, `--cardinality set`, and the target's canonical name as the value.
+
+OMK does not enforce any of this; the alias and relationship kinds carry no special behavior.
+
 ## Maintain and retrieve memory
 
 - For new unobserved history or continuity maintenance, follow [observe and reflect](references/observe-and-reflect.md).
