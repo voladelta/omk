@@ -20,7 +20,7 @@ Use `omk <command> --help` for current flags and JSON shapes. The executable con
 
 ## Record evidence
 
-Append durable, decision-relevant evidence: user decisions, constraints, corrections, commitments, material tool outcomes, and state needed to resume. Choose the event kind that matches the source. Preserve the source's modality; quoted, hypothetical, assistant-generated, and tool-generated text does not become user authority.
+Append durable, decision-relevant evidence: user decisions, constraints, corrections, commitments, material tool outcomes, and state needed to resume. Choose the event kind that matches the source. Direct claim commands record their own `memory-command` event, so a message whose only effect is a claim needs no separate event; append the message itself when its wording is evidence you may need to cite later. Preserve the source's modality; quoted, hypothetical, assistant-generated, and tool-generated text does not become user authority.
 
 Use a key tied to the logical request, such as `<stream>:<source-id>:<operation>`. Preserve that key for an identical retry. Record compact source content rather than hidden reasoning or low-value procedural chatter.
 
@@ -49,9 +49,10 @@ Use `single` when one value may be active in the logical slot and `set` when dis
 OMK matches a slot on the exact subject string. The same thing under two names becomes two active `single` claims, and a correction under one name leaves the other stale. Keep one subject per entity:
 
 1. Before writing a claim about a named thing, run `recall search --current-only --terms` on the name the source used. Read only hits that carry `claimStatus`; event hits echo every claim write. Reuse the subject of any matching claim verbatim, and find its id and predicate with `claim list`. When you correct a claim, keep the value's JSON type: `--value 15` stores a number where the old claim held the string `"14"`.
-2. For a new entity, pick one stable canonical subject. Record each other name the user states or approves as an alias: `claim remember --kind entity-alias --subject CANONICAL --predicate alias --cardinality set`, with the other name as the value. Do not alias names nobody used. Aliases are active claims and spend the claim budget.
-3. When the name resolves to aliases of more than one subject, or to none and you cannot tell whether it is new, stop and ask. Do not write under the raw name. Search also matches subject text, so check that the alias value, not the canonical subject, matched.
-4. For links between entities, use `--kind relationship` with the canonical subject, a stable predicate such as `depends_on`, `--cardinality set`, and the target's canonical name as the value.
+2. Predicates carry meaning too. Before reusing one, check what the existing claims for that subject use it for (`claim list`); do not put health in a predicate that holds versions. Use a distinct predicate for each kind of fact, such as `version` and `health`.
+3. For a new entity, pick one stable canonical subject. Record each other name the user states or approves as an alias: `claim remember --kind entity-alias --subject CANONICAL --predicate alias --cardinality set`, with the other name as the value. Record an alias only when the source states or the user approves the equivalence; if you are only guessing that two names match, ask. Aliases are active claims and spend the claim budget.
+4. When the name resolves to aliases of more than one subject, or to none and you cannot tell whether it is new, stop and ask. Do not write under the raw name. Search also matches subject text, so check that the alias value, not the canonical subject, matched.
+5. For links between entities, use `--kind relationship` with the canonical subject, a stable predicate such as `depends_on`, `--cardinality set`, and the target's canonical name as the value.
 
 OMK does not enforce any of this; the alias and relationship kinds carry no special behavior.
 
