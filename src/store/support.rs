@@ -1475,75 +1475,99 @@ pub(super) fn search_fts(
         values
     };
 
-    // ORDER BY rank takes FTS5's fast path. Boosts are applied while reading
-    // rows in rank order: once a row's best possible boosted score cannot beat
-    // the page's worst, no later row can either.
-    let mut statement = conn.prepare(&format!(
-        "SELECT record_type,record_id,scope_id,substr(text,1,512),rank FROM memory_fts
-         WHERE memory_fts MATCH ?{exact_scope} AND rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
-         ORDER BY rank"
-    ))?;
+    // Each boost class is read separately through FTS5's ORDER BY rank fast
+    // path. Events and observations share one boost per class, so their top
+    // `limit` rows by rank are their top rows after boosting too. Claim boosts
+    // depend on status, so claims stream last and stop once a row's best
+    // possible boosted score cannot reach the page.
+    let SearchTypes {
+        claims,
+        observations,
+        events,
+    } = options.types;
+    let all = !(claims || observations || events);
     let mut claim_lookup =
         conn.prepare_cached("SELECT status,subject,predicate FROM claims WHERE id=?1")?;
-    let mut rows = statement
-        .query(rusqlite::params_from_iter(values(&full)))
-        .map_err(invalid)?;
     let mut hits: Vec<SearchHit> = Vec::new();
-    while let Some(row) = rows.next().map_err(invalid)? {
-        let rank: f64 = row.get(4)?;
-        // hits stays sorted, so its last entry is the page's worst.
-        if hits.len() >= limit
-            && hits
-                .last()
-                .is_some_and(|worst| rank * MAX_BOOST > worst.rank)
-        {
-            break;
-        }
-        let record_type: String = row.get(0)?;
-        let scope_id: String = row.get(2)?;
-        if !visible.contains(scope_id.as_str()) {
+    for (class, wanted) in [
+        ("event", events),
+        ("observation", observations),
+        ("claim", claims),
+    ] {
+        if !(all || wanted) {
             continue;
         }
-        let id: String = row.get(1)?;
-        let (status, subject, predicate) = if record_type == "claim" {
-            let (status, subject, predicate) = claim_lookup.query_row([&id], |row| {
-                Ok((
-                    parse_enum::<ClaimStatus>(&row.get::<_, String>(0)?)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            (Some(status), Some(subject), Some(predicate))
-        } else {
-            (None, None, None)
-        };
-        if options.current_only && status.as_ref().is_some_and(|s| *s != ClaimStatus::Active) {
-            continue;
+        let bounded = class == "claim";
+        let expression = format!("({full}) AND (facet : {})", facet_type_token(class));
+        let mut statement = conn.prepare(&format!(
+            "SELECT record_type,record_id,scope_id,substr(text,1,512),rank FROM memory_fts
+             WHERE memory_fts MATCH ?{exact_scope} AND rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
+             ORDER BY rank{}",
+            if bounded { "" } else { " LIMIT ?" }
+        ))?;
+        let mut class_values = values(&expression);
+        if !bounded {
+            class_values.push(rusqlite::types::Value::Integer(limit as i64));
         }
-        let hit = SearchHit {
-            rank: rank * search_boost(&record_type, status.as_ref()),
-            record_type,
-            id,
-            scope_id,
-            text: row.get(3)?,
-            claim_status: status,
-            subject,
-            predicate,
-        };
-        let position = hits.partition_point(|other| {
-            other
-                .rank
-                .total_cmp(&hit.rank)
-                .then_with(|| other.record_type.cmp(&hit.record_type))
-                .then_with(|| other.id.cmp(&hit.id))
-                .is_lt()
-        });
-        if position < limit {
-            hits.insert(position, hit);
-            hits.truncate(limit);
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(class_values))
+            .map_err(invalid)?;
+        while let Some(row) = rows.next().map_err(invalid)? {
+            let rank: f64 = row.get(4)?;
+            // hits stays sorted, so its last entry is the page's worst.
+            if bounded
+                && hits.len() >= limit
+                && hits
+                    .last()
+                    .is_some_and(|worst| rank * MAX_BOOST > worst.rank)
+            {
+                break;
+            }
+            let record_type: String = row.get(0)?;
+            let scope_id: String = row.get(2)?;
+            if !visible.contains(scope_id.as_str()) {
+                continue;
+            }
+            let id: String = row.get(1)?;
+            let (status, subject, predicate) = if record_type == "claim" {
+                let (status, subject, predicate) = claim_lookup.query_row([&id], |row| {
+                    Ok((
+                        parse_enum::<ClaimStatus>(&row.get::<_, String>(0)?)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                (Some(status), Some(subject), Some(predicate))
+            } else {
+                (None, None, None)
+            };
+            if options.current_only && status.as_ref().is_some_and(|s| *s != ClaimStatus::Active) {
+                continue;
+            }
+            let hit = SearchHit {
+                rank: rank * search_boost(&record_type, status.as_ref()),
+                record_type,
+                id,
+                scope_id,
+                text: row.get(3)?,
+                claim_status: status,
+                subject,
+                predicate,
+            };
+            let position = hits.partition_point(|other| {
+                other
+                    .rank
+                    .total_cmp(&hit.rank)
+                    .then_with(|| other.record_type.cmp(&hit.record_type))
+                    .then_with(|| other.id.cmp(&hit.id))
+                    .is_lt()
+            });
+            if position < limit {
+                hits.insert(position, hit);
+                hits.truncate(limit);
+            }
         }
     }
-    drop(rows);
     if !count {
         let shown = hits.len();
         return Ok(SearchPage::new(hits, shown, shown, limit));
