@@ -276,7 +276,42 @@ Search treats your input as a literal phrase. Punctuation and hyphens are safe:
 omk recall search --scope project:omk --query 'settlement ETH-only'
 ```
 
-Search returns a preview of at most 512 Unicode characters in `text`, with `claimStatus` for claim hits. Use exact recall to read full evidence. The default includes historical claims and matches a literal phrase. `--terms` matches all whitespace-separated literal terms; `--fts-query` enables raw FTS5 syntax and conflicts with `--terms`. `--current-only` filters claims to active status while retaining matching events and observations. Queries allow at most 4,096 UTF-8 bytes and 64 whitespace terms. Results sort by rank, record type, then record ID.
+Search returns a page:
+
+```json
+{"hits": [...], "shown": 20, "matched": 57, "searchable": 4210, "nextAction": "37 more matches not shown; raise --limit (now 20) or narrow the query"}
+```
+
+`matched` counts every hit the filters allow, not just the page. `searchable` counts the records the scope and filters allow before the query runs. Together they separate three cases an empty or full page used to hide: more hits past `--limit` (`matched > shown`), a real miss (`matched: 0`, `searchable > 0`), and a scope or filter with nothing in it (`searchable: 0`). `nextAction` names the case.
+
+Each hit has a preview of at most 512 Unicode characters in `text`, with `claimStatus`, `subject` and `predicate` for claim hits. Use exact recall to read full evidence. The default includes historical claims and matches a literal phrase. `--terms` matches all whitespace-separated literal terms; `--fts-query` enables raw FTS5 syntax and conflicts with `--terms`. `--current-only` filters claims to active status while retaining matching events and observations. Queries allow at most 4,096 UTF-8 bytes and 64 whitespace terms.
+
+Narrow a search with these flags:
+
+- `--type claim|observation|event` returns only those record types; repeat it for several
+- `--field subject|predicate|value` matches only that part of a claim, so a search for a name in alias values does not match every claim whose subject holds the name; the default `text` field matches the whole record
+- `--include-commands` adds the `memory-command` events that every direct claim write records; search leaves them out by default because each repeats its claim
+
+Scope, record type and command filters are tokens in the full-text index, so they narrow the match itself rather than filtering its rows afterwards. Search still checks each hit's exact scope ID. Above 64 visible scopes the scope tokens are skipped and only the exact check applies.
+
+Results sort by BM25 multiplied by a record boost, then record type and record ID. Active claims count double, pending and disputed claims and observations count 1.25, events count 1, and superseded, rejected and expired claims count 0.5. `rank` reports that product; lower sorts first.
+
+## Resolve entity names
+
+`recall resolve` maps a name to the subject of existing active claims:
+
+```sh
+omk recall resolve --scope project:omk --name 'Dr. Alice Moreau'
+```
+
+It compares the name against every active subject and every string value of an active `entity-alias` claim in the visible scopes. Four tiers run in order, and the first with a match decides:
+
+1. exact: the name equals a subject or alias
+2. name: equal after case folding and replacing punctuation with spaces
+3. contains: one side contains the other as whole words, with at least 3 characters on the shorter side
+4. fuzzy: an edit distance (with adjacent swaps) of at most one per 5 characters, capped at 3, against the whole name or, for a one-word query, any word of at least 4 characters
+
+`status` is `resolved` for one subject at the exact or name tier, `probable` for one subject at the contains or fuzzy tier, `ambiguous` for several subjects, and `none` otherwise. Each candidate lists the names that matched, whether through the subject or an alias, and the alias claim ID. `consideredSubjects` and `consideredAliases` tell an empty store from a real miss. Placeholder names such as `unknown`, `n/a` and `tbd` never match, and resolving one returns `invalid_input`. A nickname nobody recorded, such as `Bob` for `Robert`, does not match; record it as an alias once the user confirms it.
 
 Use `--fts-query` only when you need SQLite FTS5 syntax.
 
@@ -306,7 +341,7 @@ OMK indexes the record IDs in each saved operation result and the search row of 
 
 ## Use the current schema
 
-OMK 0.7 uses schema v7. Existing schema v7 databases reopen without changes.
+OMK 0.8 uses schema v8. Existing schema v8 databases reopen without changes. Schema v8 split the full-text index into text, subject, predicate, value and filter columns, so OMK 0.8 cannot open a schema v7 database; start a fresh one.
 
 Opening a database compares its required table, column, constraint, index, and FTS definitions against the schema created by OMK. A missing or changed definition returns `schema_mismatch` before record writes. The comparison is deliberately exact for OMK-created databases; it does not repair altered schemas or replace a full integrity check.
 
@@ -320,7 +355,7 @@ Omit `--expected-previous-view` only for generation 1.
 
 Each stream has its own view chain. Every view links to the exact previous view. A stale commit fails without writing. The previous view stays active after a failed reflection.
 
-OMK 0.7 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure: `secure_delete` does not reach copies in the write-ahead log (WAL) before a checkpoint, backups or filesystem snapshots.
+OMK 0.8 does not provide project-wide views, historical claim state queries or encryption at rest. It does not guarantee forensic erasure: `secure_delete` does not reach copies in the write-ahead log (WAL) before a checkpoint, backups or filesystem snapshots.
 
 `--scope` states the agent's intent and prevents accidental scope leaks. It does not authenticate a process that can choose another scope or read the database.
 
@@ -342,6 +377,7 @@ The integration tests cover:
 - concurrency and recovery
 - command provenance and claim authority
 - scope retrieval, per-source recall checks and full-text search modes
+- search page counts, index-level filters, ranking boosts and name resolution tiers
 - hard context budgets and deduplication through inherited continuity views
 - overlapping purge dependencies and preservation of unrelated replays
 - structured CLI errors and exact evidence recall

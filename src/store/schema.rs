@@ -186,7 +186,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     record_type UNINDEXED,
     record_id UNINDEXED,
     scope_id UNINDEXED,
-    text
+    text,
+    subject,
+    predicate,
+    value,
+    facet
 );
 
 CREATE TABLE IF NOT EXISTS memory_fts_refs (

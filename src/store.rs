@@ -13,16 +13,18 @@ use uuid::Uuid;
 use crate::model::*;
 use crate::{KernelError, KernelErrorKind};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 mod claim;
 mod context;
 mod observation;
 mod privacy;
+mod resolve;
 mod rows;
 mod schema;
 mod support;
 
+use resolve::*;
 use rows::*;
 use schema::SCHEMA;
 use support::*;
@@ -119,10 +121,16 @@ fn insert_event(conn: &Connection, input: EventInsert) -> Result<MemoryEvent> {
     if event.sensitivity == Sensitivity::Normal {
         insert_fts(
             conn,
-            "event",
-            &event.id,
-            &event.scope_id,
-            &searchable_json(&event.content),
+            &FtsRow {
+                record_type: "event",
+                record_id: &event.id,
+                scope_id: &event.scope_id,
+                kind: &enum_text(&event.kind),
+                text: &searchable_json(&event.content),
+                subject: "",
+                predicate: "",
+                value: "",
+            },
         )?;
     }
     Ok(event)

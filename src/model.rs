@@ -484,9 +484,54 @@ pub struct SearchHit {
     pub id: String,
     pub scope_id: String,
     pub text: String,
+    /// BM25 multiplied by the record boost; lower sorts first.
     pub rank: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_status: Option<ClaimStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+}
+
+/// One bounded search answer. `matched` counts every hit the filters allow,
+/// and `searchable` counts the records the filters allow before the query, so
+/// an empty page separates "no match" from "nothing here to match".
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub shown: usize,
+    pub matched: usize,
+    pub searchable: usize,
+    pub next_action: Option<String>,
+}
+
+impl SearchPage {
+    pub fn new(hits: Vec<SearchHit>, matched: usize, searchable: usize, limit: usize) -> Self {
+        let shown = hits.len();
+        let next_action = if searchable == 0 {
+            Some("no searchable records in this scope with these filters; check --scope (siblings are not searched) and the type filters".to_owned())
+        } else if matched == 0 {
+            Some(format!(
+                "no match among {searchable} searchable records; try --terms or fewer words before treating the fact as unknown"
+            ))
+        } else if matched > shown {
+            Some(format!(
+                "{} more matches not shown; raise --limit (now {limit}) or narrow the query",
+                matched - shown
+            ))
+        } else {
+            None
+        };
+        Self {
+            hits,
+            shown,
+            matched,
+            searchable,
+            next_action,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -497,11 +542,92 @@ pub enum SearchMode {
     Advanced,
 }
 
+/// Record types a search may return. All false means all types.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchTypes {
+    pub claims: bool,
+    pub observations: bool,
+    pub events: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SearchField {
+    /// Full record text: claim subject, predicate and value, or event and observation content.
+    #[default]
+    Text,
+    /// Claim subject only.
+    Subject,
+    /// Claim predicate only.
+    Predicate,
+    /// Claim value only.
+    Value,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchOptions {
     pub mode: SearchMode,
     /// Filter claims to active status; events and observations remain searchable.
     pub current_only: bool,
+    pub types: SearchTypes,
+    pub field: SearchField,
+    /// Also return `memory-command` events, which repeat each direct claim write.
+    pub include_commands: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolveStatus {
+    /// One subject matched exactly or by normalized name.
+    Resolved,
+    /// One subject matched only by containment or spelling distance.
+    Probable,
+    /// More than one subject matched at the best tier.
+    Ambiguous,
+    /// No subject matched.
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolveTier {
+    Exact,
+    Name,
+    Contains,
+    Fuzzy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedName {
+    pub name: String,
+    /// `subject` or `alias`.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    pub scope_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveCandidate {
+    pub subject: String,
+    pub matched: Vec<ResolvedName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resolution {
+    pub query: String,
+    pub status: ResolveStatus,
+    pub tier: Option<ResolveTier>,
+    pub candidates: Vec<ResolveCandidate>,
+    /// Distinct active subjects and alias names compared against the query.
+    pub considered_subjects: usize,
+    pub considered_aliases: usize,
+    pub next_action: String,
 }
 
 /// Evidence query used during context composition.
