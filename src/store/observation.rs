@@ -99,15 +99,15 @@ impl MemoryStore {
                     }
                     // An oversized first event would block the stream forever, so
                     // cover it with a stub the observer cannot cite.
-                    event = truncate_event_for_budget(event, max_tokens - tokens).map_err(
-                        |stub_cost| {
-                            KernelError::budget_exceeded(format!(
-                                "observation budget too small: minimumRequiredTokens={} for required state and first event",
-                                tokens.saturating_add(stub_cost)
-                            ))
-                        },
-                    )?;
+                    event = stub_event_for_budget(event);
                     cost = serialized_item_tokens(&event);
+                    ensure!(
+                        cost <= max_tokens - tokens,
+                        KernelError::budget_exceeded(format!(
+                            "observation budget too small: minimumRequiredTokens={} for required state and first event",
+                            tokens.saturating_add(cost)
+                        ))
+                    );
                     truncated_event_ids.push(event.id.clone());
                 }
                 tokens += cost;
@@ -502,24 +502,15 @@ fn render_planned_run(conn: &Connection, run_id: &str, max_tokens: i64) -> Resul
         active_claims,
         previous_continuation,
     };
-    let tokens = estimate_tokens(&plan.model_payload().to_string()).saturating_add(
-        plan.previous_continuation
-            .as_ref()
-            .map_or(0, view_hint_extra),
-    );
     plan.events = query_events_range(conn, &run.stream_id, run.from_sequence, run.to_sequence)?
         .into_iter()
         .map(redact_for_agent)
         .map(|event| {
-            if !run.truncated_event_ids.contains(&event.id) {
-                return event;
+            if run.truncated_event_ids.contains(&event.id) {
+                stub_event_for_budget(event)
+            } else {
+                event
             }
-            truncate_event_for_budget(event.clone(), max_tokens - tokens).unwrap_or_else(
-                |empty_cost| {
-                    truncate_event_for_budget(event, empty_cost)
-                        .expect("an empty stub fits its cost")
-                },
-            )
         })
         .collect();
     Ok(plan)

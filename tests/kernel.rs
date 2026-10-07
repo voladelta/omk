@@ -3070,10 +3070,24 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
     assert_eq!(stub.id, big.id);
     assert_eq!(stub.content["truncated"], json!(true));
     assert_eq!(stub.content["reason"], json!("exceeds observation budget"));
-    let preview = stub.content["preview"].as_str().unwrap();
-    assert!(!preview.is_empty() && preview.len() < 4_000);
+    // No cut text: the observer sees none of the event, only what it costs.
+    assert!(stub.content.get("preview").is_none());
+    assert!(!stub.content.to_string().contains("xxxx"));
+    assert!(stub.content["eventTokens"].as_i64().unwrap() > 1_000);
     assert_eq!(stub.metadata, json!({}));
-    assert_eq!(plan.to_sequence, 1);
+    let replayed = fixture
+        .store
+        .plan_observation("user", "stream", 400, "fake", "v1", "plan")
+        .unwrap();
+    assert!(replayed.operation.replayed);
+    assert_eq!(
+        replayed.data.into_plan().unwrap().events[0].content,
+        stub.content
+    );
+    // The stub is small, so the next event fits the same plan whole.
+    assert_eq!(plan.to_sequence, 2);
+    assert_eq!(plan.events[1].id, small.id);
+    assert_eq!(plan.events[1].content, json!("small"));
 
     // The stored event is intact, but the observer cannot cite the stub.
     let error = fixture
@@ -3085,26 +3099,28 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
         Some(KernelErrorKind::InvalidInput)
     );
     assert!(error.to_string().contains("truncated event"));
-    let empty = ObserverResult {
-        observations: vec![],
-        claims: vec![],
-        continuation: ContinuationDraft::default(),
-        ambiguities: vec![],
-        empty_reason: Some("only a truncated event".to_owned()),
-    };
     fixture
         .store
-        .commit_observation(&plan.run_id, empty, "commit-empty")
+        .commit_observation(
+            &plan.run_id,
+            observer_result(&small.id, "ETH"),
+            "cite-small",
+        )
         .unwrap();
     let status = fixture
         .store
         .stream_status(&access("user"), "stream")
         .unwrap();
-    assert_eq!(status.observed_through_sequence, 1);
-
-    let next = plan_run(&mut fixture, "user", "stream", "next-plan");
-    assert_eq!(next.events[0].id, small.id);
-    assert_eq!(next.events[0].content, json!("small"));
+    assert_eq!(status.observed_through_sequence, 2);
+    assert!(
+        fixture
+            .store
+            .plan_observation("user", "stream", 400, "fake", "v1", "next-plan")
+            .unwrap()
+            .data
+            .into_plan()
+            .is_none()
+    );
     assert_eq!(
         fixture
             .store

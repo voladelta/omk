@@ -251,49 +251,24 @@ pub(super) fn redact_for_agent(mut event: MemoryEvent) -> MemoryEvent {
     event
 }
 
-/// Replace an event that cannot fit the observation budget with a stub whose
-/// preview keeps as much serialized content as `available_tokens` allows.
-/// Returns the cost of an empty stub when even that does not fit.
-pub(super) fn truncate_event_for_budget(
-    event: MemoryEvent,
-    available_tokens: i64,
-) -> std::result::Result<MemoryEvent, i64> {
-    let serialized = event.content.to_string();
-    let stub = |chars: usize| {
-        let content = json!({
-            "truncated": true,
-            "reason": "exceeds observation budget",
-            "preview": serialized.chars().take(chars).collect::<String>(),
-        });
-        let metadata = json!({});
-        MemoryEvent {
-            content_hash: hash_json(&content),
-            token_count: estimate_event_tokens(&content, &metadata),
-            content,
-            metadata,
-            ..event.clone()
-        }
-    };
-    let cost = |chars: usize| serialized_item_tokens(&stub(chars));
-    let empty_cost = cost(0);
-    if empty_cost > available_tokens {
-        return Err(empty_cost);
+/// Replace an event that cannot fit the observation budget with a stub that
+/// holds none of its content: an observer shown part of an event acts on half
+/// of it. `eventTokens` is the whole event's cost, so a caller knows the budget
+/// that would include it.
+pub(super) fn stub_event_for_budget(event: MemoryEvent) -> MemoryEvent {
+    let content = json!({
+        "truncated": true,
+        "reason": "exceeds observation budget",
+        "eventTokens": serialized_item_tokens(&event).saturating_add(event_hint_extra(&event)),
+    });
+    let metadata = json!({});
+    MemoryEvent {
+        content_hash: hash_json(&content),
+        token_count: estimate_event_tokens(&content, &metadata),
+        content,
+        metadata,
+        ..event
     }
-    // Four characters per token bounds the preview, and cost grows with length.
-    let mut low = 0;
-    let mut high = serialized
-        .chars()
-        .count()
-        .min((available_tokens as usize).saturating_mul(4));
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        if cost(middle) <= available_tokens {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    Ok(stub(low))
 }
 
 pub(super) struct ResolvedReadAccess<'a> {
