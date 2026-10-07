@@ -3,12 +3,12 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
-use clap::{Args, Parser, Subcommand, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use omk::{
     ClaimCardinality, ClaimKind, ClaimStatus, ContextQuery, EventKind, KernelError,
     KernelErrorKind, MAX_OBSERVER_BYTES, MemoryStore, MutationResult, NewEvent, ObserverResult,
-    ReadAccess, SCHEMA_VERSION, ScopeKind, SearchMode, SearchOptions, Sensitivity, ViewKind,
-    store::CreateView,
+    ReadAccess, SCHEMA_VERSION, ScopeKind, SearchField, SearchMode, SearchOptions, SearchTypes,
+    Sensitivity, ViewKind, store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -409,6 +409,25 @@ enum RecallCommand {
         /// Return only active claims, alongside matching events and observations.
         #[arg(long)]
         current_only: bool,
+        /// Return only these record types; repeat the flag for several.
+        #[arg(long = "type", value_enum)]
+        types: Vec<RecordType>,
+        /// Match only this field. Subject, predicate and value hold claim parts only.
+        #[arg(long, value_enum, default_value_t = SearchField::Text)]
+        field: SearchField,
+        /// Also return memory-command events, which repeat every direct claim write.
+        #[arg(long)]
+        include_commands: bool,
+    },
+    #[command(
+        after_help = "Tiers run in order and the first with a match decides: exact subject or alias, normalized name (case and punctuation ignored), whole-word containment, then spelling distance. Only active claims count; entity-alias claims with string values supply aliases."
+    )]
+    /// Resolve a name to the subject of existing active claims.
+    Resolve {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        name: String,
     },
     /// Return a claim with its exact source events.
     ExplainClaim {
@@ -419,6 +438,13 @@ enum RecallCommand {
         #[arg(long)]
         reveal_secret: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RecordType {
+    Claim,
+    Observation,
+    Event,
 }
 
 #[derive(Debug, Args)]
@@ -800,6 +826,9 @@ fn run(cli: Cli) -> Result<()> {
                 fts_query,
                 terms,
                 current_only,
+                types,
+                field,
+                include_commands,
             } => {
                 let mode = if fts_query {
                     SearchMode::Advanced
@@ -808,13 +837,26 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     SearchMode::Phrase
                 };
-                let hits = store.search_with_options(
+                let page = store.search_page(
                     &scope,
                     &query,
                     limit,
-                    SearchOptions { mode, current_only },
+                    SearchOptions {
+                        mode,
+                        current_only,
+                        types: SearchTypes {
+                            claims: types.contains(&RecordType::Claim),
+                            observations: types.contains(&RecordType::Observation),
+                            events: types.contains(&RecordType::Event),
+                        },
+                        field,
+                        include_commands,
+                    },
                 )?;
-                print_json(&hits)?;
+                print_json(&page)?;
+            }
+            RecallCommand::Resolve { scope, name } => {
+                print_json(&store.resolve_name(&scope, &name)?)?;
             }
             RecallCommand::ExplainClaim {
                 scope,
@@ -841,7 +883,7 @@ fn run(cli: Cli) -> Result<()> {
                     } else {
                         SearchMode::Phrase
                     },
-                    current_only: false,
+                    ..Default::default()
                 },
             });
             if args.compact {
@@ -957,6 +999,16 @@ fn is_sqlite_contention(cause: &(dyn std::error::Error + 'static)) -> bool {
     )
 }
 
+/// Recovery hint for a schema mismatch, naming the schema this build opens.
+fn schema_mismatch_action() -> &'static str {
+    static ACTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ACTION.get_or_init(|| {
+        format!(
+            "restore a valid schema v{SCHEMA_VERSION} database from backup; do not delete existing data"
+        )
+    })
+}
+
 fn classify_error(
     error: &anyhow::Error,
     key_reusable_for_command: bool,
@@ -983,7 +1035,7 @@ fn classify_error(
             "schema_mismatch",
             false,
             true,
-            Some("restore a valid schema v7 database from backup; do not delete existing data"),
+            Some(schema_mismatch_action()),
         ),
         KernelErrorKind::IdempotencyConflict => (
             "idempotency_conflict",
@@ -1191,7 +1243,8 @@ mod tests {
     fn schema_mismatch_recovery_names_the_current_schema() {
         let classified = classified(KernelErrorKind::SchemaMismatch, "schema mismatch", false);
         assert_eq!(classified.0, "schema_mismatch");
-        assert!(classified.3.is_some_and(|action| action.contains("v7")));
+        let schema = format!("schema v{} database", omk::SCHEMA_VERSION);
+        assert!(classified.3.is_some_and(|action| action.contains(&schema)));
     }
 
     #[test]

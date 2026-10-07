@@ -550,7 +550,8 @@ fn cli_literal_search_and_observer_errors_are_agent_safe() {
             "purge-derived marker",
         ],
     );
-    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(hits["matched"], 1);
 
     let plan = success_json(
         &db,

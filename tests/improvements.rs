@@ -711,7 +711,7 @@ fn search_modes_status_previews_and_cli_are_explicit() {
     );
     let options = SearchOptions {
         mode: SearchMode::Terms,
-        current_only: false,
+        ..Default::default()
     };
     let hits = store
         .search_with_options("thread", "rare identifier", 10, options)
@@ -787,7 +787,7 @@ fn search_modes_status_previews_and_cli_are_explicit() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json[0]["id"], raw.id);
+    assert_eq!(json["hits"][0]["id"], raw.id);
     let conflict = Command::new(env!("CARGO_BIN_EXE_omk"))
         .args([
             "--db",

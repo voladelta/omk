@@ -237,10 +237,16 @@ impl MemoryStore {
             }
             insert_fts(
                 &tx,
-                "observation",
-                &observation.id,
-                &observation.scope_id,
-                &observation.content,
+                &FtsRow {
+                    record_type: "observation",
+                    record_id: &observation.id,
+                    scope_id: &observation.scope_id,
+                    kind: &enum_text(&observation.kind),
+                    text: &observation.content,
+                    subject: "",
+                    predicate: "",
+                    value: "",
+                },
             )?;
             observations.push(observation);
         }

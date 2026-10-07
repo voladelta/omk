@@ -302,7 +302,7 @@ impl MemoryStore {
             limit,
             SearchOptions {
                 mode: SearchMode::Advanced,
-                current_only: false,
+                ..Default::default()
             },
         )
     }
@@ -314,6 +314,29 @@ impl MemoryStore {
         limit: usize,
         options: SearchOptions,
     ) -> Result<Vec<SearchHit>> {
+        Ok(self.search(scope_id, query, limit, options, false)?.hits)
+    }
+
+    /// Search with `matched` and `searchable` counts, so an empty or full
+    /// page says whether more exists.
+    pub fn search_page(
+        &self,
+        scope_id: &str,
+        query: &str,
+        limit: usize,
+        options: SearchOptions,
+    ) -> Result<SearchPage> {
+        self.search(scope_id, query, limit, options, true)
+    }
+
+    fn search(
+        &self,
+        scope_id: &str,
+        query: &str,
+        limit: usize,
+        options: SearchOptions,
+        count: bool,
+    ) -> Result<SearchPage> {
         validate_nonempty("search query", query)?;
         ensure!(
             limit > 0 && limit <= 1000,
@@ -324,13 +347,15 @@ impl MemoryStore {
         );
         let scope_ids = retrieval_scope_ids(&self.conn, scope_id)?;
         let fts_query = bounded_fts_query(query, options.mode)?;
-        search_fts(
-            &self.conn,
-            &scope_ids,
-            &fts_query,
-            limit,
-            options.current_only,
-        )
+        search_fts(&self.conn, &scope_ids, &fts_query, limit, options, count)
+    }
+
+    /// Resolve a name to the subject of active claims: exact subject or alias,
+    /// then normalized name, then whole-word containment, then spelling
+    /// distance. The first tier with a match decides.
+    pub fn resolve_name(&self, scope_id: &str, name: &str) -> Result<Resolution> {
+        let scope_ids = retrieval_scope_ids(&self.conn, scope_id)?;
+        resolve_name(&self.conn, &scope_ids, name)
     }
 
     pub fn compose_context(
