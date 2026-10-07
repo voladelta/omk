@@ -84,20 +84,20 @@ fn search_pages_count_matches_and_tell_empty_scopes_from_misses() {
     let page = store
         .search_page("user", "orchid", 2, SearchOptions::default())
         .unwrap();
-    assert_eq!((page.shown, page.matched, page.searchable), (2, 5, 5));
+    assert_eq!((page.shown, page.matched, page.searchable), (2, 5, None));
     assert!(page.next_action.unwrap().contains("3 more matches"));
 
     let miss = store
         .search_page("user", "tulip", 10, SearchOptions::default())
         .unwrap();
-    assert_eq!((miss.shown, miss.matched, miss.searchable), (0, 0, 5));
+    assert_eq!((miss.shown, miss.matched, miss.searchable), (0, 0, Some(5)));
     assert!(miss.next_action.unwrap().contains("no match among 5"));
 
     // A sibling scope has nothing visible, which is not the same as no match.
     let empty = store
         .search_page("sibling", "orchid", 10, SearchOptions::default())
         .unwrap();
-    assert_eq!((empty.matched, empty.searchable), (0, 0));
+    assert_eq!((empty.matched, empty.searchable), (0, Some(0)));
     assert!(empty.next_action.unwrap().contains("no searchable records"));
 
     let exact = store
@@ -144,7 +144,13 @@ fn command_echoes_types_and_fields_filter_inside_the_match() {
     assert_eq!(claims.matched, 2);
     assert!(claims.hits.iter().all(|hit| hit.record_type == "claim"));
     assert_eq!(claims.hits[0].subject.as_deref(), Some("Alice Moreau"));
-    assert_eq!(claims.searchable, 2);
+    assert_eq!(
+        store
+            .search_page("user", "tulip", 20, claims_only)
+            .unwrap()
+            .searchable,
+        Some(2)
+    );
 
     // A value search skips the subject, so only the email value matches.
     let values = store
@@ -213,7 +219,14 @@ fn search_reaches_every_scope_past_the_facet_limit() {
     let page = store
         .search_page("user", "quartz", 1000, SearchOptions::default())
         .unwrap();
-    assert_eq!((page.shown, page.matched, page.searchable), (70, 70, 70));
+    assert_eq!((page.shown, page.matched, page.searchable), (70, 70, None));
+    assert_eq!(
+        store
+            .search_page("user", "tulip", 10, SearchOptions::default())
+            .unwrap()
+            .searchable,
+        Some(70)
+    );
     let one = store
         .search_page("child-3", "quartz", 10, SearchOptions::default())
         .unwrap();
@@ -481,8 +494,9 @@ fn every_scope_strategy_returns_exactly_the_visible_records() {
     let excluded = page(&store, "root", "basalt", 1000);
     assert_eq!(
         (excluded.shown, excluded.matched, excluded.searchable),
-        (71, 71, 71)
+        (71, 71, None)
     );
+    assert_eq!(page(&store, "root", "tulip", 10).searchable, Some(71));
     assert!(
         excluded
             .hits
@@ -503,7 +517,11 @@ fn every_scope_strategy_returns_exactly_the_visible_records() {
         );
     }
     let exact = page(&store, "root", "basalt", 1000);
-    assert_eq!((exact.shown, exact.matched, exact.searchable), (71, 71, 71));
+    assert_eq!(
+        (exact.shown, exact.matched, exact.searchable),
+        (71, 71, None)
+    );
+    assert_eq!(page(&store, "root", "tulip", 10).searchable, Some(71));
     assert!(
         exact
             .hits
@@ -630,4 +648,88 @@ fn resolve_keeps_projects_and_versions_apart() {
         ResolveStatus::Probable,
         &["Project Apollo"],
     );
+}
+
+#[test]
+fn broad_queries_filter_scope_with_index_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    for index in 0..70 {
+        let scope = format!("child-{index}");
+        store
+            .create_scope(&scope, ScopeKind::Task, Some("thread"), None, &scope)
+            .unwrap();
+    }
+    // More matches than the selective cutoff, so scope comes from tokens.
+    for index in 0..1100 {
+        event(
+            &mut store,
+            "thread",
+            &format!("granite {index}"),
+            &format!("e{index}"),
+        );
+    }
+    for index in 0..5 {
+        event(
+            &mut store,
+            "sibling",
+            "granite outside",
+            &format!("s{index}"),
+        );
+    }
+    // 72 visible scopes and one hidden: excluded-scope tokens.
+    let excluded = page(&store, "user", "granite", 10);
+    assert_eq!((excluded.shown, excluded.matched), (10, 1100));
+    // Three visible scopes: included-scope tokens.
+    let included = page(&store, "child-3", "granite", 10);
+    assert_eq!((included.shown, included.matched), (10, 1100));
+    assert!(included.hits.iter().all(|hit| hit.scope_id == "thread"));
+    let outside = page(&store, "sibling", "granite", 10);
+    assert_eq!(outside.matched, 5);
+}
+
+#[test]
+fn broad_boosted_pages_agree_with_deeper_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    let words = ["ember", "flint", "garnet", "hazel"];
+    for index in 0..1050 {
+        let text = format!("ember {} {}", words[index % 4], "filler ".repeat(index % 9));
+        event(&mut store, "thread", &text, &format!("e{index}"));
+    }
+    for index in 0..80 {
+        let text = format!("ember {} {}", words[index % 4], "filler ".repeat(index % 5));
+        let claim = fact(
+            &mut store,
+            &format!("S{index}"),
+            "note",
+            &text,
+            &format!("c{index}"),
+        );
+        if index % 3 == 0 {
+            store
+                .correct_claim(
+                    &claim.id,
+                    json!(format!("{text} v2")),
+                    &[],
+                    &format!("x{index}"),
+                )
+                .unwrap();
+        }
+    }
+    for current_only in [false, true] {
+        let options = SearchOptions {
+            current_only,
+            ..Default::default()
+        };
+        let deep = store.search_page("user", "ember", 1000, options).unwrap();
+        assert!(deep.matched > 1000, "broad path expected: {}", deep.matched);
+        for limit in [1, 7, 40, 200] {
+            let top = store.search_page("user", "ember", limit, options).unwrap();
+            let expected: Vec<&str> = deep.hits[..limit].iter().map(|h| h.id.as_str()).collect();
+            let got: Vec<&str> = top.hits.iter().map(|h| h.id.as_str()).collect();
+            assert_eq!(got, expected, "limit {limit} current_only {current_only}");
+            assert_eq!(top.matched, deep.matched);
+        }
+    }
 }

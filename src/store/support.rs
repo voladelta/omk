@@ -1336,6 +1336,9 @@ pub(super) fn budget_claims(
 const MAX_SCOPE_FACETS: usize = 64;
 /// Highest record boost; bounds how far a later rank row can climb.
 const MAX_BOOST: f64 = 2.0;
+/// Queries matching at most this many rows before scope filtering check each
+/// row's scope exactly instead of merging scope tokens.
+const SELECTIVE_ROWS: usize = 1000;
 
 /// How a search limits scope. Tokens keep the match inside the index;
 /// `Exact` reads each matching row's scope, which costs a content lookup.
@@ -1431,7 +1434,7 @@ pub(super) fn search_fts(
     count: bool,
 ) -> Result<SearchPage> {
     if scope_ids.is_empty() {
-        return Ok(SearchPage::new(Vec::new(), 0, 0, limit));
+        return Ok(SearchPage::new(Vec::new(), 0, Some(0), limit));
     }
     let column = match options.field {
         SearchField::Text => "text",
@@ -1443,7 +1446,7 @@ pub(super) fn search_fts(
     let visible: HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
     // The query sits inside a column filter; bounded_fts_query keeps its
     // parentheses balanced so it cannot escape into the facet filters.
-    let full = facet_match(&format!("{{{column}}} : ({query})"), &scope, &options);
+    let column_query = format!("{{{column}}} : ({query})");
     // FTS5 reports bad query syntax as a plain SQLITE_ERROR while stepping;
     // busy and other failures keep their own classification.
     let invalid = |error: rusqlite::Error| -> anyhow::Error {
@@ -1457,56 +1460,116 @@ pub(super) fn search_fts(
             _ => error.into(),
         }
     };
-    let exact_scope = if matches!(scope, ScopeFilter::Exact) {
-        format!(
-            " AND memory_fts.scope_id IN ({})",
-            std::iter::repeat_n("?", scope_ids.len())
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    } else {
-        String::new()
+    let exact_sql = format!(
+        " AND memory_fts.scope_id IN ({})",
+        std::iter::repeat_n("?", scope_ids.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let scope_sql = |filter: &ScopeFilter| {
+        if matches!(filter, ScopeFilter::Exact) {
+            exact_sql.as_str()
+        } else {
+            ""
+        }
     };
-    let values = |expression: &str| {
+    let values = |filter: &ScopeFilter, expression: &str| {
         let mut values = vec![rusqlite::types::Value::Text(expression.to_owned())];
-        if !exact_scope.is_empty() {
+        if matches!(filter, ScopeFilter::Exact) {
             values.extend(scope_ids.iter().cloned().map(rusqlite::types::Value::Text));
         }
         values
     };
+    let raw_count = |filter: &ScopeFilter, expression: &str| -> Result<i64> {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?{}",
+                scope_sql(filter)
+            ),
+            rusqlite::params_from_iter(values(filter, expression)),
+            |row| row.get(0),
+        )
+        .map_err(invalid)
+    };
+    let count_of = |filter: &ScopeFilter, expression: &str| -> Result<usize> {
+        let exact_scope = scope_sql(filter);
+        let mut total = raw_count(filter, expression)?;
+        // Under --current-only, claims that are not active are counted
+        // separately and subtracted.
+        if options.current_only {
+            let claims = format!("({expression}) AND (facet : {})", facet_type_token("claim"));
+            let inactive: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM memory_fts JOIN claims ON claims.id=memory_fts.record_id
+                         WHERE memory_fts MATCH ?{exact_scope} AND claims.status!='active'"
+                    ),
+                    rusqlite::params_from_iter(values(filter, &claims)),
+                    |row| row.get(0),
+                )
+                .map_err(invalid)?;
+            total -= inactive;
+        }
+        Ok(total as usize)
+    };
+    // A selective query, counted from the index without scope, reads all
+    // of its rows once: the exact scope check costs one content read per
+    // row, and the read rows give `matched` without another count. A broad
+    // query filters scope with tokens, whose cost follows the visible scopes'
+    // postings instead of the matches.
+    let unscoped = facet_match(&column_query, &ScopeFilter::Everything, &options);
+    let selective = raw_count(&ScopeFilter::Everything, &unscoped)? <= SELECTIVE_ROWS as i64;
+    let match_scope = if selective && !matches!(scope, ScopeFilter::Everything) {
+        &ScopeFilter::Exact
+    } else {
+        &scope
+    };
+    let full = facet_match(&column_query, match_scope, &options);
+    let exact_scope = scope_sql(match_scope);
 
-    // Each boost class is read separately through FTS5's ORDER BY rank fast
-    // path. Events and observations share one boost per class, so their top
-    // `limit` rows by rank are their top rows after boosting too. Claim boosts
-    // depend on status, so claims stream last and stop once a row's best
-    // possible boosted score cannot reach the page.
+    // A broad query reads each boost class separately through FTS5's ORDER BY
+    // rank fast path. Events and observations share one boost per class, so
+    // their top `limit` rows by rank are their top rows after boosting too.
+    // Claim boosts depend on status, so claims stream last and stop once a
+    // row's best possible boosted score cannot reach the page.
     let SearchTypes {
         claims,
         observations,
         events,
     } = options.types;
     let all = !(claims || observations || events);
+    let plans: Vec<Option<&str>> = if selective {
+        vec![None]
+    } else {
+        [
+            ("event", events),
+            ("observation", observations),
+            ("claim", claims),
+        ]
+        .into_iter()
+        .filter(|(_, wanted)| all || *wanted)
+        .map(|(class, _)| Some(class))
+        .collect()
+    };
     let mut claim_lookup =
         conn.prepare_cached("SELECT status,subject,predicate FROM claims WHERE id=?1")?;
     let mut hits: Vec<SearchHit> = Vec::new();
-    for (class, wanted) in [
-        ("event", events),
-        ("observation", observations),
-        ("claim", claims),
-    ] {
-        if !(all || wanted) {
-            continue;
-        }
-        let bounded = class == "claim";
-        let expression = format!("({full}) AND (facet : {})", facet_type_token(class));
+    let mut qualified = 0;
+    for class in plans {
+        let limited = matches!(class, Some("event" | "observation"));
+        let bounded = class == Some("claim");
+        let expression = match class {
+            Some(class) => format!("({full}) AND (facet : {})", facet_type_token(class)),
+            None => full.clone(),
+        };
         let mut statement = conn.prepare(&format!(
             "SELECT record_type,record_id,scope_id,substr(text,1,512),rank FROM memory_fts
              WHERE memory_fts MATCH ?{exact_scope} AND rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
              ORDER BY rank{}",
-            if bounded { "" } else { " LIMIT ?" }
+            if limited { " LIMIT ?" } else { "" }
         ))?;
-        let mut class_values = values(&expression);
-        if !bounded {
+        let mut class_values = values(match_scope, &expression);
+        if limited {
             class_values.push(rusqlite::types::Value::Integer(limit as i64));
         }
         let mut rows = statement
@@ -1544,6 +1607,7 @@ pub(super) fn search_fts(
             if options.current_only && status.as_ref().is_some_and(|s| *s != ClaimStatus::Active) {
                 continue;
             }
+            qualified += 1;
             let hit = SearchHit {
                 rank: rank * search_boost(&record_type, status.as_ref()),
                 record_type,
@@ -1570,42 +1634,28 @@ pub(super) fn search_fts(
     }
     if !count {
         let shown = hits.len();
-        return Ok(SearchPage::new(hits, shown, shown, limit));
+        return Ok(SearchPage::new(hits, shown, None, limit));
     }
-    // Counts come from the index alone. Under --current-only, claims that
-    // are not active are counted separately and subtracted.
-    let count_of = |expression: &str| -> Result<usize> {
-        let mut total: i64 = conn
-            .query_row(
-                &format!("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?{exact_scope}"),
-                rusqlite::params_from_iter(values(expression)),
-                |row| row.get(0),
-            )
-            .map_err(invalid)?;
-        if options.current_only {
-            let claims = format!("({expression}) AND (facet : {})", facet_type_token("claim"));
-            let inactive: i64 = conn
-                .query_row(
-                    &format!(
-                        "SELECT count(*) FROM memory_fts JOIN claims ON claims.id=memory_fts.record_id
-                         WHERE memory_fts MATCH ?{exact_scope} AND claims.status!='active'"
-                    ),
-                    rusqlite::params_from_iter(values(&claims)),
-                    |row| row.get(0),
-                )
-                .map_err(invalid)?;
-            total -= inactive;
-        }
-        Ok(total as usize)
+    let matched = if selective {
+        qualified
+    } else {
+        count_of(match_scope, &full)?.max(hits.len())
     };
-    let matched = count_of(&full)?.max(hits.len());
-    let any_record = format!(
-        "facet : ({})",
-        ["claim", "observation", "event"]
-            .map(facet_type_token)
-            .join(" OR ")
-    );
-    let searchable = count_of(&facet_match(&any_record, &scope, &options))?;
+    // Searchable only matters for an empty page, so it is counted only then.
+    let searchable = if matched == 0 {
+        let any_record = format!(
+            "facet : ({})",
+            ["claim", "observation", "event"]
+                .map(facet_type_token)
+                .join(" OR ")
+        );
+        Some(count_of(
+            &scope,
+            &facet_match(&any_record, &scope, &options),
+        )?)
+    } else {
+        None
+    };
     Ok(SearchPage::new(hits, matched, searchable, limit))
 }
 

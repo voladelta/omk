@@ -494,25 +494,32 @@ pub struct SearchHit {
     pub predicate: Option<String>,
 }
 
-/// One bounded search answer. `matched` counts every hit the filters allow,
-/// and `searchable` counts the records the filters allow before the query, so
-/// an empty page separates "no match" from "nothing here to match".
+/// One bounded search answer. `matched` counts every hit the filters allow.
+/// On an empty page, `searchable` counts the records the filters allow before
+/// the query, separating "no match" from "nothing here to match".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchPage {
     pub hits: Vec<SearchHit>,
     pub shown: usize,
     pub matched: usize,
-    pub searchable: usize,
+    /// Counted only when `matched` is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searchable: Option<usize>,
     pub next_action: Option<String>,
 }
 
 impl SearchPage {
-    pub fn new(hits: Vec<SearchHit>, matched: usize, searchable: usize, limit: usize) -> Self {
+    pub fn new(
+        hits: Vec<SearchHit>,
+        matched: usize,
+        searchable: Option<usize>,
+        limit: usize,
+    ) -> Self {
         let shown = hits.len();
-        let next_action = if searchable == 0 {
+        let next_action = if searchable == Some(0) {
             Some("no searchable records in this scope with these filters; check --scope (siblings are not searched) and the type filters".to_owned())
-        } else if matched == 0 {
+        } else if let (0, Some(searchable)) = (matched, searchable) {
             Some(format!(
                 "no match among {searchable} searchable records; try --terms or fewer words before treating the fact as unknown"
             ))
