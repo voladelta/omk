@@ -319,6 +319,22 @@ Search includes the target scope, its ancestors and its descendants. Context inh
 
 Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
 
+### Measure search
+
+`examples/search_bench.rs` drives `omk` binaries only through the CLI, so one run compares schema versions on an identical synthetic world: 120 people with recorded aliases and corrected facts, plus 4,000 chat events that mention them on a Zipf curve. Run `cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency]`.
+
+Against OMK 0.7, using the omk-memory skill's earlier procedure (search the name, then read each claim hit):
+
+| task | OMK 0.7 | OMK 0.8 |
+|---|---|---|
+| resolve 426 name mentions, correct | 71.4%; every miss would create a duplicate entity | 99.3% with `recall resolve` |
+| CLI calls and tokens read per mention | 5.4 calls, 1,895 tokens | 1 call, 106 tokens |
+| current claim first for `<name> <predicate>`, default flags | 90–93% across runs; a replaced claim ranked above it 36–47 times | 100% |
+| tokens read per fact question | 276 | 201; 75 with `--current-only --type claim` |
+| median search wall time over 20,000 events: one thread, project, root scope | 15, 17, 36 ms | 8, 14, 23 ms |
+
+The 0.7 procedure missed every typo and every title such as `Dr.`; `resolve` returns those as `probable` for confirmation. `resolve` still misses 60% of nicknames nobody recorded. With `--current-only`, 0.7 already put the current claim first in every lookup. Tokens use OMK's estimate of four characters each; wall times include process start. These figures depend on the synthetic workload.
+
 ## Protect private data
 
 OMK applies these privacy rules:
