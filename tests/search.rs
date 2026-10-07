@@ -107,6 +107,79 @@ fn search_pages_count_matches_and_tell_empty_scopes_from_misses() {
 }
 
 #[test]
+fn current_only_searchable_leaves_out_visible_inactive_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    fact(&mut store, "Alice Moreau", "email", "alice@acme.io", "c1");
+    let city = fact(&mut store, "Alice Moreau", "city", "Lyon", "c2");
+    store
+        .correct_claim(&city.id, json!("Paris"), &[], "c3")
+        .unwrap();
+    event(&mut store, "thread", "lunch with alice", "e1");
+    // A replaced claim in a hidden scope must not change the visible count.
+    let hidden = store
+        .remember_claim(
+            "sibling",
+            ClaimKind::Fact,
+            "Bob",
+            "city",
+            json!("Oslo"),
+            &[],
+            "s1",
+        )
+        .unwrap()
+        .data;
+    store
+        .correct_claim(&hidden.id, json!("Rome"), &[], "s2")
+        .unwrap();
+
+    let searchable = |store: &MemoryStore, scope: &str, options: SearchOptions| {
+        store
+            .search_page(scope, "tulip", 10, options)
+            .unwrap()
+            .searchable
+    };
+    let current = SearchOptions {
+        current_only: true,
+        ..Default::default()
+    };
+    // Three claims, one replaced, plus the thread event.
+    assert_eq!(
+        searchable(&store, "thread", SearchOptions::default()),
+        Some(4)
+    );
+    assert_eq!(searchable(&store, "thread", current), Some(3));
+    let events = SearchTypes {
+        events: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        searchable(
+            &store,
+            "thread",
+            SearchOptions {
+                types: events,
+                ..current
+            }
+        ),
+        Some(1)
+    );
+
+    // One root sees every scope, so search applies no scope filter.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::open(dir.path().join("memory.db")).unwrap();
+    store
+        .create_scope("user", ScopeKind::User, None, None, "user")
+        .unwrap();
+    fact(&mut store, "Alice Moreau", "email", "alice@acme.io", "c1");
+    let city = fact(&mut store, "Alice Moreau", "city", "Lyon", "c2");
+    store
+        .correct_claim(&city.id, json!("Paris"), &[], "c3")
+        .unwrap();
+    assert_eq!(searchable(&store, "user", current), Some(2));
+}
+
+#[test]
 fn command_echoes_types_and_fields_filter_inside_the_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = setup(&dir.path().join("memory.db"));

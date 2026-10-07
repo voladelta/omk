@@ -1516,9 +1516,17 @@ pub(super) fn search_fts(
     // of its rows once: the exact scope check costs one content read per
     // row, and the read rows give `matched` without another count. A broad
     // query filters scope with tokens, whose cost follows the visible scopes'
-    // postings instead of the matches.
+    // postings instead of the matches. The count stops one row past the
+    // threshold, so a broad query does not walk all of its matches here.
     let unscoped = facet_match(&column_query, &ScopeFilter::Everything, &options);
-    let selective = raw_count(&ScopeFilter::Everything, &unscoped)? <= SELECTIVE_ROWS as i64;
+    let probe: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM memory_fts WHERE memory_fts MATCH ?1 LIMIT ?2)",
+            params![unscoped, SELECTIVE_ROWS as i64 + 1],
+            |row| row.get(0),
+        )
+        .map_err(invalid)?;
+    let selective = probe <= SELECTIVE_ROWS as i64;
     let match_scope = if selective && !matches!(scope, ScopeFilter::Everything) {
         &ScopeFilter::Exact
     } else {
@@ -1649,10 +1657,28 @@ pub(super) fn search_fts(
                 .map(facet_type_token)
                 .join(" OR ")
         );
-        Some(count_of(
-            &scope,
-            &facet_match(&any_record, &scope, &options),
-        )?)
+        let mut total = raw_count(&scope, &facet_match(&any_record, &scope, &options))?;
+        // Every claim has one index row in its own scope, so the claims
+        // table counts the inactive ones without reading index rows.
+        if options.current_only && (all || claims) {
+            let visible: &[String] = match scope {
+                ScopeFilter::Everything => &[],
+                _ => scope_ids,
+            };
+            let mut sql = "SELECT count(*) FROM claims WHERE status!='active'".to_owned();
+            if !visible.is_empty() {
+                sql.push_str(&format!(
+                    " AND scope_id IN ({})",
+                    std::iter::repeat_n("?", visible.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            let inactive: i64 =
+                conn.query_row(&sql, rusqlite::params_from_iter(visible), |row| row.get(0))?;
+            total -= inactive;
+        }
+        Some(total as usize)
     } else {
         None
     };

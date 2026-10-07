@@ -199,9 +199,24 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b.len()]
 }
 
+/// Whether `needle` occurs in `haystack` as whole words. Both are normalized,
+/// so words are separated by single spaces.
 fn contains_words(haystack: &str, needle: &str) -> bool {
-    needle.chars().count() >= MIN_LOOSE_CHARS
-        && format!(" {haystack} ").contains(&format!(" {needle} "))
+    if needle.chars().count() < MIN_LOOSE_CHARS {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let at = from + offset;
+        let end = at + needle.len();
+        if (at == 0 || bytes[at - 1] == b' ') && (end == bytes.len() || bytes[end] == b' ') {
+            return true;
+        }
+        // Occurrences may overlap, so resume one character later.
+        from = at + haystack[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Distance of a known name from the query, or None when the tier misses it.
@@ -303,36 +318,40 @@ fn aligned_distance(query: &[&str], known: &[&str]) -> Option<usize> {
     let mut total = 0;
     let mut exact = false;
     for (q, k) in query.iter().zip(known) {
-        let distance = edit_distance(q, k);
-        if distance > word_budget(q, k) {
-            return None;
-        }
+        let distance = within_budget(q, k)?;
         exact |= distance == 0;
         total += distance;
     }
     exact.then_some(total)
 }
 
-fn fuzzy_distance(query: &str, query_key: &str, known: &KnownName) -> Option<usize> {
-    let query_words: Vec<&str> = query.split(' ').collect();
+/// Edit distance of two words when it fits their budget. The length gap is a
+/// lower bound on the distance, so a larger gap skips the full computation.
+fn within_budget(a: &str, b: &str) -> Option<usize> {
+    let budget = word_budget(a, b);
+    if a.chars().count().abs_diff(b.chars().count()) > budget {
+        return None;
+    }
+    let distance = edit_distance(a, b);
+    (distance <= budget).then_some(distance)
+}
+
+fn fuzzy_distance(query_words: &[&str], key_words: &[&str], known: &KnownName) -> Option<usize> {
     let known_words: Vec<&str> = known.normalized.split(' ').collect();
-    if let [word] = query_words.as_slice() {
+    if let [word] = query_words {
         return known_words
             .iter()
             .filter(|known| known.chars().count() >= MIN_FUZZY_CHARS)
-            .map(|known| (edit_distance(word, known), word_budget(word, known)))
-            .filter(|(distance, budget)| distance <= budget)
-            .map(|(distance, _)| distance)
+            .filter_map(|known| within_budget(word, known))
             .min();
     }
     if query_words.len() != known_words.len() {
         return None;
     }
-    let key_words: Vec<&str> = query_key.split(' ').collect();
     let known_key: Vec<&str> = known.key.split(' ').collect();
     [
-        aligned_distance(&query_words, &known_words),
-        aligned_distance(&key_words, &known_key),
+        aligned_distance(query_words, &known_words),
+        aligned_distance(key_words, &known_key),
     ]
     .into_iter()
     .flatten()
@@ -360,6 +379,7 @@ pub(super) fn resolve_name(
     let query_chars = query.chars().count();
     let query_key = word_key(&query);
     let query_words: Vec<&str> = query.split(' ').collect();
+    let key_words: Vec<&str> = query_key.split(' ').collect();
     let tiers: [(ResolveTier, TierTest<'_>); 5] = [
         (
             ResolveTier::Exact,
@@ -390,7 +410,7 @@ pub(super) fn resolve_name(
                 if query_chars < MIN_FUZZY_CHARS {
                     return None;
                 }
-                fuzzy_distance(&query, &query_key, known)
+                fuzzy_distance(&query_words, &key_words, known)
             }),
         ),
     ];
