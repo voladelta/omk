@@ -296,6 +296,12 @@ Scope, record type and command filters are tokens in the full-text index, so the
 
 Results sort by BM25 multiplied by a record boost, then record type and record ID. Active claims count double, pending and disputed claims and observations count 1.25, events count 1, and superseded, rejected and expired claims count 0.5. `rank` reports that product; lower sorts first. Search reads events and observations as separate top-`--limit` lists, since one boost applies to each, and streams claims in BM25 order until no later claim could reach the page even at the highest boost. Only those rows are decoded. When several events or observations tie on BM25 at the edge of the page, the index order picks which ones appear. `matched` and `searchable` are counted from the index.
 
+Use `--fts-query` only when you need SQLite FTS5 syntax.
+
+Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. When a `single` claim has the same kind, subject and predicate in several visible scopes, the deepest scope wins: context and observation plans drop the shadowed ancestor claim, and context lists it in `diagnostics.omittedItems` as `shadowed by descendant scope claim`. Shadowed claims do not count toward the required budget. `set` claims are combined across scopes without shadowing. `claim list` and exact recall still return every claim. A project context can also render one named descendant stream.
+
+Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Evidence queries use search's default filters, so `memory-command` events are not hits of their own; a matching claim still brings in its command event as a source. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
+
 ## Resolve entity names
 
 `recall resolve` maps a name to the subject of existing active claims:
