@@ -238,6 +238,8 @@ struct Omk {
     db: PathBuf,
     keys: u64,
     calls: u64,
+    /// Characters of JSON the agent had to read, for a token estimate.
+    read_chars: u64,
 }
 
 impl Omk {
@@ -254,6 +256,7 @@ impl Omk {
             "omk {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        self.read_chars += String::from_utf8_lossy(&output.stdout).chars().count() as u64;
         serde_json::from_slice(&output.stdout).expect("omk JSON output")
     }
 
@@ -284,6 +287,7 @@ fn open(bin: &Path, dir: &Path, name: &str) -> (Omk, i64) {
         db,
         keys: 0,
         calls: 0,
+        read_chars: 0,
     };
     let schema = omk.run(&["init"])["data"]["schemaVersion"]
         .as_i64()
@@ -665,6 +669,7 @@ struct ResolveScore {
     needless_question: usize,
     probable: usize,
     calls: u64,
+    read_chars: u64,
     by_category: HashMap<&'static str, (usize, usize)>,
 }
 
@@ -686,6 +691,11 @@ impl ResolveScore {
     }
 }
 
+/// OMK's own estimate: one token per four characters.
+fn tokens_per(chars: u64, total: usize) -> String {
+    format!("{:.0}", chars as f64 / 4.0 / total as f64)
+}
+
 fn pct(n: usize, d: usize) -> String {
     if d == 0 {
         return "-".to_owned();
@@ -701,6 +711,7 @@ fn run_resolve(
 ) -> ResolveScore {
     let mut score = ResolveScore::default();
     let before = omk.calls;
+    let chars_before = omk.read_chars;
     for mention in mentions {
         let (got, probable) = strategy(omk, &mention.text);
         if probable && got == mention.expected {
@@ -709,6 +720,7 @@ fn run_resolve(
         score.add(mention, &got);
     }
     score.calls = omk.calls - before;
+    score.read_chars = omk.read_chars - chars_before;
     eprintln!("  resolve {label}: {}/{}", score.correct, score.total);
     score
 }
@@ -719,6 +731,7 @@ struct LookupScore {
     mrr: f64,
     stale_above: usize,
     total: usize,
+    read_chars: u64,
 }
 
 fn run_lookup(omk: &mut Omk, entities: &[Entity], extra: &[&str]) -> LookupScore {
@@ -728,7 +741,9 @@ fn run_lookup(omk: &mut Omk, entities: &[Entity], extra: &[&str]) -> LookupScore
         mrr: 0.0,
         stale_above: 0,
         total: 0,
+        read_chars: 0,
     };
+    let chars_before = omk.read_chars;
     for e in entities {
         let stale: BTreeSet<&str> = e.superseded.iter().map(String::as_str).collect();
         for predicate in PREDICATES {
@@ -755,6 +770,7 @@ fn run_lookup(omk: &mut Omk, entities: &[Entity], extra: &[&str]) -> LookupScore
             }
         }
     }
+    score.read_chars = omk.read_chars - chars_before;
     score
 }
 
@@ -856,13 +872,14 @@ fn main() {
         }
         for (strategy, s) in &strategies {
             resolve_rows.push(format!(
-                "| {label} | {strategy} | {} | {} | {} | {} | {} | {:.1} |",
+                "| {label} | {strategy} | {} | {} | {} | {} | {} | {:.1} | {} |",
                 pct(s.correct, s.total),
                 pct(s.duplicate, s.total),
                 pct(s.wrong_merge, s.total),
                 pct(s.needless_question, s.total),
                 s.probable,
-                s.calls as f64 / s.total as f64
+                s.calls as f64 / s.total as f64,
+                tokens_per(s.read_chars, s.total)
             ));
             let mut categories: Vec<_> = s.by_category.iter().collect();
             categories.sort();
@@ -885,11 +902,12 @@ fn main() {
         for (variant, extra) in lookups {
             let s = run_lookup(&mut omk, &entities, &extra);
             lookup_rows.push(format!(
-                "| {label} | {variant} | {} | {:.3} | {} | {} |",
+                "| {label} | {variant} | {} | {:.3} | {} | {} | {} |",
                 pct(s.hit1, s.total),
                 s.mrr / s.total as f64,
                 pct(s.recall, s.total),
-                s.stale_above
+                s.stale_above,
+                tokens_per(s.read_chars, s.total)
             ));
         }
         if with_latency {
@@ -900,11 +918,11 @@ fn main() {
     let mut report = String::new();
     report.push_str("## Name resolution\n\n");
     report.push_str(&format!("{mention_total} mentions per binary.\n\n"));
-    report.push_str("| binary | strategy | correct | duplicate entity | wrong merge | needless question | correct but probable | CLI calls per mention |\n|---|---|---|---|---|---|---|---|\n");
+    report.push_str("| binary | strategy | correct | duplicate entity | wrong merge | needless question | correct but probable | CLI calls per mention | tokens read per mention |\n|---|---|---|---|---|---|---|---|---|\n");
     report.push_str(&resolve_rows.join("\n"));
     report.push_str("\n\n### Correct by mention category\n\n| binary | strategy | categories |\n|---|---|---|\n");
     report.push_str(&category_rows.join("\n"));
-    report.push_str("\n\n## Fact lookup\n\n480 questions: `<name> <predicate>` with `--terms --limit 20`; target is the current claim.\n\n| binary | flags | hit@1 | MRR@20 | recall@20 | stale claim ranked above target |\n|---|---|---|---|---|---|\n");
+    report.push_str("\n\n## Fact lookup\n\n480 questions: `<name> <predicate>` with `--terms --limit 20`; target is the current claim.\n\n| binary | flags | hit@1 | MRR@20 | recall@20 | stale claim ranked above target | tokens read per question |\n|---|---|---|---|---|---|---|\n");
     report.push_str(&lookup_rows.join("\n"));
     if with_latency {
         report.push_str("\n\n## Search latency\n\n20,000 events over 211 scopes; query `deploy` matches every event. Median CLI wall time of 41 runs, process start included.\n\n| binary | anchor scope | median ms |\n|---|---|---|\n");
