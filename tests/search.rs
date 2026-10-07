@@ -584,3 +584,50 @@ fn raw_queries_cannot_escape_the_filter_group() {
         .unwrap();
     assert_eq!(quoted.matched, 0);
 }
+
+#[test]
+fn resolve_keeps_projects_and_versions_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    for (index, subject) in [
+        "Project Atlas",
+        "Project Apollo",
+        "atlas-api",
+        "Postgres 16",
+        "api-gateway",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fact(&mut store, subject, "status", "x", &format!("c{index}"));
+    }
+    let check = |name: &str, status: ResolveStatus, subjects: &[&str]| {
+        let resolution = store.resolve_name("user", name).unwrap();
+        let got: Vec<&str> = resolution
+            .candidates
+            .iter()
+            .map(|candidate| candidate.subject.as_str())
+            .collect();
+        assert_eq!(
+            (resolution.status, got.as_slice()),
+            (status, subjects),
+            "{name}"
+        );
+    };
+    check("project atlas", ResolveStatus::Resolved, &["Project Atlas"]);
+    check("Atlas API", ResolveStatus::Resolved, &["atlas-api"]);
+    check(
+        "Atlas",
+        ResolveStatus::Ambiguous,
+        &["Project Atlas", "atlas-api"],
+    );
+    check("api gateway v2", ResolveStatus::Probable, &["api-gateway"]);
+    // Neighbouring names and versions stay distinct.
+    check("Project Athena", ResolveStatus::None, &[]);
+    check("Postgres 15", ResolveStatus::None, &[]);
+    check(
+        "Project Apolo",
+        ResolveStatus::Probable,
+        &["Project Apollo"],
+    );
+}

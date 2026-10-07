@@ -656,14 +656,20 @@ fn mentions(entities: &[Entity], seed: u64) -> Vec<Mention> {
     result
 }
 
-/// The omk-memory skill procedure: search the name, keep claim hits, read each
-/// claim, and keep subjects whose own name or alias value matches.
-fn resolve_by_search(omk: &mut Omk, name: &str, limit: &str, schema: i64) -> Outcome {
+/// Claim hits for one search as (subject, is alias, value). Schema 7 hits
+/// lack the subject, so each claim is read once with explain-claim.
+fn claim_hits(
+    omk: &mut Omk,
+    query: &str,
+    limit: &str,
+    schema: i64,
+    read: &mut HashMap<String, (String, bool, String)>,
+) -> Vec<(String, bool, String)> {
     let mut args = vec![
         "--scope",
         "user:me",
         "--query",
-        name,
+        query,
         "--terms",
         "--current-only",
         "--limit",
@@ -673,15 +679,7 @@ fn resolve_by_search(omk: &mut Omk, name: &str, limit: &str, schema: i64) -> Out
         args.extend(["--type", "claim"]);
     }
     let hits = omk.search(&args);
-    let wanted = normalize(name);
-    let matches = |candidate: &str| {
-        let candidate = normalize(candidate);
-        !candidate.is_empty()
-            && (format!(" {candidate} ").contains(&format!(" {wanted} "))
-                || format!(" {wanted} ").contains(&format!(" {candidate} ")))
-    };
-    let mut subjects = BTreeSet::new();
-    let mut read = HashMap::new();
+    let mut claims = Vec::new();
     for hit in hits.iter().filter(|hit| hit.get("claimStatus").is_some()) {
         let id = hit["id"].as_str().unwrap().to_owned();
         let claim = if schema >= 8 {
@@ -714,9 +712,44 @@ fn resolve_by_search(omk: &mut Omk, name: &str, limit: &str, schema: i64) -> Out
                 })
                 .clone()
         };
-        let (subject, is_alias, value) = claim;
+        claims.push(claim);
+    }
+    claims
+}
+
+/// The omk-memory skill procedure: search the name, keep claim hits, read each
+/// claim, and keep subjects whose own name or alias value contains the name or
+/// sits inside it. With `retry`, a name that finds nothing is searched word by
+/// word (3+ letters, accents ignored), keeping subjects that share a whole
+/// word with it: what a careful agent would try next.
+fn resolve_by_search(omk: &mut Omk, name: &str, limit: &str, schema: i64, retry: bool) -> Outcome {
+    let mut read = HashMap::new();
+    let wanted = normalize(name);
+    let matches = |candidate: &str| {
+        let candidate = normalize(candidate);
+        !candidate.is_empty()
+            && (format!(" {candidate} ").contains(&format!(" {wanted} "))
+                || format!(" {wanted} ").contains(&format!(" {candidate} ")))
+    };
+    let mut subjects = BTreeSet::new();
+    for (subject, is_alias, value) in claim_hits(omk, name, limit, schema, &mut read) {
         if matches(&subject) || (is_alias && matches(&value)) {
             subjects.insert(subject);
+        }
+    }
+    if retry && subjects.is_empty() {
+        let folded = normalize(&strip_accents(name));
+        for word in folded.split(' ').filter(|word| word.chars().count() >= 3) {
+            let shares = |candidate: &str| {
+                normalize(&strip_accents(candidate))
+                    .split(' ')
+                    .any(|other| other == word)
+            };
+            for (subject, is_alias, value) in claim_hits(omk, word, limit, schema, &mut read) {
+                if shares(&subject) || (is_alias && shares(&value)) {
+                    subjects.insert(subject);
+                }
+            }
         }
     }
     match subjects.len() {
@@ -916,17 +949,18 @@ fn latency(bin: &Path, dir: &Path, label: &str) -> Vec<String> {
             &content,
         ]);
     }
-    let base = ["--query", "deploy", "--limit", "10"];
+    // "deploy" matches every event; note 12267 is one event in thread:p3t7.
     let mut rows = Vec::new();
-    for (name, scope) in [
-        ("one thread (3 visible scopes)", "thread:p3t7"),
-        ("project (21 scopes)", "project:p3"),
-        ("user (211 scopes)", "user:me"),
-    ] {
-        let mut args = vec!["--scope", scope];
-        args.extend(base);
-        let ms = median_ms(&mut omk, &args, 41);
-        rows.push(format!("| {label} | {name} | {ms:.1} |"));
+    for query in ["deploy", "note 12267"] {
+        for (name, scope) in [
+            ("one thread (3 visible scopes)", "thread:p3t7"),
+            ("project (21 scopes)", "project:p3"),
+            ("user (211 scopes)", "user:me"),
+        ] {
+            let args = ["--scope", scope, "--query", query, "--limit", "10"];
+            let ms = median_ms(&mut omk, &args, 41);
+            rows.push(format!("| {label} | `{query}` | {name} | {ms:.1} |"));
+        }
     }
     rows
 }
@@ -961,10 +995,13 @@ fn main() {
         let mentions = mentions(&entities, seed);
         mention_total = mentions.len();
         let mut strategies: Vec<(String, ResolveScore)> = Vec::new();
-        for limit in ["20", "100"] {
-            let strategy = format!("skill search procedure, --limit {limit}");
+        for (limit, retry) in [("20", false), ("100", false), ("20", true)] {
+            let strategy = format!(
+                "skill search procedure{}, --limit {limit}",
+                if retry { " + word retries" } else { "" }
+            );
             let score = run_resolve(&strategy, &mut omk, &mentions, |omk, name| {
-                (resolve_by_search(omk, name, limit, schema), false)
+                (resolve_by_search(omk, name, limit, schema, retry), false)
             });
             strategies.push((strategy, score));
         }
@@ -1030,7 +1067,7 @@ fn main() {
     report.push_str("\n\n## Fact lookup\n\n480 questions: `<name> <predicate>` with `--terms --limit 20`; target is the current claim.\n\n| binary | flags | hit@1 | MRR@20 | recall@20 | stale claim ranked above target | tokens read per question |\n|---|---|---|---|---|---|---|\n");
     report.push_str(&lookup_rows.join("\n"));
     if with_latency {
-        report.push_str("\n\n## Search latency\n\n20,000 events over 211 scopes; query `deploy` matches every event. Median CLI wall time of 41 runs, process start included.\n\n| binary | anchor scope | median ms |\n|---|---|---|\n");
+        report.push_str("\n\n## Search latency\n\n20,000 events over 211 scopes. `deploy` matches every event; `note 12267` matches one. Median CLI wall time of 41 runs, process start included.\n\n| binary | query | anchor scope | median ms |\n|---|---|---|---|\n");
         report.push_str(&latency_rows.join("\n"));
     }
     report.push('\n');
