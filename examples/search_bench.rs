@@ -5,7 +5,7 @@
 //! people with canonical names, recorded aliases, facts, corrections, and
 //! chat events that mention them in passing, skewed so a few people dominate.
 //!
-//! Usage: cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency]
+//! Usage: cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency] [--seed N]
 //!
 //! Tasks:
 //! - resolve: map a mention to an existing subject, flag ambiguity, or call it
@@ -46,6 +46,11 @@ const FIRST: &[(&str, &str)] = &[
     ("Frederick", "Fred"),
     ("Gabriella", "Gabi"),
     ("Leonardo", "Leo"),
+    ("Sarah", "Sally"),
+    ("Mary", "Polly"),
+    ("Eugene", "Gene"),
+    ("Helen", "Nell"),
+    ("Ann", "Nancy"),
 ];
 
 const LAST: &[&str] = &[
@@ -61,21 +66,21 @@ const LAST: &[&str] = &[
     "Fitzgerald",
     "Achebe",
     "Rasmussen",
-    "Delacroix",
+    "Lefèvre",
     "Ivanova",
     "Mbeki",
-    "Castellano",
+    "Gómez",
     "Nakamura",
     "Oyelaran",
     "Petrov",
     "Quintero",
-    "Sorensen",
+    "Søndergaard",
     "Takahashi",
     "Underwood",
     "Valdivia",
     "Whitfield",
     "Yamamoto",
-    "Zielinski",
+    "Żeleński",
     "Abernathy",
     "Bergstrom",
     "Cardenas",
@@ -83,8 +88,8 @@ const LAST: &[&str] = &[
     "Eriksen",
     "Ferreira",
     "Gallagher",
-    "Hoffmann",
-    "Iglesias",
+    "Müller",
+    "Núñez",
     "Jaramillo",
     "Kaplan",
     "Laurent",
@@ -161,6 +166,10 @@ const LAST: &[&str] = &[
     "Ito",
     "Jovanovic",
 ];
+
+/// Irregular nicknames deliberately absent from OMK's nickname table, so
+/// they measure what the table does not cover.
+const HELD_OUT_NICKNAMES: &[&str] = &["Sally", "Polly", "Gene", "Nell", "Nancy"];
 
 const ORGS: &[&str] = &[
     "Northwind",
@@ -305,8 +314,8 @@ fn normalize(text: &str) -> String {
         .join(" ")
 }
 
-fn build_world(omk: &mut Omk) -> Vec<Entity> {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+fn build_world(omk: &mut Omk, seed: u64) -> Vec<Entity> {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
     omk.write(&["scope", "add", "--id", "user:me", "--kind", "user"]);
     let mut threads = Vec::new();
     for p in 0..4 {
@@ -471,8 +480,22 @@ struct Mention {
     expected: Outcome,
 }
 
-fn mentions(entities: &[Entity]) -> Vec<Mention> {
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+/// Drop the accents the benchmark's surnames use, the way a hurried typist would.
+fn strip_accents(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'è' | 'é' => 'e',
+            'ó' | 'ø' => 'o',
+            'ü' | 'ú' => 'u',
+            'ñ' | 'ń' => 'n',
+            'Ż' => 'Z',
+            other => other,
+        })
+        .collect()
+}
+
+fn mentions(entities: &[Entity], seed: u64) -> Vec<Mention> {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let subjects_matching = |words: &str| -> Vec<String> {
         let words = normalize(words);
         entities
@@ -522,6 +545,46 @@ fn mentions(entities: &[Entity]) -> Vec<Mention> {
                 expected: one.clone(),
             });
         }
+        result.push(Mention {
+            category: "reversed, comma",
+            text: format!("{}, {}", e.last, e.first),
+            expected: one.clone(),
+        });
+        let initial = &e.first[..1];
+        let same_initial = entities
+            .iter()
+            .filter(|other| other.last == e.last && other.first.starts_with(initial))
+            .count();
+        result.push(Mention {
+            category: "initial + last name",
+            text: format!("{initial}. {}", e.last),
+            expected: if same_initial > 1 {
+                Outcome::Ambiguous
+            } else {
+                one.clone()
+            },
+        });
+        if !subject.is_ascii() {
+            result.push(Mention {
+                category: "accents dropped",
+                text: strip_accents(&subject),
+                expected: one.clone(),
+            });
+        }
+        // A new person with the same surname and first initial.
+        if let Some((other, _)) = FIRST
+            .iter()
+            .find(|(first, _)| *first != e.first && first.starts_with(initial))
+            && !entities
+                .iter()
+                .any(|known| known.first == *other && known.last == e.last)
+        {
+            result.push(Mention {
+                category: "new, same initial and surname",
+                text: format!("{other} {}", e.last),
+                expected: Outcome::New,
+            });
+        }
         let sharing = subjects_matching(e.last);
         result.push(Mention {
             category: "last name only",
@@ -544,15 +607,6 @@ fn mentions(entities: &[Entity]) -> Vec<Mention> {
                 Outcome::One(e.subject())
             },
         });
-        // A nickname nobody recorded: a person would guess, then confirm.
-        let alias = format!("{} {}", e.nick, e.last);
-        if !e.aliases.contains(&alias) && subjects_matching(e.last).len() == 1 {
-            result.push(Mention {
-                category: "unrecorded nickname",
-                text: alias,
-                expected: Outcome::One(e.subject()),
-            });
-        }
         // A different, new person who shares a recorded last name.
         let (first, _) =
             FIRST[(FIRST.iter().position(|(f, _)| *f == e.first).unwrap() + 7) % FIRST.len()];
@@ -563,6 +617,25 @@ fn mentions(entities: &[Entity]) -> Vec<Mention> {
                 expected: Outcome::New,
             });
         }
+    }
+    // A nickname nobody recorded: a person would guess, then confirm.
+    for e in entities {
+        let alias = format!("{} {}", e.nick, e.last);
+        if e.aliases.contains(&alias) || subjects_matching(e.last).len() != 1 {
+            continue;
+        }
+        let category = if e.first.to_lowercase().starts_with(&e.nick.to_lowercase()) {
+            "nickname, prefix"
+        } else if HELD_OUT_NICKNAMES.contains(&e.nick) {
+            "nickname, irregular, held out of table"
+        } else {
+            "nickname, irregular, in table"
+        };
+        result.push(Mention {
+            category,
+            text: alias,
+            expected: Outcome::One(e.subject()),
+        });
     }
     for i in 0..30 {
         let (first, _) = FIRST[i % FIRST.len()];
@@ -838,9 +911,14 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let with_latency = args.iter().any(|a| a == "--latency");
     args.retain(|a| a != "--latency");
+    let mut seed = 0;
+    if let Some(at) = args.iter().position(|a| a == "--seed") {
+        seed = args[at + 1].parse().expect("--seed takes an integer");
+        args.drain(at..=at + 1);
+    }
     assert!(
         args.len() >= 2,
-        "usage: search_bench OUT_DIR BIN [BIN...] [--latency]"
+        "usage: search_bench OUT_DIR BIN [BIN...] [--latency] [--seed N]"
     );
     let dir = PathBuf::from(&args[0]);
     std::fs::create_dir_all(&dir).unwrap();
@@ -855,8 +933,8 @@ fn main() {
         let (mut omk, schema) = open(&bin, &dir, &format!("{name}.db"));
         let label = format!("{name} (schema {schema})");
         eprintln!("{label}: building world");
-        let entities = build_world(&mut omk);
-        let mentions = mentions(&entities);
+        let entities = build_world(&mut omk, seed);
+        let mentions = mentions(&entities, seed);
         mention_total = mentions.len();
         let mut strategies: Vec<(String, ResolveScore)> = Vec::new();
         for limit in ["20", "100"] {

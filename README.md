@@ -304,20 +304,15 @@ Results sort by BM25 multiplied by a record boost, then record type and record I
 omk recall resolve --scope project:omk --name 'Dr. Alice Moreau'
 ```
 
-It compares the name against every active subject and every string value of an active `entity-alias` claim in the visible scopes. Four tiers run in order, and the first with a match decides:
+It compares the name against every active subject and every string value of an active `entity-alias` claim in the visible scopes. Names are compared after case folding, accent folding (`José Núñez` equals `Jose Nunez`), joining apostrophes (`O'Connell` equals `OConnell`) and turning other punctuation into spaces. Five tiers run in order, and the first with a match decides:
 
 1. exact: the name equals a subject or alias
-2. name: equal after case folding and replacing punctuation with spaces
-3. contains: one side contains the other as whole words, with at least 3 characters on the shorter side
-4. fuzzy: an edit distance (with adjacent swaps) of at most one per 5 characters, capped at 3, against the whole name or, for a one-word query, any word of at least 4 characters
+2. name: the same words after folding, in any order (`Moreau, Alice`)
+3. contains: one side contains the other as whole words, with at least 3 characters on the shorter side (`Dr. Alice Moreau`)
+4. tokens: every word of a name of two or more words stands for a different known word, in any order, as the same word, an initial (`A. Moreau`), a prefix of at least two letters (`Kate` for `Katherine`), or a nickname from OMK's built-in table of common English diminutives (`Bob` for `Robert`); at least one word of 3 or more characters must match whole
+5. fuzzy: an edit distance (with adjacent swaps) of at most one per 5 characters, capped at 3, against the whole name or, for a one-word query, any word of at least 4 characters
 
-`status` is `resolved` for one subject at the exact or name tier, `probable` for one subject at the contains or fuzzy tier, `ambiguous` for several subjects, and `none` otherwise. Each candidate lists the names that matched, whether through the subject or an alias, and the alias claim ID. `consideredSubjects` and `consideredAliases` tell an empty store from a real miss. Placeholder names such as `unknown`, `n/a` and `tbd` never match, and resolving one returns `invalid_input`. A nickname nobody recorded, such as `Bob` for `Robert`, does not match; record it as an alias once the user confirms it.
-
-Use `--fts-query` only when you need SQLite FTS5 syntax.
-
-Search includes the target scope, its ancestors and its descendants. Context inherits state from ancestors only. When a `single` claim has the same kind, subject and predicate in several visible scopes, the deepest scope wins: context and observation plans drop the shadowed ancestor claim, and context lists it in `diagnostics.omittedItems` as `shadowed by descendant scope claim`. Shadowed claims do not count toward the required budget. `set` claims are combined across scopes without shadowing. `claim list` and exact recall still return every claim. A project context can also render one named descendant stream.
-
-Context evidence queries use the same search modes: `omk context --scope SCOPE --stream STREAM --query 'rollback CLOCK_SKEW_17' --terms` matches separated literal terms. Use `--fts-query` for SQLite FTS5 syntax. Both flags require `--query`, conflict with each other, and work with `--compact`. Omitting them preserves literal phrase matching. Library callers can pass a `ContextQuery` to `compose_context_with_query(...)` or `compose_compact_context_with_query(...)`; existing composition methods retain their defaults.
+`status` is `resolved` for one subject at the exact or name tier, `probable` for one subject at a later tier, `ambiguous` for several subjects, and `none` otherwise. Each candidate lists the names that matched, whether through the subject or an alias, and the alias claim ID. `consideredSubjects` and `consideredAliases` tell an empty store from a real miss. Placeholder names such as `unknown`, `n/a` and `tbd` never match, and resolving one returns `invalid_input`. An irregular nickname missing from the table, such as `Sally` for `Sarah`, does not match; record it as an alias once the user confirms it.
 
 ### Measure search
 

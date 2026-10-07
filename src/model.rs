@@ -594,6 +594,8 @@ pub enum ResolveTier {
     Exact,
     Name,
     Contains,
+    /// Words match in any order through initials, prefixes or nicknames.
+    Tokens,
     Fuzzy,
 }
 

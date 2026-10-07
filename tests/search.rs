@@ -304,6 +304,80 @@ fn resolve_walks_exact_name_contains_and_fuzzy_tiers() {
 }
 
 #[test]
+fn resolve_handles_order_accents_initials_and_nicknames() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    for (index, subject) in [
+        "Alice Moreau",
+        "Alan Moreau",
+        "Robert Novak",
+        "José Núñez",
+        "Siobhan O'Connell",
+        "Katherine Lindqvist",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fact(&mut store, subject, "role", "x", &format!("c{index}"));
+    }
+    let check =
+        |name: &str, status: ResolveStatus, tier: Option<ResolveTier>, subjects: &[&str]| {
+            let resolution = store.resolve_name("user", name).unwrap();
+            let got: Vec<&str> = resolution
+                .candidates
+                .iter()
+                .map(|candidate| candidate.subject.as_str())
+                .collect();
+            assert_eq!(
+                (resolution.status, resolution.tier, got.as_slice()),
+                (status, tier, subjects),
+                "{name}"
+            );
+        };
+    use ResolveStatus::*;
+    use ResolveTier::*;
+    check("Moreau, Alice", Resolved, Some(Name), &["Alice Moreau"]);
+    check("Jose Nunez", Resolved, Some(Name), &["José Núñez"]);
+    check(
+        "SIOBHAN OCONNELL",
+        Resolved,
+        Some(Name),
+        &["Siobhan O'Connell"],
+    );
+    check(
+        "A. Moreau",
+        Ambiguous,
+        Some(Tokens),
+        &["Alan Moreau", "Alice Moreau"],
+    );
+    check(
+        "Al Moreau",
+        Ambiguous,
+        Some(Tokens),
+        &["Alan Moreau", "Alice Moreau"],
+    );
+    check("Bob Novak", Probable, Some(Tokens), &["Robert Novak"]);
+    check("Novak, Rob", Probable, Some(Tokens), &["Robert Novak"]);
+    check(
+        "Kate Lindqvist",
+        Probable,
+        Some(Tokens),
+        &["Katherine Lindqvist"],
+    );
+    check(
+        "K Lindqvist",
+        Probable,
+        Some(Tokens),
+        &["Katherine Lindqvist"],
+    );
+    // A different first name, or initials alone, must not merge.
+    check("Anthony Moreau", None, Option::None, &[]);
+    check("Alice Novak", None, Option::None, &[]);
+    check("B. Moreau", None, Option::None, &[]);
+    check("A M", None, Option::None, &[]);
+}
+
+#[test]
 fn cli_search_page_flags_and_resolve() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("memory.db");

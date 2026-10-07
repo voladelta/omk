@@ -20,15 +20,155 @@ const MAX_CANDIDATES: usize = 20;
 const MIN_LOOSE_CHARS: usize = 3;
 const MIN_FUZZY_CHARS: usize = 4;
 
-/// Case-folded alphanumeric words joined by single spaces.
+/// Common English diminutives and the formal names they stand for. A
+/// nickname that is a prefix of its formal name (Kate, Will) needs no entry.
+const NICKNAMES: &[(&str, &[&str])] = &[
+    ("abigail", &["abby", "gail"]),
+    ("albert", &["bert", "al"]),
+    ("alexander", &["sasha", "xander", "sandy"]),
+    ("alexandra", &["sasha", "sandra", "lexi"]),
+    ("alfred", &["fred", "alf"]),
+    ("andrew", &["drew", "andy"]),
+    ("anthony", &["tony"]),
+    ("barbara", &["babs", "barb"]),
+    ("catherine", &["cathy", "kate", "katie", "kat"]),
+    ("charles", &["chuck", "charlie", "chas"]),
+    ("christina", &["tina", "chrissy"]),
+    ("christine", &["tina", "chrissy"]),
+    ("christopher", &["kit", "topher"]),
+    ("deborah", &["debbie", "deb"]),
+    ("dorothy", &["dot", "dotty", "dolly"]),
+    ("edward", &["ted", "teddy", "ned", "eddie"]),
+    (
+        "elizabeth",
+        &["liz", "lizzie", "beth", "betty", "betsy", "libby", "eliza"],
+    ),
+    ("eleanor", &["nell", "nora", "ellie"]),
+    ("frederick", &["freddie"]),
+    ("gabriella", &["gabby"]),
+    ("harold", &["harry", "hal"]),
+    ("henry", &["harry", "hank", "hal"]),
+    ("james", &["jim", "jimmy", "jamie"]),
+    ("jennifer", &["jenny"]),
+    ("john", &["jack", "johnny"]),
+    ("jonathan", &["jonny"]),
+    ("joseph", &["joe", "joey"]),
+    ("katherine", &["kate", "katie", "kathy", "kat", "kay"]),
+    ("kathryn", &["kate", "katie", "kathy"]),
+    ("lawrence", &["larry"]),
+    ("leonardo", &["leo"]),
+    (
+        "margaret",
+        &["maggie", "meg", "peggy", "marge", "greta", "daisy"],
+    ),
+    ("matthew", &["matt"]),
+    ("michael", &["mike", "mikey", "mick"]),
+    ("nicholas", &["nick", "nicky"]),
+    ("patricia", &["patty", "trish", "tricia"]),
+    ("patrick", &["paddy", "rick"]),
+    ("peter", &["pete"]),
+    ("rebecca", &["becky", "becca"]),
+    ("richard", &["rick", "dick", "rich", "ricky"]),
+    ("robert", &["bob", "bobby", "rob", "robbie", "bert"]),
+    ("samantha", &["sammy"]),
+    ("samuel", &["sammy"]),
+    ("stephen", &["steve"]),
+    ("steven", &["steve"]),
+    ("susan", &["sue", "susie"]),
+    ("theodora", &["teddy", "dora", "thea"]),
+    ("theodore", &["ted", "teddy", "theo"]),
+    ("thomas", &["tommy"]),
+    ("victoria", &["vicky", "tori", "vic"]),
+    ("william", &["bill", "billy", "will", "willy", "liam"]),
+];
+
+/// Fold the Latin accents people often drop when typing a name.
+fn fold_accent(c: char) -> &'static str {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'ç' | 'ć' | 'č' => "c",
+        'ď' | 'đ' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => "e",
+        'ğ' => "g",
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ı' => "i",
+        'ł' | 'ľ' => "l",
+        'ñ' | 'ń' | 'ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => "o",
+        'ř' => "r",
+        'ś' | 'š' | 'ş' => "s",
+        'ť' | 'ţ' => "t",
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => "u",
+        'ý' | 'ÿ' => "y",
+        'ź' | 'ż' | 'ž' => "z",
+        'ß' => "ss",
+        'æ' => "ae",
+        'œ' => "oe",
+        'þ' => "th",
+        _ => "",
+    }
+}
+
+/// Case-folded, accent-folded alphanumeric words joined by single spaces.
+/// Apostrophes join their neighbours, so O'Connell and OConnell agree.
 pub(super) fn normalize_name(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut folded = String::with_capacity(name.len());
+    for c in name.to_lowercase().chars() {
+        match fold_accent(c) {
+            "" if matches!(c, '\'' | '\u{2019}' | '`') => {}
+            "" if c.is_alphanumeric() => folded.push(c),
+            "" => folded.push(' '),
+            ascii => folded.push_str(ascii),
+        }
+    }
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Normalized words in sorted order, so word order does not matter.
+fn word_key(normalized: &str) -> String {
+    let mut words: Vec<&str> = normalized.split(' ').collect();
+    words.sort_unstable();
+    words.join(" ")
+}
+
+fn is_nickname(short: &str, formal: &str) -> bool {
+    NICKNAMES
+        .iter()
+        .any(|(name, nicknames)| *name == formal && nicknames.contains(&short))
+}
+
+/// How a query word can stand for a known word in the tokens tier.
+fn word_matches(query: &str, known: &str) -> bool {
+    let query_chars = query.chars().count();
+    query == known
+        || (query_chars == 1 && known.starts_with(query))
+        || (query_chars >= 2 && known.starts_with(query))
+        || (known.chars().count() >= MIN_LOOSE_CHARS && query.starts_with(known))
+        || is_nickname(query, known)
+        || is_nickname(known, query)
+}
+
+/// Every query word stands for a different known word, in any order, and at
+/// least one pair matches whole: "A. Moreau" or "Bob Novak", not "A. B.".
+fn words_match(query: &[&str], known: &[&str]) -> bool {
+    fn assign(query: &[&str], known: &[&str], used: &mut Vec<bool>, anchored: bool) -> bool {
+        let Some((first, rest)) = query.split_first() else {
+            return anchored;
+        };
+        for (index, word) in known.iter().enumerate() {
+            if !used[index] && word_matches(first, word) {
+                used[index] = true;
+                let whole = first == word && first.chars().count() >= MIN_LOOSE_CHARS;
+                if assign(rest, known, used, anchored || whole) {
+                    return true;
+                }
+                used[index] = false;
+            }
+        }
+        false
+    }
+    query.len() >= 2
+        && query.len() <= known.len()
+        && assign(query, known, &mut vec![false; known.len()], false)
 }
 
 fn is_placeholder(normalized: &str) -> bool {
@@ -70,6 +210,7 @@ type TierTest<'a> = Box<dyn Fn(&KnownName) -> Option<usize> + 'a>;
 struct KnownName {
     name: String,
     normalized: String,
+    key: String,
     subject: String,
     via: &'static str,
     claim_id: Option<String>,
@@ -91,8 +232,10 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
         })?,
     )?;
     for (subject, scope_id) in subjects {
+        let normalized = normalize_name(&subject);
         names.push(KnownName {
-            normalized: normalize_name(&subject),
+            key: word_key(&normalized),
+            normalized,
             name: subject.clone(),
             subject,
             via: "subject",
@@ -122,8 +265,10 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
             continue;
         };
         alias_count += 1;
+        let normalized = normalize_name(&alias);
         names.push(KnownName {
-            normalized: normalize_name(&alias),
+            key: word_key(&normalized),
+            normalized,
             name: alias,
             subject,
             via: "alias",
@@ -173,14 +318,16 @@ pub(super) fn resolve_name(
     let (names, considered_subjects, considered_aliases) = known_names(conn, scope_ids)?;
     let query_chars = query.chars().count();
     let threshold = query_chars.div_ceil(5).clamp(1, 3);
-    let tiers: [(ResolveTier, TierTest<'_>); 4] = [
+    let query_key = word_key(&query);
+    let query_words: Vec<&str> = query.split(' ').collect();
+    let tiers: [(ResolveTier, TierTest<'_>); 5] = [
         (
             ResolveTier::Exact,
             Box::new(|known| (known.name == name).then_some(0)),
         ),
         (
             ResolveTier::Name,
-            Box::new(|known| (known.normalized == query).then_some(0)),
+            Box::new(|known| (known.key == query_key).then_some(0)),
         ),
         (
             ResolveTier::Contains,
@@ -188,6 +335,13 @@ pub(super) fn resolve_name(
                 (contains_words(&known.normalized, &query)
                     || contains_words(&query, &known.normalized))
                 .then_some(0)
+            }),
+        ),
+        (
+            ResolveTier::Tokens,
+            Box::new(|known| {
+                let known_words: Vec<&str> = known.normalized.split(' ').collect();
+                words_match(&query_words, &known_words).then_some(0)
             }),
         ),
         (
