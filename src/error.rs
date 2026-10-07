@@ -35,6 +35,14 @@ impl KernelError {
         self.kind
     }
 
+    pub fn claim_conflict(message: impl Into<String>) -> Self {
+        Self::new(KernelErrorKind::ClaimConflict, message)
+    }
+
+    pub fn schema_mismatch(message: impl Into<String>) -> Self {
+        Self::new(KernelErrorKind::SchemaMismatch, message)
+    }
+
     pub fn idempotency_conflict(message: impl Into<String>) -> Self {
         Self::new(KernelErrorKind::IdempotencyConflict, message)
     }

@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) const EVENT_COLUMNS: &str = "id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json";
+pub(super) const OBSERVATION_COLUMNS: &str = "id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at";
+pub(super) const CLAIM_COLUMNS: &str = "id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at";
+pub(super) const VIEW_COLUMNS: &str = "id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at";
+pub(super) const RUN_INFO_COLUMNS: &str = "id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,source_integrity,observer_model,prompt_version,ambiguities_json,error,created_at,updated_at";
+
 pub(super) fn row_scope(row: &Row<'_>) -> rusqlite::Result<Scope> {
     Ok(Scope {
         id: row.get(0)?,
@@ -99,14 +105,6 @@ pub(super) fn row_view(row: &Row<'_>) -> rusqlite::Result<MemoryView> {
 }
 
 pub(super) fn row_observation_run_info(row: &Row<'_>) -> rusqlite::Result<ObservationRunInfo> {
-    let ambiguities_raw: String = row.get(10)?;
-    let ambiguities = serde_json::from_str(&ambiguities_raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            ambiguities_raw.len(),
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
     let status: String = row.get(6)?;
     let source_integrity: SourceIntegrity = parse_enum(&row.get::<_, String>(7)?)?;
     let error: Option<String> = row.get(11)?;
@@ -132,7 +130,7 @@ pub(super) fn row_observation_run_info(row: &Row<'_>) -> rusqlite::Result<Observ
         source_integrity,
         observer_model: row.get(8)?,
         prompt_version: row.get(9)?,
-        ambiguities,
+        ambiguities: parse_json_column(row, 10)?,
         error,
         next_action,
         created_at: row.get(12)?,
@@ -140,7 +138,10 @@ pub(super) fn row_observation_run_info(row: &Row<'_>) -> rusqlite::Result<Observ
     })
 }
 
-pub(super) fn parse_json_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
+pub(super) fn parse_json_column<T: DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
     let raw: String = row.get(index)?;
     serde_json::from_str(&raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(

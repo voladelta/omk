@@ -9,7 +9,7 @@ enum ContextRendering {
 impl ContextRendering {
     fn claim_tokens(self, claim: &Claim) -> i64 {
         match self {
-            Self::Full => estimate_claim_tokens(claim),
+            Self::Full => serialized_item_tokens(claim),
             Self::Compact => serialized_item_tokens(&claim.compact_model_record()),
         }
     }
@@ -38,158 +38,122 @@ impl ContextRendering {
     }
 }
 
+impl ContextDiagnostics {
+    /// Count `cost` against `max_tokens` when it fits; otherwise record `id`
+    /// as omitted for budget.
+    fn admit(&mut self, max_tokens: i64, cost: i64, id: &str) -> bool {
+        if cost <= max_tokens - self.estimated_tokens {
+            self.estimated_tokens += cost;
+            return true;
+        }
+        self.omitted_items.push(OmittedItem {
+            id: id.to_owned(),
+            reason: "context token budget".to_owned(),
+        });
+        false
+    }
+}
+
 impl MemoryStore {
     pub fn create_view(&mut self, input: CreateView) -> Result<MutationResult<MemoryView>> {
         validate_nonempty("view content", &input.content)?;
-        validate_nonempty("idempotency key", &input.idempotency_key)?;
         ensure!(
             input.kind == ViewKind::Continuity,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "continuation views are created only by observation commit",
-            )
+            KernelError::invalid_input("continuation views are created only by observation commit")
         );
         ensure!(
             input.source_from_sequence > 0
                 && input.source_through_sequence >= input.source_from_sequence,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "view source sequence range is invalid",
-            )
+            KernelError::invalid_input("view source sequence range is invalid")
         );
-        let request_hash = operation_request_hash("view.create", &input)?;
-        let tx = self.immediate()?;
-        if let Some(prior) =
-            prior_result::<MemoryView>(&tx, &input.idempotency_key, "view.create", &request_hash)?
-        {
-            tx.commit()?;
-            return Ok(MutationResult::replayed(prior));
-        }
-        ensure_scope_exists(&tx, &input.scope_id)?;
-        let stream_scope: String = tx
-            .query_row(
-                "SELECT scope_id FROM memory_streams WHERE id=?1",
-                [&input.stream_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("stream {} does not exist", input.stream_id),
-                )
-            })?;
-        ensure!(
-            stream_scope == input.scope_id,
-            KernelError::new(
-                KernelErrorKind::ScopeViolation,
-                format!(
+        self.mutate("view.create", &input.idempotency_key, &input, |tx| {
+            ensure_scope_exists(tx, &input.scope_id)?;
+            let stream_scope = query_stream_scope(tx, &input.stream_id)?;
+            ensure!(
+                stream_scope == input.scope_id,
+                KernelError::scope_violation(format!(
                     "stream {} belongs to scope {stream_scope}, not {}",
                     input.stream_id, input.scope_id
-                ),
-            )
-        );
-        let latest = latest_view(&tx, &input.stream_id, "continuity")?;
-        ensure!(
-            latest.as_ref().map(|view| view.id.as_str())
-                == input.expected_previous_view_id.as_deref(),
-            KernelError::new(
-                KernelErrorKind::StaleView,
-                format!(
-                    "view is stale: expected previous view {:?}, found {:?}",
-                    input.expected_previous_view_id,
-                    latest.as_ref().map(|view| view.id.as_str())
-                ),
-            )
-        );
-        for observation_id in &input.source_observation_ids {
-            let (source_scope, source_stream, source_start, source_end):
-                (String, String, i64, i64) = tx
-                .query_row(
-                    "SELECT observation.scope_id,run.stream_id,observation.source_start_sequence,observation.source_end_sequence
-                     FROM observations observation
-                     JOIN observation_runs run ON run.id=observation.run_id
-                     WHERE observation.id=?1",
-                    [observation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?
-                .ok_or_else(|| {
-                    KernelError::new(
-                        KernelErrorKind::NotFound,
-                        format!("observation {observation_id} does not exist"),
-                    )
-                })?;
+                ))
+            );
+            let latest = latest_view(tx, &input.stream_id, "continuity")?;
+            let latest_id = latest.as_ref().map(|view| view.id.as_str());
             ensure!(
-                source_scope == input.scope_id,
-                KernelError::new(
-                    KernelErrorKind::ScopeViolation,
-                    format!(
+                latest_id == input.expected_previous_view_id.as_deref(),
+                KernelError::stale_view(format!(
+                    "view is stale: expected previous view {:?}, found {latest_id:?}",
+                    input.expected_previous_view_id,
+                ))
+            );
+            for observation_id in &input.source_observation_ids {
+                let (source_scope, source_stream, source_start, source_end): (
+                    String,
+                    String,
+                    i64,
+                    i64,
+                ) = tx
+                    .query_row(
+                        "SELECT observation.scope_id,run.stream_id,observation.source_start_sequence,observation.source_end_sequence
+                         FROM observations observation
+                         JOIN observation_runs run ON run.id=observation.run_id
+                         WHERE observation.id=?1",
+                        [observation_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        KernelError::not_found(format!("observation {observation_id} does not exist"))
+                    })?;
+                ensure!(
+                    source_scope == input.scope_id,
+                    KernelError::scope_violation(format!(
                         "observation {observation_id} belongs to scope {source_scope}, not {}",
                         input.scope_id
-                    ),
-                )
-            );
-            ensure!(
-                source_stream == input.stream_id,
-                KernelError::new(
-                    KernelErrorKind::ScopeViolation,
-                    format!(
+                    ))
+                );
+                ensure!(
+                    source_stream == input.stream_id,
+                    KernelError::scope_violation(format!(
                         "observation {observation_id} belongs to stream {source_stream}, not {}",
                         input.stream_id
-                    ),
-                )
-            );
-            ensure!(
-                source_start >= input.source_from_sequence
-                    && source_end <= input.source_through_sequence,
-                KernelError::new(
-                    KernelErrorKind::InvalidInput,
-                    format!(
+                    ))
+                );
+                ensure!(
+                    source_start >= input.source_from_sequence
+                        && source_end <= input.source_through_sequence,
+                    KernelError::invalid_input(format!(
                         "observation {observation_id} is outside the declared view source range"
-                    ),
-                )
-            );
-        }
-        let estimated_token_count = estimate_tokens(&input.content);
-        let token_count = input.token_count.map_or(estimated_token_count, |count| {
-            count.max(estimated_token_count)
-        });
-        let view = insert_next_view(
-            &tx,
-            &input.scope_id,
-            &input.stream_id,
-            input.kind,
-            &input.content,
-            input.source_from_sequence,
-            input.source_through_sequence,
-            input.model.as_deref(),
-            input.prompt_version.as_deref(),
-            token_count,
-        )?;
-        for observation_id in &input.source_observation_ids {
-            tx.execute(
-                "INSERT INTO view_sources(view_id,observation_id) VALUES (?1,?2)",
-                params![view.id, observation_id],
+                    ))
+                );
+            }
+            let estimated = estimate_tokens(&input.content);
+            let view = insert_next_view(
+                tx,
+                &input.scope_id,
+                &input.stream_id,
+                input.kind.clone(),
+                &input.content,
+                input.source_from_sequence,
+                input.source_through_sequence,
+                input.model.as_deref(),
+                input.prompt_version.as_deref(),
+                input.token_count.map_or(estimated, |hint| hint.max(estimated)),
             )?;
-        }
-        save_operation(
-            &tx,
-            &input.idempotency_key,
-            "view.create",
-            &request_hash,
-            &view,
-        )?;
-        tx.commit()?;
-        Ok(MutationResult::created(view))
+            for observation_id in &input.source_observation_ids {
+                tx.execute(
+                    "INSERT INTO view_sources(view_id,observation_id) VALUES (?1,?2)",
+                    params![view.id, observation_id],
+                )?;
+            }
+            Ok(view)
+        })
     }
 
     pub fn list_views(&self, scope_id: &str) -> Result<Vec<MemoryView>> {
         ensure_scope_exists(&self.conn, scope_id)?;
-        let mut statement = self.conn.prepare(
-            "SELECT id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
-             FROM memory_views WHERE scope_id=?1 ORDER BY stream_id,kind,generation",
-        )?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {VIEW_COLUMNS} FROM memory_views WHERE scope_id=?1 ORDER BY stream_id,kind,generation"
+        ))?;
         collect_rows(statement.query_map([scope_id], row_view)?)
     }
 
@@ -198,39 +162,9 @@ impl MemoryStore {
         access: &ReadAccess,
         observation_id: &str,
     ) -> Result<Vec<MemoryEvent>> {
-        let scope_id: String = self
-            .conn
-            .query_row(
-                "SELECT scope_id FROM observations WHERE id=?1",
-                [observation_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("observation {observation_id} does not exist"),
-                )
-            })?;
-        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
-        access.ensure_scope(&scope_id)?;
-        self.recall_observation_sources(&access, observation_id)
-    }
-
-    fn recall_observation_sources(
-        &self,
-        access: &ResolvedReadAccess<'_>,
-        observation_id: &str,
-    ) -> Result<Vec<MemoryEvent>> {
-        let mut statement = self.conn.prepare(
-            "SELECT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
-             FROM memory_events e JOIN observation_sources s ON s.event_id=e.id
-             WHERE s.observation_id=?1 ORDER BY e.stream_id,e.sequence",
-        )?;
-        collect_rows(statement.query_map([observation_id], row_event)?)?
-            .into_iter()
-            .map(|event| access.apply(event))
-            .collect()
+        Ok(self
+            .explain_observation(access, observation_id)?
+            .source_events)
     }
 
     pub fn explain_observation(
@@ -241,44 +175,59 @@ impl MemoryStore {
         let observation = self
             .conn
             .query_row(
-                "SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
-                 FROM observations WHERE id=?1",
+                &format!("SELECT {OBSERVATION_COLUMNS} FROM observations WHERE id=?1"),
                 [observation_id],
                 row_observation,
             )
             .optional()?
             .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("observation {observation_id} does not exist"),
-                )
+                KernelError::not_found(format!("observation {observation_id} does not exist"))
             })?;
-        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
-        access.ensure_scope(&observation.scope_id)?;
+        let source_events = self.source_events(
+            access,
+            &observation.scope_id,
+            "SELECT event_id FROM observation_sources WHERE observation_id=?1",
+            observation_id,
+        )?;
         Ok(ObservationExplanation {
             observation,
-            source_events: self.recall_observation_sources(&access, observation_id)?,
+            source_events,
         })
     }
 
     pub fn explain_claim(&self, access: &ReadAccess, claim_id: &str) -> Result<ClaimExplanation> {
         let claim = query_claim(&self.conn, claim_id)?;
-        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
-        access.ensure_scope(&claim.scope_id)?;
-        let mut events_statement = self.conn.prepare(
-            "SELECT DISTINCT e.id,e.stream_id,e.sequence,e.scope_id,e.kind,e.actor_id,e.occurred_at,e.recorded_at,e.content_json,e.content_hash,e.token_count,e.sensitivity,e.metadata_json
-             FROM memory_events e JOIN claim_sources source ON source.event_id=e.id
-             WHERE source.claim_id=?1
-             ORDER BY e.stream_id,e.sequence",
+        let source_events = self.source_events(
+            access,
+            &claim.scope_id,
+            "SELECT event_id FROM claim_sources WHERE claim_id=?1",
+            claim_id,
         )?;
-        let source_events = collect_rows(events_statement.query_map([claim_id], row_event)?)?
-            .into_iter()
-            .map(|event| access.apply(event))
-            .collect::<Result<Vec<_>>>()?;
         Ok(ClaimExplanation {
             claim,
             source_events,
         })
+    }
+
+    /// The source events of a record in `record_scope_id`, read through
+    /// `access`. `sources_sql` selects the record's event IDs.
+    fn source_events(
+        &self,
+        access: &ReadAccess,
+        record_scope_id: &str,
+        sources_sql: &str,
+        record_id: &str,
+    ) -> Result<Vec<MemoryEvent>> {
+        let access = ResolvedReadAccess::resolve(&self.conn, access)?;
+        access.ensure_scope(record_scope_id)?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM memory_events WHERE id IN ({sources_sql})
+             ORDER BY stream_id,sequence"
+        ))?;
+        collect_rows(statement.query_map([record_id], row_event)?)?
+            .into_iter()
+            .map(|event| access.apply(event))
+            .collect()
     }
 
     pub fn search_full_text(
@@ -288,23 +237,6 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
         self.search_with_options(scope_id, query, limit, SearchOptions::default())
-    }
-
-    pub fn search_full_text_advanced(
-        &self,
-        scope_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>> {
-        self.search_with_options(
-            scope_id,
-            query,
-            limit,
-            SearchOptions {
-                mode: SearchMode::Advanced,
-                ..Default::default()
-            },
-        )
     }
 
     pub fn search_with_options(
@@ -340,10 +272,7 @@ impl MemoryStore {
         validate_nonempty("search query", query)?;
         ensure!(
             limit > 0 && limit <= 1000,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "search limit must be from 1 to 1000",
-            )
+            KernelError::invalid_input("search limit must be from 1 to 1000")
         );
         let scope_ids = retrieval_scope_ids(&self.conn, scope_id)?;
         let fts_query = bounded_fts_query(query, options.mode)?;
@@ -447,47 +376,29 @@ impl MemoryStore {
     ) -> Result<ContextBundle> {
         ensure!(
             max_tokens > 0,
-            KernelError::new(KernelErrorKind::InvalidInput, "max tokens must be positive",)
+            KernelError::invalid_input("max tokens must be positive")
         );
         ensure!(
             recent_raw_tokens >= 0,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "recent raw tokens cannot be negative",
-            )
+            KernelError::invalid_input("recent raw tokens cannot be negative")
         );
         // Read every section from one snapshot. Dropping the transaction
         // rolls it back, which is all a read needs.
         let _snapshot = self.conn.unchecked_transaction()?;
         let visible = visible_scope_ids(&self.conn, scope_id)?;
-        let stream_scope: String = self
-            .conn
-            .query_row(
-                "SELECT scope_id FROM memory_streams WHERE id=?1",
-                [stream_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("stream {stream_id} does not exist"),
-                )
-            })?;
+        let stream_scope = query_stream_scope(&self.conn, stream_id)?;
         ensure!(
-            visible.contains(&stream_scope)
-                || scope_is_ancestor(&self.conn, scope_id, &stream_scope)?,
-            KernelError::new(
-                KernelErrorKind::ScopeViolation,
-                format!("stream {stream_id} is not visible from scope {scope_id}"),
-            )
+            retrieval_scope_ids(&self.conn, scope_id)?.contains(&stream_scope),
+            KernelError::scope_violation(format!(
+                "stream {stream_id} is not visible from scope {scope_id}"
+            ))
         );
-        let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"))?;
+        let mut claims = query_claims_for_scopes(&self.conn, &visible, Some("active"), None)?;
         sort_claims_by_scope(&mut claims, &visible);
         let (claims, shadowed_claims) = split_shadowed_claims(claims, &visible);
         let mut pending_claims =
-            query_claim_candidates(&self.conn, &visible, Some("pending"), Some(257))?;
-        pending_claims.extend(query_claim_candidates(
+            query_claims_for_scopes(&self.conn, &visible, Some("pending"), Some(257))?;
+        pending_claims.extend(query_claims_for_scopes(
             &self.conn,
             &visible,
             Some("disputed"),
@@ -512,12 +423,9 @@ impl MemoryStore {
         let overhead_tokens = estimate_tokens(&empty_payload.to_string());
         ensure!(
             overhead_tokens <= max_tokens,
-            KernelError::new(
-                KernelErrorKind::BudgetExceeded,
-                format!(
-                    "context budget too small: minimumRequiredTokens={overhead_tokens} for the context structure"
-                ),
-            )
+            KernelError::budget_exceeded(format!(
+                "context budget too small: minimumRequiredTokens={overhead_tokens} for the context structure"
+            ))
         );
         let (claims, over_budget_claims) = budget_claims(
             &self.conn,
@@ -552,28 +460,15 @@ impl MemoryStore {
             let draft: ContinuationDraft = serde_json::from_str(&view.content)
                 .context("reading structured continuation view")?;
             let cost = serialized_item_tokens(&draft).saturating_add(view_hint_extra(&view));
-            if cost <= max_tokens - diagnostics.estimated_tokens {
-                diagnostics.estimated_tokens += cost;
+            if diagnostics.admit(max_tokens, cost, &view.id) {
                 continuation = Some(draft);
-            } else {
-                diagnostics.omitted_items.push(OmittedItem {
-                    id: view.id,
-                    reason: "context token budget".to_owned(),
-                });
             }
         }
 
         let mut selected_pending_claims = Vec::new();
         for claim in pending_claims {
-            let cost = rendering.claim_tokens(&claim);
-            if cost <= max_tokens - diagnostics.estimated_tokens {
-                diagnostics.estimated_tokens += cost;
+            if diagnostics.admit(max_tokens, rendering.claim_tokens(&claim), &claim.id) {
                 selected_pending_claims.push(claim);
-            } else {
-                diagnostics.omitted_items.push(OmittedItem {
-                    id: claim.id,
-                    reason: "context token budget".to_owned(),
-                });
             }
         }
 
@@ -606,13 +501,13 @@ impl MemoryStore {
                 break;
             }
         }
-        recent_events_reversed.reverse();
-        let recent_events = recent_events_reversed;
+        let mut recent_events = recent_events_reversed;
+        recent_events.reverse();
         diagnostics.estimated_tokens += raw_tokens;
         let mut recalled_evidence = Vec::new();
-        let read_access = ReadAccess::agent(scope_id);
         if let Some(query) = query {
             let hits = self.search_with_options(scope_id, query.text, 10, query.options)?;
+            let read_access = ReadAccess::agent(scope_id);
             let access = ResolvedReadAccess::resolve(&self.conn, &read_access)?;
             let mut recalled_ids = HashSet::new();
             for hit in hits {
@@ -631,15 +526,8 @@ impl MemoryStore {
                         continue;
                     }
                     let event = access.apply(self.query_event(&id)?)?;
-                    let cost = rendering.event_tokens(&event);
-                    if cost <= max_tokens - diagnostics.estimated_tokens {
-                        diagnostics.estimated_tokens += cost;
+                    if diagnostics.admit(max_tokens, rendering.event_tokens(&event), &id) {
                         recalled_evidence.push(event);
-                    } else {
-                        diagnostics.omitted_items.push(OmittedItem {
-                            id,
-                            reason: "context token budget".to_owned(),
-                        });
                     }
                 }
             }
@@ -651,31 +539,20 @@ impl MemoryStore {
             .collect();
         let represented_event_ids = serde_json::to_string(&represented_event_ids)?;
 
-        let mut selected_continuity_ids = Vec::new();
-        if let Some(view) = latest_view(&self.conn, stream_id, "continuity")? {
-            let cost = rendering.view_tokens(&view);
-            if cost <= max_tokens - diagnostics.estimated_tokens {
-                diagnostics.estimated_tokens += cost;
-                selected_continuity_ids.push(view.id.clone());
-                continuity_views.push(view);
-            } else {
-                diagnostics.omitted_items.push(OmittedItem {
-                    id: view.id,
-                    reason: "context token budget".to_owned(),
-                });
-            }
+        if let Some(view) = latest_view(&self.conn, stream_id, "continuity")?
+            && diagnostics.admit(max_tokens, rendering.view_tokens(&view), &view.id)
+        {
+            continuity_views.push(view);
         }
+        let continuity_ids: Vec<String> = continuity_views.iter().map(|v| v.id.clone()).collect();
 
         let mut observation_scopes = visible.clone();
         if !observation_scopes.contains(&stream_scope) {
             observation_scopes.push(stream_scope);
         }
         // Newest first, so a backlog of older observations cannot hide new ones.
-        let mut candidates = query_observations_for_scopes(
-            &self.conn,
-            &observation_scopes,
-            &selected_continuity_ids,
-        )?;
+        let mut candidates =
+            query_observations_for_scopes(&self.conn, &observation_scopes, &continuity_ids)?;
         if candidates.len() > 256 {
             diagnostics.truncated = true;
             candidates.truncate(256);
@@ -690,14 +567,8 @@ impl MemoryStore {
                 continue;
             }
             let cost = rendering.observation_tokens(&observation);
-            if cost <= max_tokens - diagnostics.estimated_tokens {
-                diagnostics.estimated_tokens += cost;
+            if diagnostics.admit(max_tokens, cost, &observation.id) {
                 observations.push(observation);
-            } else {
-                diagnostics.omitted_items.push(OmittedItem {
-                    id: observation.id,
-                    reason: "context token budget".to_owned(),
-                });
             }
         }
         observations.sort_by(|left, right| {

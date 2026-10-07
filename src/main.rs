@@ -470,34 +470,31 @@ struct ContextArgs {
     compact: bool,
 }
 
+/// Mutations take an idempotency key; reads do not.
 fn command_allows_key_reuse(command: &Command) -> bool {
-    match command {
-        Command::Init | Command::Recall { .. } | Command::Context(_) => false,
-        Command::Scope { command } => matches!(command, ScopeCommand::Add { .. }),
-        Command::Event { command } => matches!(
-            command,
-            EventCommand::Append { .. } | EventCommand::Purge { .. }
-        ),
-        Command::Observe { command } => matches!(
-            command,
-            ObserveCommand::Plan { .. }
-                | ObserveCommand::Commit { .. }
-                | ObserveCommand::Fail { .. }
-        ),
-        Command::Claim { command } => matches!(
-            command,
-            ClaimCommand::Remember(_)
-                | ClaimCommand::Propose(_)
-                | ClaimCommand::Confirm { .. }
-                | ClaimCommand::Correct { .. }
-                | ClaimCommand::Rescope { .. }
-                | ClaimCommand::Reject { .. }
-                | ClaimCommand::Forget { .. }
-                | ClaimCommand::Purge { .. }
-                | ClaimCommand::Reconcile { .. }
-        ),
-        Command::View { command } => matches!(command, ViewCommand::Create(_)),
-    }
+    !matches!(
+        command,
+        Command::Init
+            | Command::Recall { .. }
+            | Command::Context(_)
+            | Command::Scope {
+                command: ScopeCommand::List
+            }
+            | Command::Event {
+                command: EventCommand::Get { .. }
+            }
+            | Command::Observe {
+                command: ObserveCommand::Get { .. }
+                    | ObserveCommand::List { .. }
+                    | ObserveCommand::Status { .. }
+            }
+            | Command::Claim {
+                command: ClaimCommand::List { .. }
+            }
+            | Command::View {
+                command: ViewCommand::List { .. }
+            }
+    )
 }
 
 fn main() {
@@ -602,7 +599,7 @@ fn run(cli: Cli) -> Result<()> {
                 let raw_metadata = if let Some(metadata) = metadata {
                     metadata
                 } else if let Some(path) = metadata_file.as_deref() {
-                    read_path_or_stdin(Some(path))?
+                    read_input(Some(path), u64::MAX)?
                 } else {
                     "{}".to_owned()
                 };
@@ -628,13 +625,7 @@ fn run(cli: Cli) -> Result<()> {
                 scope,
                 id,
                 reveal_secret,
-            } => print_json(&store.get_event(
-                &ReadAccess {
-                    anchor_scope_id: scope,
-                    reveal_secrets: reveal_secret,
-                },
-                &id,
-            )?)?,
+            } => print_json(&store.get_event(&read_access(scope, reveal_secret), &id)?)?,
             EventCommand::Purge {
                 id,
                 idempotency_key,
@@ -661,7 +652,7 @@ fn run(cli: Cli) -> Result<()> {
                 input,
                 idempotency_key,
             } => {
-                let raw = read_observer_input(input.as_deref())?;
+                let raw = read_input(input.as_deref(), MAX_OBSERVER_BYTES as u64)?;
                 let result: ObserverResult = serde_json::from_str(&raw).map_err(|error| {
                     KernelError::invalid_input(format!(
                         "parsing strict ObserverResult JSON: {error}"
@@ -796,13 +787,7 @@ fn run(cli: Cli) -> Result<()> {
                 id,
                 reveal_secret,
             } => {
-                print_json(&store.explain_observation(
-                    &ReadAccess {
-                        anchor_scope_id: scope,
-                        reveal_secrets: reveal_secret,
-                    },
-                    &id,
-                )?)?;
+                print_json(&store.explain_observation(&read_access(scope, reveal_secret), &id)?)?;
             }
             RecallCommand::EventRange {
                 scope,
@@ -811,10 +796,7 @@ fn run(cli: Cli) -> Result<()> {
                 to,
                 reveal_secret,
             } => print_json(&store.recall_event_range(
-                &ReadAccess {
-                    anchor_scope_id: scope,
-                    reveal_secrets: reveal_secret,
-                },
+                &read_access(scope, reveal_secret),
                 &stream,
                 from,
                 to,
@@ -830,19 +812,12 @@ fn run(cli: Cli) -> Result<()> {
                 field,
                 include_commands,
             } => {
-                let mode = if fts_query {
-                    SearchMode::Advanced
-                } else if terms {
-                    SearchMode::Terms
-                } else {
-                    SearchMode::Phrase
-                };
                 let page = store.search_page(
                     &scope,
                     &query,
                     limit,
                     SearchOptions {
-                        mode,
+                        mode: search_mode(fts_query, terms),
                         current_only,
                         types: SearchTypes {
                             claims: types.contains(&RecordType::Claim),
@@ -863,26 +838,14 @@ fn run(cli: Cli) -> Result<()> {
                 id,
                 reveal_secret,
             } => {
-                print_json(&store.explain_claim(
-                    &ReadAccess {
-                        anchor_scope_id: scope,
-                        reveal_secrets: reveal_secret,
-                    },
-                    &id,
-                )?)?;
+                print_json(&store.explain_claim(&read_access(scope, reveal_secret), &id)?)?;
             }
         },
         Command::Context(args) => {
             let query = args.query.as_deref().map(|text| ContextQuery {
                 text,
                 options: SearchOptions {
-                    mode: if args.fts_query {
-                        SearchMode::Advanced
-                    } else if args.terms {
-                        SearchMode::Terms
-                    } else {
-                        SearchMode::Phrase
-                    },
+                    mode: search_mode(args.fts_query, args.terms),
                     ..Default::default()
                 },
             });
@@ -915,38 +878,32 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn read_access(scope: String, reveal_secrets: bool) -> ReadAccess {
+    ReadAccess {
+        anchor_scope_id: scope,
+        reveal_secrets,
+    }
+}
+
+fn search_mode(fts_query: bool, terms: bool) -> SearchMode {
+    if fts_query {
+        SearchMode::Advanced
+    } else if terms {
+        SearchMode::Terms
+    } else {
+        SearchMode::Phrase
+    }
+}
+
 fn read_inline_or_file(inline: Option<String>, path: Option<&Path>) -> Result<String> {
-    if let Some(inline) = inline {
-        return Ok(inline);
-    }
-    read_path_or_stdin(path)
-}
-
-fn read_path_or_stdin(path: Option<&Path>) -> Result<String> {
-    match path {
-        Some(path) if path != Path::new("-") => fs::read_to_string(path).map_err(|error| {
-            KernelError::invalid_input(format!("reading input file {}: {error}", path.display()))
-                .into()
-        }),
-        _ => {
-            ensure!(
-                !io::stdin().is_terminal(),
-                KernelError::missing_input(
-                    "stdin is interactive; pipe input or pass a file option",
-                )
-            );
-            let mut input = String::new();
-            io::stdin().read_to_string(&mut input)?;
-            ensure!(
-                !input.is_empty(),
-                KernelError::missing_input("stdin was empty")
-            );
-            Ok(input)
-        }
+    match inline {
+        Some(inline) => Ok(inline),
+        None => read_input(path, u64::MAX),
     }
 }
 
-fn read_observer_input(path: Option<&Path>) -> Result<String> {
+/// Read a file, or stdin for `-` or no path, up to `max_bytes`.
+fn read_input(path: Option<&Path>, max_bytes: u64) -> Result<String> {
     let reader: Box<dyn Read> = match path {
         Some(path) if path != Path::new("-") => {
             Box::new(fs::File::open(path).map_err(|error| {
@@ -968,18 +925,17 @@ fn read_observer_input(path: Option<&Path>) -> Result<String> {
     };
     let mut bytes = Vec::new();
     reader
-        .take((MAX_OBSERVER_BYTES + 1) as u64)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= MAX_OBSERVER_BYTES,
-        KernelError::invalid_input("ObserverResult input exceeds 1048576 bytes")
+        bytes.len() as u64 <= max_bytes,
+        KernelError::invalid_input(format!("input exceeds {max_bytes} bytes"))
     );
     ensure!(
         !bytes.is_empty(),
-        KernelError::missing_input("observer input was empty")
+        KernelError::missing_input("input was empty")
     );
-    String::from_utf8(bytes)
-        .map_err(|_| KernelError::invalid_input("observer input must be UTF-8").into())
+    String::from_utf8(bytes).map_err(|_| KernelError::invalid_input("input must be UTF-8").into())
 }
 
 fn parse_json_or_string(raw: &str) -> Value {
@@ -1079,23 +1035,16 @@ fn classify_error(
             false,
             Some("the operation already committed; inspect the target records instead of retrying"),
         ),
-        KernelErrorKind::NotFound => {
-            if key_reusable_for_command {
-                (
-                    "not_found",
-                    false,
-                    true,
-                    Some("create or target an existing resource and retry with the same key"),
-                )
+        KernelErrorKind::NotFound => (
+            "not_found",
+            false,
+            key_reusable_for_command,
+            Some(if key_reusable_for_command {
+                "create or target an existing resource and retry with the same key"
             } else {
-                (
-                    "not_found",
-                    false,
-                    false,
-                    Some("inspect the identifier and scope"),
-                )
-            }
-        }
+                "inspect the identifier and scope"
+            }),
+        ),
         KernelErrorKind::ScopeViolation => (
             "scope_violation",
             false,

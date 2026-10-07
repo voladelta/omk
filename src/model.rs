@@ -307,7 +307,7 @@ pub struct ObservationPlan {
 impl ObservationPlan {
     /// Model input only. Run identifiers and command instructions are envelopes.
     pub fn model_payload(&self) -> Value {
-        serde_json::json!({"scope": self.scope, "events": self.events,
+        json!({"scope": self.scope, "events": self.events,
             "activeClaims": self.active_claims, "previousContinuation": self.previous_continuation})
     }
 }
@@ -653,7 +653,7 @@ pub struct ContextQuery<'a> {
 
 impl ContextBundle {
     pub fn model_payload(&self) -> Value {
-        serde_json::json!({"claims": self.claims, "pendingClaims": self.pending_claims,
+        json!({"claims": self.claims, "pendingClaims": self.pending_claims,
             "continuation": self.continuation, "continuityViews": self.continuity_views,
             "observations": self.observations, "recentEvents": self.recent_events,
             "recalledEvidence": self.recalled_evidence})

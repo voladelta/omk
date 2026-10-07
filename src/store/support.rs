@@ -19,7 +19,6 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
         "SELECT scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,observer_model,prompt_version,truncated_event_ids_json,source_integrity FROM observation_runs WHERE id=?1",
         [id],
         |row| {
-            let truncated_raw: String = row.get(8)?;
             Ok(ObservationRun {
                 scope_id: row.get(0)?,
                 stream_id: row.get(1)?,
@@ -29,13 +28,7 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
                 status: row.get(5)?,
                 observer_model: row.get(6)?,
                 prompt_version: row.get(7)?,
-                truncated_event_ids: serde_json::from_str(&truncated_raw).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        truncated_raw.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
+                truncated_event_ids: parse_json_column(row, 8)?,
                 source_integrity: row.get(9)?,
             })
         },
@@ -288,11 +281,10 @@ pub(super) fn truncate_event_for_budget(
     }
     // Four characters per token bounds the preview, and cost grows with length.
     let mut low = 0;
-    let mut high = serialized.chars().count().min(
-        usize::try_from(available_tokens)
-            .unwrap_or(usize::MAX / 4)
-            .saturating_mul(4),
-    );
+    let mut high = serialized
+        .chars()
+        .count()
+        .min((available_tokens as usize).saturating_mul(4));
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         if cost(middle) <= available_tokens {
@@ -425,7 +417,7 @@ pub(super) fn prior_result<T: DeserializeOwned>(
         operation == expected_operation,
         KernelError::idempotency_conflict(format!(
             "idempotency key was already used for {operation}, not {expected_operation}"
-        ),)
+        ))
     );
     let request_hash = request_hash.ok_or_else(|| {
         KernelError::privacy_purged("the prior request for this idempotency key was privacy-purged")
@@ -552,9 +544,7 @@ pub(super) fn view_successor_ids(conn: &Connection, view_ids: &[String]) -> Resu
     if view_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", view_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = placeholders(view_ids.len());
     let sql = format!(
         "WITH RECURSIVE successors(id) AS (
             SELECT id FROM memory_views WHERE id IN ({placeholders})
@@ -584,20 +574,20 @@ pub(super) fn generated_command_source_ids(
     collect_rows(statement.query_map([claim_id], |row| row.get(0))?)
 }
 
-pub(super) fn set_command_event_owner(
+/// Make a generated command event a source of the claim it wrote, and mark
+/// that claim as its owner so purging the claim purges the event too.
+pub(super) fn attach_command_event(
     conn: &Connection,
-    event_id: &str,
+    command: &MemoryEvent,
     claim_id: &str,
 ) -> Result<()> {
-    let changed = conn.execute(
+    conn.execute(
         "UPDATE memory_events
          SET metadata_json=json_set(metadata_json,'$.ownerClaimId',?2)
-         WHERE id=?1 AND kind='memory-command'
-           AND json_extract(metadata_json,'$.generatedBy')='omk'",
-        params![event_id, claim_id],
+         WHERE id=?1",
+        params![command.id, claim_id],
     )?;
-    ensure!(changed == 1, "generated command event owner update failed");
-    Ok(())
+    attach_event_sources(conn, claim_id, std::slice::from_ref(&command.id))
 }
 
 /// One search row. `text` holds the whole record; claims also fill
@@ -696,12 +686,7 @@ pub(super) fn query_scope(conn: &Connection, id: &str) -> Result<Scope> {
 pub(super) fn visible_scope_ids(conn: &Connection, scope_id: &str) -> Result<Vec<String>> {
     let mut current = Some(scope_id.to_owned());
     let mut result = Vec::new();
-    let mut seen = HashSet::new();
     while let Some(id) = current {
-        ensure!(
-            seen.insert(id.clone()),
-            "scope hierarchy contains a cycle at {id}"
-        );
         let parent: Option<Option<String>> = conn
             .query_row(
                 "SELECT parent_id FROM memory_scopes WHERE id=?1",
@@ -736,16 +721,6 @@ pub(super) fn retrieval_scope_ids(conn: &Connection, scope_id: &str) -> Result<V
     Ok(result)
 }
 
-pub(super) fn scope_is_ancestor(
-    conn: &Connection,
-    ancestor_id: &str,
-    descendant_id: &str,
-) -> Result<bool> {
-    Ok(visible_scope_ids(conn, descendant_id)?
-        .iter()
-        .any(|scope_id| scope_id == ancestor_id))
-}
-
 pub(super) fn literal_fts_query(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
@@ -758,7 +733,7 @@ pub(super) fn query_event_page(
 ) -> Result<Vec<MemoryEvent>> {
     let (comparison, order) = if reverse { ("<", "DESC") } else { (">", "ASC") };
     let mut statement = conn.prepare(&format!(
-        "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json
+        "SELECT {EVENT_COLUMNS}
          FROM memory_events WHERE stream_id=?1 AND sequence{comparison}?2 ORDER BY sequence {order} LIMIT 32"
     ))?;
     collect_rows(statement.query_map(params![stream_id, cursor], row_event)?)
@@ -770,10 +745,10 @@ pub(super) fn query_events_range(
     from_sequence: i64,
     to_sequence: i64,
 ) -> Result<Vec<MemoryEvent>> {
-    let mut statement = conn.prepare(
-        "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json
-         FROM memory_events WHERE stream_id=?1 AND sequence BETWEEN ?2 AND ?3 ORDER BY sequence",
-    )?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {EVENT_COLUMNS}
+         FROM memory_events WHERE stream_id=?1 AND sequence BETWEEN ?2 AND ?3 ORDER BY sequence"
+    ))?;
     collect_rows(statement.query_map(params![stream_id, from_sequence, to_sequence], row_event)?)
 }
 
@@ -928,8 +903,10 @@ pub(super) fn latest_view(
 ) -> Result<Option<MemoryView>> {
     Ok(conn
         .query_row(
-            "SELECT id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at
-             FROM memory_views WHERE stream_id=?1 AND kind=?2 ORDER BY generation DESC LIMIT 1",
+            &format!(
+                "SELECT {VIEW_COLUMNS}
+                 FROM memory_views WHERE stream_id=?1 AND kind=?2 ORDER BY generation DESC LIMIT 1"
+            ),
             params![stream_id, kind],
             row_view,
         )
@@ -940,25 +917,13 @@ pub(super) fn query_claims_for_scopes(
     conn: &Connection,
     scope_ids: &[String],
     status: Option<&str>,
-) -> Result<Vec<Claim>> {
-    query_claim_candidates(conn, scope_ids, status, None)
-}
-
-pub(super) fn query_claim_candidates(
-    conn: &Connection,
-    scope_ids: &[String],
-    status: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Vec<Claim>> {
     if scope_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", scope_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut sql = format!(
-        "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE scope_id IN ({placeholders})"
-    );
+    let placeholders = placeholders(scope_ids.len());
+    let mut sql = format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE scope_id IN ({placeholders})");
     let mut values = scope_ids.to_vec();
     if let Some(status) = status {
         sql.push_str(" AND status=?");
@@ -976,7 +941,7 @@ pub(super) fn query_claim_candidates(
 
 pub(super) fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
     conn.query_row(
-        "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at FROM claims WHERE id=?1",
+        &format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE id=?1"),
         [id],
         row_claim,
     )
@@ -984,22 +949,25 @@ pub(super) fn query_claim(conn: &Connection, id: &str) -> Result<Claim> {
     .ok_or_else(|| KernelError::not_found(format!("claim {id} does not exist")).into())
 }
 
-pub(super) fn query_active_claim_member(
-    conn: &Connection,
-    scope_id: &str,
-    kind: &str,
-    subject: &str,
-    predicate: &str,
-    cardinality: &ClaimCardinality,
-    value_hash: &str,
-) -> Result<Option<Claim>> {
+/// The active claim in `claim`'s slot: any value for `single`, the same value
+/// for `set`.
+pub(super) fn query_active_claim_member(conn: &Connection, claim: &Claim) -> Result<Option<Claim>> {
     Ok(conn
         .query_row(
-            "SELECT id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at
-             FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4
-               AND cardinality=?5 AND (cardinality='single' OR value_hash=?6) AND status='active'
-             ORDER BY updated_at DESC LIMIT 1",
-            params![scope_id, kind, subject, predicate, enum_text(cardinality), value_hash],
+            &format!(
+                "SELECT {CLAIM_COLUMNS}
+                 FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4
+                   AND cardinality=?5 AND (cardinality='single' OR value_hash=?6) AND status='active'
+                 ORDER BY updated_at DESC LIMIT 1"
+            ),
+            params![
+                claim.scope_id,
+                enum_text(&claim.kind),
+                claim.subject,
+                claim.predicate,
+                enum_text(&claim.cardinality),
+                claim.value_hash
+            ],
             row_claim,
         )
         .optional()?)
@@ -1151,12 +1119,8 @@ pub(super) fn query_observations_for_scopes(
     if scope_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let scope_placeholders = std::iter::repeat_n("?", scope_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let view_placeholders = std::iter::repeat_n("?", represented_view_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let scope_placeholders = placeholders(scope_ids.len());
+    let view_placeholders = placeholders(represented_view_ids.len());
     // Observations represented by the selected view chain are excluded before
     // LIMIT so reflected history cannot crowd out newer observations.
     let sql = format!(
@@ -1168,7 +1132,7 @@ pub(super) fn query_observations_for_scopes(
             JOIN view_chain current ON current.id=view.id
             WHERE view.previous_view_id IS NOT NULL
          )
-         SELECT id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at
+         SELECT {OBSERVATION_COLUMNS}
          FROM observations
          WHERE scope_id IN ({scope_placeholders})
            AND NOT EXISTS (
@@ -1209,15 +1173,11 @@ pub(super) fn context_source_ids(
         "claim" => ("claim_sources", "claim_id"),
         _ => bail!("unsupported full-text record type"),
     };
-    query_string_column(
+    query_strings(
         conn,
         &format!("SELECT event_id FROM {table} WHERE {column}=?1 ORDER BY event_id LIMIT 257"),
-        id,
+        [id],
     )
-}
-
-pub(super) fn estimate_claim_tokens(claim: &Claim) -> i64 {
-    serialized_item_tokens(claim)
 }
 
 // One extra character covers the array separator; rounding per item is conservative.
@@ -1462,9 +1422,7 @@ pub(super) fn search_fts(
     };
     let exact_sql = format!(
         " AND memory_fts.scope_id IN ({})",
-        std::iter::repeat_n("?", scope_ids.len())
-            .collect::<Vec<_>>()
-            .join(",")
+        placeholders(scope_ids.len())
     );
     let scope_sql = |filter: &ScopeFilter| {
         if matches!(filter, ScopeFilter::Exact) {
@@ -1673,9 +1631,7 @@ pub(super) fn search_fts(
             if !visible.is_empty() {
                 sql.push_str(&format!(
                     " AND scope_id IN ({})",
-                    std::iter::repeat_n("?", visible.len())
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    placeholders(visible.len())
                 ));
             }
             let inactive: i64 =
@@ -1734,11 +1690,25 @@ fn balanced_outside_strings(query: &str) -> bool {
     depth == 0 && !in_string
 }
 
-pub(super) fn query_string_column(
+pub(super) fn query_strings(
     conn: &Connection,
     sql: &str,
-    value: &str,
+    params: impl rusqlite::Params,
 ) -> Result<Vec<String>> {
     let mut statement = conn.prepare(sql)?;
-    collect_rows(statement.query_map([value], |row| row.get(0))?)
+    collect_rows(statement.query_map(params, |row| row.get(0))?)
+}
+
+pub(super) fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(",")
+}
+
+pub(super) fn query_stream_scope(conn: &Connection, stream_id: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT scope_id FROM memory_streams WHERE id=?1",
+        [stream_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| KernelError::not_found(format!("stream {stream_id} does not exist")).into())
 }

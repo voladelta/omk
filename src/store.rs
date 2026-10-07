@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::KernelError;
 use crate::model::*;
-use crate::{KernelError, KernelErrorKind};
 
 pub const SCHEMA_VERSION: i64 = 8;
 
@@ -155,12 +155,9 @@ impl MemoryStore {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
             schema_version == 0 || schema_version == SCHEMA_VERSION,
-            KernelError::new(
-                KernelErrorKind::SchemaMismatch,
-                format!(
-                    "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
-                ),
-            )
+            KernelError::schema_mismatch(format!(
+                "database schema version {schema_version} is incompatible with OMK schema version {SCHEMA_VERSION}; start with a fresh database"
+            ))
         );
         if schema_version == 0 {
             let has_schema_objects: bool = conn.query_row(
@@ -173,8 +170,7 @@ impl MemoryStore {
             )?;
             ensure!(
                 !has_schema_objects,
-                KernelError::new(
-                    KernelErrorKind::SchemaMismatch,
+                KernelError::schema_mismatch(
                     "unversioned database is not empty; start with a fresh database",
                 )
             );
@@ -199,54 +195,33 @@ impl MemoryStore {
         idempotency_key: &str,
     ) -> Result<MutationResult<Scope>> {
         validate_nonempty("scope id", id)?;
-        validate_nonempty("idempotency key", idempotency_key)?;
-        ensure!(
-            parent_id != Some(id),
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "a scope cannot be its own parent",
-            )
-        );
-
-        let request_hash = operation_request_hash(
-            "scope.create",
-            &json!({"id": id, "kind": kind, "parentId": parent_id, "name": name}),
-        )?;
-        let tx = self.immediate()?;
-        if let Some(prior) =
-            prior_result::<Scope>(&tx, idempotency_key, "scope.create", &request_hash)?
-        {
-            tx.commit()?;
-            return Ok(MutationResult::replayed(prior));
-        }
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_scopes WHERE id=?1)",
-            [id],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            !exists,
-            KernelError::invalid_input(format!("scope {id} already exists"))
-        );
-        if let Some(parent) = parent_id {
-            ensure_scope_exists(&tx, parent)?;
-        }
-        let now = now();
-        tx.execute(
-            "INSERT INTO memory_scopes(id,kind,parent_id,name,created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![id, enum_text(&kind), parent_id, name, now],
-        )
-        .with_context(|| format!("creating scope {id}"))?;
-        let scope = Scope {
-            id: id.to_owned(),
-            kind,
-            parent_id: parent_id.map(str::to_owned),
-            name: name.map(str::to_owned),
-            created_at: now,
-        };
-        save_operation(&tx, idempotency_key, "scope.create", &request_hash, &scope)?;
-        tx.commit()?;
-        Ok(MutationResult::created(scope))
+        let request = json!({"id": id, "kind": kind, "parentId": parent_id, "name": name});
+        self.mutate("scope.create", idempotency_key, &request, |tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_scopes WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                !exists,
+                KernelError::invalid_input(format!("scope {id} already exists"))
+            );
+            if let Some(parent) = parent_id {
+                ensure_scope_exists(tx, parent)?;
+            }
+            let scope = Scope {
+                id: id.to_owned(),
+                kind,
+                parent_id: parent_id.map(str::to_owned),
+                name: name.map(str::to_owned),
+                created_at: now(),
+            };
+            tx.execute(
+                "INSERT INTO memory_scopes(id,kind,parent_id,name,created_at) VALUES (?1,?2,?3,?4,?5)",
+                params![scope.id, enum_text(&scope.kind), parent_id, name, scope.created_at],
+            )?;
+            Ok(scope)
+        })
     }
 
     pub fn list_scopes(&self) -> Result<Vec<Scope>> {
@@ -256,108 +231,76 @@ impl MemoryStore {
         collect_rows(statement.query_map([], row_scope)?)
     }
 
-    pub fn get_scope(&self, id: &str) -> Result<Scope> {
-        query_scope(&self.conn, id)
-    }
-
-    pub fn visible_scope_ids(&self, scope_id: &str) -> Result<Vec<String>> {
-        visible_scope_ids(&self.conn, scope_id)
-    }
-
     pub fn append_event(&mut self, event: NewEvent) -> Result<MutationResult<MemoryEvent>> {
         validate_nonempty("scope id", &event.scope_id)?;
         validate_nonempty("stream id", &event.stream_id)?;
-        validate_nonempty("idempotency key", &event.idempotency_key)?;
         ensure!(
             event.token_count.is_none_or(|count| count >= 0),
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "token count cannot be negative",
-            )
+            KernelError::invalid_input("token count cannot be negative")
         );
         ensure!(
             event.metadata.is_object(),
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "metadata must be a JSON object",
-            )
+            KernelError::invalid_input("metadata must be a JSON object")
         );
         if let Some(occurred_at) = &event.occurred_at {
             chrono::DateTime::parse_from_rfc3339(occurred_at).map_err(|error| {
-                KernelError::new(
-                    KernelErrorKind::InvalidInput,
-                    format!("occurred-at must be an RFC 3339 timestamp: {error}"),
-                )
+                KernelError::invalid_input(format!(
+                    "occurred-at must be an RFC 3339 timestamp: {error}"
+                ))
             })?;
         }
-
-        let request_hash = if event.sensitivity == Sensitivity::DoNotStore {
-            operation_request_hash(
-                "event.append",
-                &json!({
-                    "scopeId": event.scope_id,
-                    "streamId": event.stream_id,
-                    "kind": event.kind,
-                    "actorId": event.actor_id,
-                    "occurredAt": event.occurred_at,
-                    "sensitivity": event.sensitivity,
-                    "idempotencyKey": event.idempotency_key,
-                }),
-            )?
-        } else {
-            operation_request_hash("event.append", &event)?
-        };
-        let tx = self.immediate()?;
-        if let Some(prior) =
-            prior_result::<MemoryEvent>(&tx, &event.idempotency_key, "event.append", &request_hash)?
-        {
-            tx.commit()?;
-            return Ok(MutationResult::replayed(redact_for_agent(prior)));
+        /// A do-not-store request keeps neither its content nor its metadata,
+        /// not even in the request hash.
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Request<'a> {
+            Full(&'a NewEvent),
+            Omitted(Value),
         }
-        ensure_scope_exists(&tx, &event.scope_id)?;
-        let (content, token_count) = if event.sensitivity == Sensitivity::DoNotStore {
+        let do_not_store = event.sensitivity == Sensitivity::DoNotStore;
+        let (request, content, metadata) = if do_not_store {
+            let request = json!({
+                "scopeId": event.scope_id,
+                "streamId": event.stream_id,
+                "kind": event.kind,
+                "actorId": event.actor_id,
+                "occurredAt": event.occurred_at,
+                "sensitivity": event.sensitivity,
+                "idempotencyKey": event.idempotency_key,
+            });
             let tombstone = json!({"omitted": true, "reason": "do-not-store"});
+            (Request::Omitted(request), tombstone, json!({}))
+        } else {
             (
-                tombstone.clone(),
-                estimate_event_tokens(&tombstone, &json!({})),
+                Request::Full(&event),
+                event.content.clone(),
+                event.metadata.clone(),
             )
-        } else {
-            let estimated = estimate_event_tokens(&event.content, &event.metadata);
-            let count = event
-                .token_count
-                .map_or(estimated, |count| count.max(estimated));
-            (event.content.clone(), count)
         };
-        let stored_metadata = if event.sensitivity == Sensitivity::DoNotStore {
-            json!({})
-        } else {
-            event.metadata
+        let estimated = estimate_event_tokens(&content, &metadata);
+        let token_count = match event.token_count {
+            Some(hint) if !do_not_store => hint.max(estimated),
+            _ => estimated,
         };
-        let stored = insert_event(
-            &tx,
-            EventInsert {
-                scope_id: event.scope_id,
-                stream_id: event.stream_id,
-                kind: event.kind,
-                actor_id: event.actor_id,
-                occurred_at: event.occurred_at,
-                content,
-                token_count,
-                sensitivity: event.sensitivity,
-                metadata: stored_metadata,
-            },
-        )?;
-        // Saved results never hold secret content; replay redacts anyway.
-        let stored = redact_for_agent(stored);
-        save_operation(
-            &tx,
-            &event.idempotency_key,
-            "event.append",
-            &request_hash,
-            &stored,
-        )?;
-        tx.commit()?;
-        Ok(MutationResult::created(stored))
+        self.mutate("event.append", &event.idempotency_key, &request, |tx| {
+            ensure_scope_exists(tx, &event.scope_id)?;
+            let stored = insert_event(
+                tx,
+                EventInsert {
+                    scope_id: event.scope_id.clone(),
+                    stream_id: event.stream_id.clone(),
+                    kind: event.kind.clone(),
+                    actor_id: event.actor_id.clone(),
+                    occurred_at: event.occurred_at.clone(),
+                    content,
+                    token_count,
+                    sensitivity: event.sensitivity.clone(),
+                    metadata,
+                },
+            )?;
+            // Saved results never hold secret content.
+            Ok(redact_for_agent(stored))
+        })
     }
 
     pub fn recall_event_range(
@@ -369,32 +312,13 @@ impl MemoryStore {
     ) -> Result<Vec<MemoryEvent>> {
         ensure!(
             from_sequence > 0,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "from sequence must be positive",
-            )
+            KernelError::invalid_input("from sequence must be positive")
         );
         ensure!(
             to_sequence >= from_sequence,
-            KernelError::new(
-                KernelErrorKind::InvalidInput,
-                "to sequence must be at least from sequence",
-            )
+            KernelError::invalid_input("to sequence must be at least from sequence")
         );
-        let stream_scope: String = self
-            .conn
-            .query_row(
-                "SELECT scope_id FROM memory_streams WHERE id=?1",
-                [stream_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("stream {stream_id} does not exist"),
-                )
-            })?;
+        let stream_scope = query_stream_scope(&self.conn, stream_id)?;
         let access = ResolvedReadAccess::resolve(&self.conn, access)?;
         access.ensure_scope(&stream_scope)?;
         query_events_range(&self.conn, stream_id, from_sequence, to_sequence)?
@@ -409,20 +333,38 @@ impl MemoryStore {
     }
 
     fn query_event(&self, event_id: &str) -> Result<MemoryEvent> {
-        let event = self.conn
+        self.conn
             .query_row(
-                "SELECT id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json FROM memory_events WHERE id=?1",
+                &format!("SELECT {EVENT_COLUMNS} FROM memory_events WHERE id=?1"),
                 [event_id],
                 row_event,
             )
             .optional()?
             .ok_or_else(|| {
-                KernelError::new(
-                    KernelErrorKind::NotFound,
-                    format!("event {event_id} does not exist"),
-                )
-            })?;
-        Ok(event)
+                KernelError::not_found(format!("event {event_id} does not exist")).into()
+            })
+    }
+
+    /// Run one idempotent write. A repeated key replays the saved result;
+    /// otherwise `write` runs and its result is saved in the same transaction.
+    fn mutate<T: Serialize + DeserializeOwned>(
+        &mut self,
+        operation: &str,
+        idempotency_key: &str,
+        request: &impl Serialize,
+        write: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<MutationResult<T>> {
+        validate_nonempty("idempotency key", idempotency_key)?;
+        let request_hash = operation_request_hash(operation, request)?;
+        let tx = self.immediate()?;
+        if let Some(prior) = prior_result(&tx, idempotency_key, operation, &request_hash)? {
+            tx.commit()?;
+            return Ok(MutationResult::replayed(prior));
+        }
+        let result = write(&tx)?;
+        save_operation(&tx, idempotency_key, operation, &request_hash, &result)?;
+        tx.commit()?;
+        Ok(MutationResult::created(result))
     }
 
     fn immediate(&mut self) -> Result<Transaction<'_>> {

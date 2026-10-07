@@ -25,12 +25,9 @@ pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
         // hide changed CHECK values, partial predicates, or FTS configuration.
         ensure!(
             actual.as_deref() == Some(sql.as_str()),
-            KernelError::new(
-                KernelErrorKind::SchemaMismatch,
-                format!(
-                    "schema v{SCHEMA_VERSION} mismatch: required {kind} {name} is missing or changed"
-                )
-            )
+            KernelError::schema_mismatch(format!(
+                "schema v{SCHEMA_VERSION} mismatch: required {kind} {name} is missing or changed"
+            ))
         );
     }
     Ok(())
