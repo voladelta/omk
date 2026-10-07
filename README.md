@@ -322,19 +322,31 @@ It compares the name against every active subject and every string value of an a
 
 ### Measure search
 
-`examples/search_bench.rs` drives `omk` binaries only through the CLI, so one run compares schema versions on an identical synthetic world: 120 people with recorded aliases and corrected facts, plus 4,000 chat events that mention them on a Zipf curve. Run `cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency]`.
+`examples/search_bench.rs` drives `omk` binaries only through the CLI, so one run compares versions on an identical synthetic world: 120 people with recorded aliases and corrected facts, some with accented surnames, plus 4,000 chat events that mention them on a Zipf curve. Each world yields about 600 name mentions in 16 categories, including reordered names, initials, dropped accents, typos, titles, nicknames, and new people who share a surname or initial with someone recorded. Run `cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency] [--seed N]`; each run writes every miss to `OUT_DIR`.
 
-Against OMK 0.7, using the omk-memory skill's earlier procedure (search the name, then read each claim hit):
+These results compare OMK 0.7 with OMK 0.8 over six seeds. The resolver was tuned while reading misses from seeds 0–2; seeds 3–5 were run once after the code was frozen.
 
-| task | OMK 0.7 | OMK 0.8 |
+| name resolution | OMK 0.7, skill search procedure | OMK 0.7, plus word-by-word retries | OMK 0.8, `recall resolve` |
+|---|---|---|---|
+| correct, seeds 0–2 | 57.2–57.7% | 44.9–45.7% | 99.3–99.5% |
+| correct, seeds 3–5 | 57.1–58.1% | 45.2–46.5% | 99.2–99.8% |
+| new duplicate entity | 41.9–42.9% | 0.0–0.3% | 0.2–0.7% |
+| silent wrong merge | 0% | 0.0–0.3% | 0% |
+| needless question | 0% | 53.5–54.9% | 0.0–0.2% |
+| correct, but `probable`, so the agent confirms first | 0% | 0% | 32.7–34.2% |
+| CLI calls and tokens read per mention | 4.5–4.7 calls, 1,565–1,654 tokens | 16.5–17.8 calls, 5,872–6,288 tokens | 1 call, 97–101 tokens |
+
+The skill procedure misses every typo, title, initial, reordered name, dropped accent and nickname, and each miss would create a duplicate entity. Retrying word by word removes the duplicates but turns new people into false ambiguities. `recall resolve` merged no new person into an existing subject in any seed, but a third of its correct answers are `probable` and need a confirmation. Its nickname matching is only as good as its table: prefix nicknames such as `Kate` matched 35 of 35, nicknames in the table matched 26 of 33 (missing `Gabi` and `Tom`), and the five irregular nicknames deliberately left out of the table matched 0 of 12.
+
+| other measures | OMK 0.7 | OMK 0.8 |
 |---|---|---|
-| resolve 426 name mentions, correct | 71.4%; every miss would create a duplicate entity | 99.3% with `recall resolve` |
-| CLI calls and tokens read per mention | 5.4 calls, 1,895 tokens | 1 call, 106 tokens |
-| current claim first for `<name> <predicate>`, default flags | 90–93% across runs; a replaced claim ranked above it 36–47 times | 100% |
-| tokens read per fact question | 276 | 201; 75 with `--current-only --type claim` |
-| median search wall time over 20,000 events: one thread, project, root scope | 15, 17, 36 ms | 8, 14, 23 ms |
+| current claim first for `<name> <predicate>`, default flags | 91.5–93.5%; a replaced claim ranked above it 31–41 times | 100% |
+| the same with `--current-only` | 100% | 100% |
+| tokens read per fact question | 268–277 | 186–197; 70 with `--current-only --type claim` |
+| median search over 20,000 events, query matching every event: thread, project, root scope | 16.9, 17.6, 37.1 ms | 8.9, 14.2, 24.5 ms |
+| the same, query matching one event | 4.2, 4.3, 4.6 ms | 4.3, 4.2, 4.6 ms |
 
-The 0.7 procedure missed every typo and every title such as `Dr.`; `resolve` returns those as `probable` for confirmation. `resolve` still misses 60% of nicknames nobody recorded. With `--current-only`, 0.7 already put the current claim first in every lookup. Tokens use OMK's estimate of four characters each; wall times include process start. These figures depend on the synthetic workload.
+Tokens use OMK's estimate of four characters each, and wall times include process start. The agents are scripted procedures, not models, and the world is generated, so the rates depend on this workload.
 
 ## Protect private data
 
