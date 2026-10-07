@@ -528,10 +528,18 @@ fn mentions(entities: &[Entity], seed: u64) -> Vec<Mention> {
             expected: one.clone(),
         });
         if let Some(alias) = e.aliases.first() {
+            let owners = entities
+                .iter()
+                .filter(|other| other.aliases.contains(alias))
+                .count();
             result.push(Mention {
                 category: "recorded alias",
                 text: alias.clone(),
-                expected: one.clone(),
+                expected: if owners > 1 {
+                    Outcome::Ambiguous
+                } else {
+                    one.clone()
+                },
             });
         }
         let mut last: Vec<char> = e.last.chars().collect();
@@ -629,7 +637,7 @@ fn mentions(entities: &[Entity], seed: u64) -> Vec<Mention> {
         } else if HELD_OUT_NICKNAMES.contains(&e.nick) {
             "nickname, irregular, held out of table"
         } else {
-            "nickname, irregular, in table"
+            "nickname, irregular"
         };
         result.push(Mention {
             category,
@@ -744,10 +752,13 @@ struct ResolveScore {
     calls: u64,
     read_chars: u64,
     by_category: HashMap<&'static str, (usize, usize)>,
+    /// Wrong merges that came back `probable`, so the agent would ask first.
+    wrong_but_probable: usize,
+    misses: Vec<String>,
 }
 
 impl ResolveScore {
-    fn add(&mut self, mention: &Mention, got: &Outcome) {
+    fn add(&mut self, mention: &Mention, got: &Outcome, probable: bool) {
         self.total += 1;
         let entry = self.by_category.entry(mention.category).or_default();
         entry.1 += 1;
@@ -756,9 +767,22 @@ impl ResolveScore {
             entry.0 += 1;
             return;
         }
+        self.misses.push(format!(
+            "{}: {:?} expected {:?}, got {:?}{}",
+            mention.category,
+            mention.text,
+            mention.expected,
+            got,
+            if probable { " (probable)" } else { "" }
+        ));
         match (got, &mention.expected) {
             (Outcome::New, _) => self.duplicate += 1,
-            (Outcome::One(_), _) => self.wrong_merge += 1,
+            (Outcome::One(_), _) => {
+                self.wrong_merge += 1;
+                if probable {
+                    self.wrong_but_probable += 1;
+                }
+            }
             (Outcome::Ambiguous, _) => self.needless_question += 1,
         }
     }
@@ -790,7 +814,7 @@ fn run_resolve(
         if probable && got == mention.expected {
             score.probable += 1;
         }
-        score.add(mention, &got);
+        score.add(mention, &got, probable);
     }
     score.calls = omk.calls - before;
     score.read_chars = omk.read_chars - chars_before;
@@ -950,10 +974,11 @@ fn main() {
         }
         for (strategy, s) in &strategies {
             resolve_rows.push(format!(
-                "| {label} | {strategy} | {} | {} | {} | {} | {} | {:.1} | {} |",
+                "| {label} | {strategy} | {} | {} | {} | {} | {} | {} | {:.1} | {} |",
                 pct(s.correct, s.total),
                 pct(s.duplicate, s.total),
-                pct(s.wrong_merge, s.total),
+                pct(s.wrong_merge - s.wrong_but_probable, s.total),
+                pct(s.wrong_but_probable, s.total),
                 pct(s.needless_question, s.total),
                 s.probable,
                 s.calls as f64 / s.total as f64,
@@ -963,9 +988,11 @@ fn main() {
             categories.sort();
             let cells: Vec<String> = categories
                 .iter()
-                .map(|(category, (ok, n))| format!("{category} {}", pct(*ok, *n)))
+                .map(|(category, (ok, n))| format!("{category} {ok}/{n}"))
                 .collect();
             category_rows.push(format!("| {label} | {strategy} | {} |", cells.join(" · ")));
+            let file = format!("misses-{name}-{}.txt", strategy.replace([' ', ','], "-"));
+            std::fs::write(dir.join(file), s.misses.join("\n")).unwrap();
         }
         let mut lookups: Vec<(&str, Vec<&str>)> = vec![
             ("default", vec![]),
@@ -996,7 +1023,7 @@ fn main() {
     let mut report = String::new();
     report.push_str("## Name resolution\n\n");
     report.push_str(&format!("{mention_total} mentions per binary.\n\n"));
-    report.push_str("| binary | strategy | correct | duplicate entity | wrong merge | needless question | correct but probable | CLI calls per mention | tokens read per mention |\n|---|---|---|---|---|---|---|---|---|\n");
+    report.push_str("| binary | strategy | correct | duplicate entity | silent wrong merge | wrong match flagged probable | needless question | correct but probable | CLI calls per mention | tokens read per mention |\n|---|---|---|---|---|---|---|---|---|---|\n");
     report.push_str(&resolve_rows.join("\n"));
     report.push_str("\n\n### Correct by mention category\n\n| binary | strategy | categories |\n|---|---|---|\n");
     report.push_str(&category_rows.join("\n"));

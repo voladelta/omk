@@ -314,6 +314,8 @@ fn resolve_handles_order_accents_initials_and_nicknames() {
         "José Núñez",
         "Siobhan O'Connell",
         "Katherine Lindqvist",
+        "Samantha Nakamura",
+        "Eugene Olsen",
     ]
     .into_iter()
     .enumerate()
@@ -375,6 +377,16 @@ fn resolve_handles_order_accents_initials_and_nicknames() {
     check("Alice Novak", None, Option::None, &[]);
     check("B. Moreau", None, Option::None, &[]);
     check("A M", None, Option::None, &[]);
+    // A long shared surname cannot pay for a different first name.
+    check("Sarah Nakamura", None, Option::None, &[]);
+    check("Eugene Jensen", None, Option::None, &[]);
+    check("Alice Mroeau", Probable, Some(Fuzzy), &["Alice Moreau"]);
+    check(
+        "Nakamura Samanhta",
+        Probable,
+        Some(Fuzzy),
+        &["Samantha Nakamura"],
+    );
 }
 
 #[test]

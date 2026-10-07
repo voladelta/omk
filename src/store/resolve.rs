@@ -286,16 +286,57 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
     Ok((names, subject_count, alias_count))
 }
 
-fn fuzzy_distance(query: &str, known: &str) -> usize {
-    let mut best = edit_distance(query, known);
-    if !query.contains(' ') {
-        for word in known.split(' ') {
-            if word.chars().count() >= MIN_FUZZY_CHARS {
-                best = best.min(edit_distance(query, word));
-            }
-        }
+/// Edits one word may absorb: none up to 3 characters, then one, then two
+/// from 8 characters. A per-word budget keeps a long shared surname from
+/// paying for a different first name.
+fn word_budget(a: &str, b: &str) -> usize {
+    match a.chars().count().min(b.chars().count()) {
+        0..=3 => 0,
+        4..=7 => 1,
+        _ => 2,
     }
-    best
+}
+
+/// Total edits when each word stays within its budget and, for names of
+/// several words, at least one word matches exactly.
+fn aligned_distance(query: &[&str], known: &[&str]) -> Option<usize> {
+    let mut total = 0;
+    let mut exact = false;
+    for (q, k) in query.iter().zip(known) {
+        let distance = edit_distance(q, k);
+        if distance > word_budget(q, k) {
+            return None;
+        }
+        exact |= distance == 0;
+        total += distance;
+    }
+    exact.then_some(total)
+}
+
+fn fuzzy_distance(query: &str, query_key: &str, known: &KnownName) -> Option<usize> {
+    let query_words: Vec<&str> = query.split(' ').collect();
+    let known_words: Vec<&str> = known.normalized.split(' ').collect();
+    if let [word] = query_words.as_slice() {
+        return known_words
+            .iter()
+            .filter(|known| known.chars().count() >= MIN_FUZZY_CHARS)
+            .map(|known| (edit_distance(word, known), word_budget(word, known)))
+            .filter(|(distance, budget)| distance <= budget)
+            .map(|(distance, _)| distance)
+            .min();
+    }
+    if query_words.len() != known_words.len() {
+        return None;
+    }
+    let key_words: Vec<&str> = query_key.split(' ').collect();
+    let known_key: Vec<&str> = known.key.split(' ').collect();
+    [
+        aligned_distance(&query_words, &known_words),
+        aligned_distance(&key_words, &known_key),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 pub(super) fn resolve_name(
@@ -317,7 +358,6 @@ pub(super) fn resolve_name(
     );
     let (names, considered_subjects, considered_aliases) = known_names(conn, scope_ids)?;
     let query_chars = query.chars().count();
-    let threshold = query_chars.div_ceil(5).clamp(1, 3);
     let query_key = word_key(&query);
     let query_words: Vec<&str> = query.split(' ').collect();
     let tiers: [(ResolveTier, TierTest<'_>); 5] = [
@@ -347,13 +387,10 @@ pub(super) fn resolve_name(
         (
             ResolveTier::Fuzzy,
             Box::new(|known| {
-                if query_chars < MIN_FUZZY_CHARS
-                    || known.normalized.chars().count() < MIN_FUZZY_CHARS
-                {
+                if query_chars < MIN_FUZZY_CHARS {
                     return None;
                 }
-                let distance = fuzzy_distance(&query, &known.normalized);
-                (distance <= threshold).then_some(distance)
+                fuzzy_distance(&query, &query_key, known)
             }),
         ),
     ];

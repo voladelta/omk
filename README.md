@@ -310,7 +310,7 @@ It compares the name against every active subject and every string value of an a
 2. name: the same words after folding, in any order (`Moreau, Alice`)
 3. contains: one side contains the other as whole words, with at least 3 characters on the shorter side (`Dr. Alice Moreau`)
 4. tokens: every word of a name of two or more words stands for a different known word, in any order, as the same word, an initial (`A. Moreau`), a prefix of at least two letters (`Kate` for `Katherine`), or a nickname from OMK's built-in table of common English diminutives (`Bob` for `Robert`); at least one word of 3 or more characters must match whole
-5. fuzzy: an edit distance (with adjacent swaps) of at most one per 5 characters, capped at 3, against the whole name or, for a one-word query, any word of at least 4 characters
+5. fuzzy: word by word, in the given or sorted order, each word within an edit budget (with adjacent swaps) of none up to 3 characters, one up to 7 and two beyond, and at least one word exact; a one-word query is compared with each known word of at least 4 characters
 
 `status` is `resolved` for one subject at the exact or name tier, `probable` for one subject at a later tier, `ambiguous` for several subjects, and `none` otherwise. Each candidate lists the names that matched, whether through the subject or an alias, and the alias claim ID. `consideredSubjects` and `consideredAliases` tell an empty store from a real miss. Placeholder names such as `unknown`, `n/a` and `tbd` never match, and resolving one returns `invalid_input`. An irregular nickname missing from the table, such as `Sally` for `Sarah`, does not match; record it as an alias once the user confirms it.
 
