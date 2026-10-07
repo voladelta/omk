@@ -1331,48 +1331,96 @@ pub(super) fn budget_claims(
     ))
 }
 
-/// Above this many visible scopes, search skips the scope facet and relies on
-/// the exact scope check alone, which keeps the MATCH expression small.
+/// Most scope tokens one search MATCH may carry. Each token adds an OR branch
+/// that FTS5 must merge, so large lists cost more than they save.
 const MAX_SCOPE_FACETS: usize = 64;
+/// Highest record boost; bounds how far a later rank row can climb.
+const MAX_BOOST: f64 = 2.0;
 
-/// Filter part of a search MATCH: record types, visible scopes and the
-/// command-echo exclusion, all as facet tokens.
-fn facet_filter(scope_ids: &[String], options: &SearchOptions) -> String {
+/// How a search limits scope. Tokens keep the match inside the index;
+/// `Exact` reads each matching row's scope, which costs a content lookup.
+enum ScopeFilter {
+    Everything,
+    Include(Vec<String>),
+    Exclude(Vec<String>),
+    Exact,
+}
+
+fn scope_filter(conn: &Connection, scope_ids: &[String]) -> Result<ScopeFilter> {
+    if scope_ids.len() <= MAX_SCOPE_FACETS {
+        return Ok(ScopeFilter::Include(scope_ids.to_vec()));
+    }
+    let visible: HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
+    let mut statement = conn.prepare("SELECT id FROM memory_scopes")?;
+    let hidden: Vec<String> = collect_rows(statement.query_map([], |row| row.get(0))?)?
+        .into_iter()
+        .filter(|id: &String| !visible.contains(id.as_str()))
+        .collect();
+    Ok(if hidden.is_empty() {
+        ScopeFilter::Everything
+    } else if hidden.len() <= MAX_SCOPE_FACETS {
+        ScopeFilter::Exclude(hidden)
+    } else {
+        ScopeFilter::Exact
+    })
+}
+
+fn facet_tokens(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| facet_scope_token(id))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Wrap a query part with the record type, scope and command-echo filters,
+/// all as facet tokens.
+fn facet_match(query: &str, scope: &ScopeFilter, options: &SearchOptions) -> String {
     let SearchTypes {
         claims,
         observations,
         events,
     } = options.types;
     let all = !(claims || observations || events);
-    let types: Vec<String> = [
-        ("claim", claims),
-        ("observation", observations),
-        ("event", events),
-    ]
-    .into_iter()
-    .filter(|(_, wanted)| all || *wanted)
-    .map(|(record_type, _)| facet_type_token(record_type))
-    .collect();
-    let mut filter = format!("(facet : ({}))", types.join(" OR "));
-    if scope_ids.len() <= MAX_SCOPE_FACETS {
-        let scopes: Vec<String> = scope_ids.iter().map(|id| facet_scope_token(id)).collect();
-        filter = format!("{filter} AND (facet : ({}))", scopes.join(" OR "));
+    let mut expression = format!("({query})");
+    if !all {
+        let types: Vec<String> = [
+            ("claim", claims),
+            ("observation", observations),
+            ("event", events),
+        ]
+        .into_iter()
+        .filter(|(_, wanted)| *wanted)
+        .map(|(record_type, _)| facet_type_token(record_type))
+        .collect();
+        expression = format!("{expression} AND (facet : ({}))", types.join(" OR "));
+    }
+    if let ScopeFilter::Include(ids) = scope {
+        expression = format!("{expression} AND (facet : ({}))", facet_tokens(ids));
+    }
+    let mut excluded = Vec::new();
+    if let ScopeFilter::Exclude(ids) = scope {
+        excluded.push(facet_tokens(ids));
     }
     if !options.include_commands && (all || events) {
-        filter = format!(
-            "({filter}) NOT (facet : {})",
-            facet_kind_token("memory-command")
-        );
+        excluded.push(facet_kind_token("memory-command"));
     }
-    filter
+    if !excluded.is_empty() {
+        expression = format!("({expression}) NOT (facet : ({}))", excluded.join(" OR "));
+    }
+    expression
 }
 
 /// Score multiplier per record: current claims first, then pending state and
 /// observations, then raw events, with replaced claims last.
-const SEARCH_SCORE: &str = "bm25(memory_fts,0,0,0,1.0,1.0,1.0,1.0,0) * CASE
-    WHEN record_type='claim' THEN CASE claims.status
-        WHEN 'active' THEN 2.0 WHEN 'pending' THEN 1.25 WHEN 'disputed' THEN 1.25 ELSE 0.5 END
-    WHEN record_type='observation' THEN 1.25 ELSE 1.0 END";
+fn search_boost(record_type: &str, status: Option<&ClaimStatus>) -> f64 {
+    match (record_type, status) {
+        ("claim", Some(ClaimStatus::Active)) => MAX_BOOST,
+        ("claim", Some(ClaimStatus::Pending | ClaimStatus::Disputed)) => 1.25,
+        ("claim", _) => 0.5,
+        ("observation", _) => 1.25,
+        _ => 1.0,
+    }
+}
 
 pub(super) fn search_fts(
     conn: &Connection,
@@ -1391,27 +1439,11 @@ pub(super) fn search_fts(
         SearchField::Predicate => "predicate",
         SearchField::Value => "value",
     };
-    let filter = facet_filter(scope_ids, &options);
-    // The facet narrows the match; the exact scope check below stays the
-    // authority, so a raw FTS query that escapes its parentheses or a hash
-    // collision cannot widen visibility.
-    let full = format!("({{{column}}} : ({query})) AND ({filter})");
-    let placeholders = std::iter::repeat_n("?", scope_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let conditions = format!(
-        "memory_fts MATCH ? AND memory_fts.scope_id IN ({placeholders})
-           AND (?=0 OR record_type!='claim' OR claims.status='active')"
-    );
-    let values = |expression: &str| {
-        let mut values = Vec::with_capacity(scope_ids.len() + 3);
-        values.push(rusqlite::types::Value::Text(expression.to_owned()));
-        values.extend(scope_ids.iter().cloned().map(rusqlite::types::Value::Text));
-        values.push(rusqlite::types::Value::Integer(i64::from(
-            options.current_only,
-        )));
-        values
-    };
+    let scope = scope_filter(conn, scope_ids)?;
+    let visible: HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
+    // The query sits inside a column filter; bounded_fts_query keeps its
+    // parentheses balanced so it cannot escape into the facet filters.
+    let full = facet_match(&format!("{{{column}}} : ({query})"), &scope, &options);
     // FTS5 reports bad query syntax as a plain SQLITE_ERROR while stepping;
     // busy and other failures keep their own classification.
     let invalid = |error: rusqlite::Error| -> anyhow::Error {
@@ -1425,56 +1457,131 @@ pub(super) fn search_fts(
             _ => error.into(),
         }
     };
-    let sql = format!(
-        "SELECT record_type,record_id,memory_fts.scope_id,substr(text,1,512),{SEARCH_SCORE} AS score,
-                claims.status,claims.subject,claims.predicate
-         FROM memory_fts LEFT JOIN claims ON record_type='claim' AND claims.id=record_id
-         WHERE {conditions}
-         ORDER BY score,record_type,record_id LIMIT ?"
-    );
-    let mut hit_values = values(&full);
-    hit_values.push(rusqlite::types::Value::Integer(limit as i64));
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement
-        .query_map(rusqlite::params_from_iter(hit_values), |row| {
-            Ok(SearchHit {
-                record_type: row.get(0)?,
-                id: row.get(1)?,
-                scope_id: row.get(2)?,
-                text: row.get(3)?,
-                rank: row.get(4)?,
-                claim_status: row
-                    .get::<_, Option<String>>(5)?
-                    .map(|value| parse_enum(&value))
-                    .transpose()?,
-                subject: row.get(6)?,
-                predicate: row.get(7)?,
-            })
-        })
+    let exact_scope = if matches!(scope, ScopeFilter::Exact) {
+        format!(
+            " AND memory_fts.scope_id IN ({})",
+            std::iter::repeat_n("?", scope_ids.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    } else {
+        String::new()
+    };
+    let values = |expression: &str| {
+        let mut values = vec![rusqlite::types::Value::Text(expression.to_owned())];
+        if !exact_scope.is_empty() {
+            values.extend(scope_ids.iter().cloned().map(rusqlite::types::Value::Text));
+        }
+        values
+    };
+
+    // ORDER BY rank takes FTS5's fast path. Boosts are applied while reading
+    // rows in rank order: once a row's best possible boosted score cannot beat
+    // the page's worst, no later row can either.
+    let mut statement = conn.prepare(&format!(
+        "SELECT record_type,record_id,scope_id,substr(text,1,512),rank FROM memory_fts
+         WHERE memory_fts MATCH ?{exact_scope} AND rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
+         ORDER BY rank"
+    ))?;
+    let mut claim_lookup =
+        conn.prepare_cached("SELECT status,subject,predicate FROM claims WHERE id=?1")?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(values(&full)))
         .map_err(invalid)?;
-    let hits = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(invalid)?;
+    let mut hits: Vec<SearchHit> = Vec::new();
+    while let Some(row) = rows.next().map_err(invalid)? {
+        let rank: f64 = row.get(4)?;
+        // hits stays sorted, so its last entry is the page's worst.
+        if hits.len() >= limit
+            && hits
+                .last()
+                .is_some_and(|worst| rank * MAX_BOOST > worst.rank)
+        {
+            break;
+        }
+        let record_type: String = row.get(0)?;
+        let scope_id: String = row.get(2)?;
+        if !visible.contains(scope_id.as_str()) {
+            continue;
+        }
+        let id: String = row.get(1)?;
+        let (status, subject, predicate) = if record_type == "claim" {
+            let (status, subject, predicate) = claim_lookup.query_row([&id], |row| {
+                Ok((
+                    parse_enum::<ClaimStatus>(&row.get::<_, String>(0)?)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            (Some(status), Some(subject), Some(predicate))
+        } else {
+            (None, None, None)
+        };
+        if options.current_only && status.as_ref().is_some_and(|s| *s != ClaimStatus::Active) {
+            continue;
+        }
+        let hit = SearchHit {
+            rank: rank * search_boost(&record_type, status.as_ref()),
+            record_type,
+            id,
+            scope_id,
+            text: row.get(3)?,
+            claim_status: status,
+            subject,
+            predicate,
+        };
+        let position = hits.partition_point(|other| {
+            other
+                .rank
+                .total_cmp(&hit.rank)
+                .then_with(|| other.record_type.cmp(&hit.record_type))
+                .then_with(|| other.id.cmp(&hit.id))
+                .is_lt()
+        });
+        if position < limit {
+            hits.insert(position, hit);
+            hits.truncate(limit);
+        }
+    }
+    drop(rows);
     if !count {
         let shown = hits.len();
         return Ok(SearchPage::new(hits, shown, shown, limit));
     }
-    let count_sql = format!(
-        "SELECT count(*) FROM memory_fts LEFT JOIN claims ON record_type='claim' AND claims.id=record_id
-         WHERE {conditions}"
-    );
+    // Counts come from the index alone. Under --current-only, claims that
+    // are not active are counted separately and subtracted.
     let count_of = |expression: &str| -> Result<usize> {
-        let total: i64 = conn
+        let mut total: i64 = conn
             .query_row(
-                &count_sql,
+                &format!("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?{exact_scope}"),
                 rusqlite::params_from_iter(values(expression)),
                 |row| row.get(0),
             )
             .map_err(invalid)?;
+        if options.current_only {
+            let claims = format!("({expression}) AND (facet : {})", facet_type_token("claim"));
+            let inactive: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM memory_fts JOIN claims ON claims.id=memory_fts.record_id
+                         WHERE memory_fts MATCH ?{exact_scope} AND claims.status!='active'"
+                    ),
+                    rusqlite::params_from_iter(values(&claims)),
+                    |row| row.get(0),
+                )
+                .map_err(invalid)?;
+            total -= inactive;
+        }
         Ok(total as usize)
     };
-    let matched = count_of(&full)?;
-    let searchable = count_of(&filter)?;
+    let matched = count_of(&full)?.max(hits.len());
+    let any_record = format!(
+        "facet : ({})",
+        ["claim", "observation", "event"]
+            .map(facet_type_token)
+            .join(" OR ")
+    );
+    let searchable = count_of(&facet_match(&any_record, &scope, &options))?;
     Ok(SearchPage::new(hits, matched, searchable, limit))
 }
 
@@ -1492,8 +1599,35 @@ pub(super) fn bounded_fts_query(query: &str, mode: SearchMode) -> Result<String>
             .map(literal_fts_query)
             .collect::<Vec<_>>()
             .join(" AND "),
-        SearchMode::Advanced => query.to_owned(),
+        SearchMode::Advanced => {
+            ensure!(
+                balanced_outside_strings(query),
+                KernelError::invalid_search_query(
+                    "FTS5 query must have balanced parentheses and closed strings"
+                )
+            );
+            query.to_owned()
+        }
     })
+}
+
+/// Search wraps a raw query in parentheses inside a column filter, so a raw
+/// query must not close that group early.
+fn balanced_outside_strings(query: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    for c in query.chars() {
+        match c {
+            '"' => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0 && !in_string
 }
 
 pub(super) fn query_string_column(

@@ -363,3 +363,138 @@ fn cli_search_page_flags_and_resolve() {
     assert_eq!(resolved["tier"], "name");
     assert_eq!(resolved["candidates"][0]["subject"], "Alice Moreau");
 }
+
+fn page(store: &MemoryStore, scope: &str, query: &str, limit: usize) -> SearchPage {
+    store
+        .search_page(scope, query, limit, SearchOptions::default())
+        .unwrap()
+}
+
+#[test]
+fn every_scope_strategy_returns_exactly_the_visible_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::open(dir.path().join("memory.db")).unwrap();
+    // Everything visible: one root.
+    store
+        .create_scope("root", ScopeKind::User, None, None, "root")
+        .unwrap();
+    event(&mut store, "root", "basalt", "root-event");
+    assert_eq!(page(&store, "root", "basalt", 10).matched, 1);
+    // Excluded: a second root with a few scopes, and more than 64 visible.
+    store
+        .create_scope("other", ScopeKind::User, None, None, "other")
+        .unwrap();
+    event(&mut store, "other", "basalt", "other-event");
+    for index in 0..70 {
+        let scope = format!("root-{index}");
+        store
+            .create_scope(&scope, ScopeKind::Task, Some("root"), None, &scope)
+            .unwrap();
+        event(&mut store, &scope, "basalt", &format!("root-{index}-event"));
+    }
+    let excluded = page(&store, "root", "basalt", 1000);
+    assert_eq!(
+        (excluded.shown, excluded.matched, excluded.searchable),
+        (71, 71, 71)
+    );
+    assert!(
+        excluded
+            .hits
+            .iter()
+            .all(|hit| hit.scope_id.starts_with("root"))
+    );
+    // Exact: more than 64 scopes on both sides.
+    for index in 0..70 {
+        let scope = format!("other-{index}");
+        store
+            .create_scope(&scope, ScopeKind::Task, Some("other"), None, &scope)
+            .unwrap();
+        event(
+            &mut store,
+            &scope,
+            "basalt",
+            &format!("other-{index}-event"),
+        );
+    }
+    let exact = page(&store, "root", "basalt", 1000);
+    assert_eq!((exact.shown, exact.matched, exact.searchable), (71, 71, 71));
+    assert!(
+        exact
+            .hits
+            .iter()
+            .all(|hit| hit.scope_id.starts_with("root"))
+    );
+    let limited = page(&store, "root", "basalt", 5);
+    assert_eq!((limited.shown, limited.matched), (5, 71));
+}
+
+#[test]
+fn boosted_pages_match_a_full_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    let words = ["ember", "flint", "garnet", "hazel"];
+    for index in 0..60 {
+        let text = format!("ember {} {}", words[index % 4], "filler ".repeat(index % 7));
+        if index % 3 == 0 {
+            let claim = fact(
+                &mut store,
+                &format!("S{index}"),
+                "note",
+                &text,
+                &format!("c{index}"),
+            );
+            if index % 2 == 0 {
+                store
+                    .correct_claim(
+                        &claim.id,
+                        json!(format!("{text} v2")),
+                        &[],
+                        &format!("x{index}"),
+                    )
+                    .unwrap();
+            }
+        } else {
+            event(&mut store, "thread", &text, &format!("e{index}"));
+        }
+    }
+    for current_only in [false, true] {
+        let options = SearchOptions {
+            current_only,
+            ..Default::default()
+        };
+        let all = store.search_page("user", "ember", 1000, options).unwrap();
+        assert_eq!(all.shown, all.matched);
+        for limit in [1, 5, 17] {
+            let top = store.search_page("user", "ember", limit, options).unwrap();
+            let expected: Vec<&str> = all.hits[..limit].iter().map(|h| h.id.as_str()).collect();
+            let got: Vec<&str> = top.hits.iter().map(|h| h.id.as_str()).collect();
+            assert_eq!(got, expected, "limit {limit} current_only {current_only}");
+            assert_eq!(top.matched, all.matched);
+        }
+        if current_only {
+            assert!(
+                all.hits.iter().all(|hit| hit.claim_status.is_none()
+                    || hit.claim_status == Some(ClaimStatus::Active))
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_queries_cannot_escape_the_filter_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    event(&mut store, "sibling", "secret plan", "hidden");
+    let advanced = SearchOptions {
+        mode: SearchMode::Advanced,
+        ..Default::default()
+    };
+    for query in ["x) OR (plan", "plan) OR (facet : rtevent", "\"unclosed"] {
+        let error = store.search_page("user", query, 10, advanced).unwrap_err();
+        assert_eq!(kind(error), KernelErrorKind::InvalidSearchQuery, "{query}");
+    }
+    let quoted = store
+        .search_page("user", "\"plan ) (\" OR plan", 10, advanced)
+        .unwrap();
+    assert_eq!(quoted.matched, 0);
+}

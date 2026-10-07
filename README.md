@@ -292,9 +292,9 @@ Narrow a search with these flags:
 - `--field subject|predicate|value` matches only that part of a claim, so a search for a name in alias values does not match every claim whose subject holds the name; the default `text` field matches the whole record
 - `--include-commands` adds the `memory-command` events that every direct claim write records; search leaves them out by default because each repeats its claim
 
-Scope, record type and command filters are tokens in the full-text index, so they narrow the match itself rather than filtering its rows afterwards. Search still checks each hit's exact scope ID. Above 64 visible scopes the scope tokens are skipped and only the exact check applies.
+Scope, record type and command filters are tokens in the full-text index, so they narrow the match itself rather than filtering its rows afterwards. For scope, search uses the smaller of two lists: the visible scopes, or the scopes they leave out. A root scope that sees everything needs no scope filter. When both lists exceed 64 scopes, search checks each matching row's scope ID instead, which reads every matching row and is slower. Every returned hit is also checked against the exact visible scope IDs. Raw `--fts-query` input must have balanced parentheses and closed strings, so it cannot step outside the filters.
 
-Results sort by BM25 multiplied by a record boost, then record type and record ID. Active claims count double, pending and disputed claims and observations count 1.25, events count 1, and superseded, rejected and expired claims count 0.5. `rank` reports that product; lower sorts first.
+Results sort by BM25 multiplied by a record boost, then record type and record ID. Active claims count double, pending and disputed claims and observations count 1.25, events count 1, and superseded, rejected and expired claims count 0.5. `rank` reports that product; lower sorts first. Search reads rows in plain BM25 order and stops once no later row could reach the page even at the highest boost, so only the page's neighbourhood is decoded. `matched` and `searchable` are counted from the index.
 
 ## Resolve entity names
 
