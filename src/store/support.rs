@@ -1559,8 +1559,6 @@ pub(super) fn search_fts(
         .map(|(class, _)| Some(class))
         .collect()
     };
-    let mut claim_lookup =
-        conn.prepare_cached("SELECT status,subject,predicate FROM claims WHERE id=?1")?;
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut qualified = 0;
     for class in plans {
@@ -1571,9 +1569,12 @@ pub(super) fn search_fts(
             None => full.clone(),
         };
         let mut statement = conn.prepare(&format!(
-            "SELECT record_type,record_id,scope_id,substr(text,1,512),rank FROM memory_fts
-             WHERE memory_fts MATCH ?{exact_scope} AND rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
-             ORDER BY rank{}",
+            "SELECT record_type,record_id,memory_fts.scope_id,substr(text,1,512),memory_fts.rank,
+                    claims.status,claims.subject,claims.predicate
+             FROM memory_fts LEFT JOIN claims ON record_type='claim' AND claims.id=record_id
+             WHERE memory_fts MATCH ?{exact_scope}
+               AND memory_fts.rank MATCH 'bm25(0,0,0,1,1,1,1,0)'
+             ORDER BY memory_fts.rank{}",
             if limited { " LIMIT ?" } else { "" }
         ))?;
         let mut class_values = values(match_scope, &expression);
@@ -1600,18 +1601,13 @@ pub(super) fn search_fts(
                 continue;
             }
             let id: String = row.get(1)?;
-            let (status, subject, predicate) = if record_type == "claim" {
-                let (status, subject, predicate) = claim_lookup.query_row([&id], |row| {
-                    Ok((
-                        parse_enum::<ClaimStatus>(&row.get::<_, String>(0)?)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                (Some(status), Some(subject), Some(predicate))
-            } else {
-                (None, None, None)
-            };
+            // The join fills these for claims only.
+            let status = row
+                .get::<_, Option<String>>(5)?
+                .map(|status| parse_enum::<ClaimStatus>(&status))
+                .transpose()?;
+            let subject: Option<String> = row.get(6)?;
+            let predicate: Option<String> = row.get(7)?;
             if options.current_only && status.as_ref().is_some_and(|s| *s != ClaimStatus::Active) {
                 continue;
             }
@@ -1651,10 +1647,18 @@ pub(super) fn search_fts(
     };
     // Searchable only matters for an empty page, so it is counted only then.
     let searchable = if matched == 0 {
+        // Only claims fill the subject, predicate and value fields, so a
+        // field search has only claims to search.
+        let record_types: &[&str] = match options.field {
+            SearchField::Text => &["claim", "observation", "event"],
+            _ => &["claim"],
+        };
         let any_record = format!(
             "facet : ({})",
-            ["claim", "observation", "event"]
-                .map(facet_type_token)
+            record_types
+                .iter()
+                .map(|record_type| facet_type_token(record_type))
+                .collect::<Vec<_>>()
                 .join(" OR ")
         );
         let mut total = raw_count(&scope, &facet_match(&any_record, &scope, &options))?;

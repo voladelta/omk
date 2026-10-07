@@ -253,6 +253,30 @@ fn command_echoes_types_and_fields_filter_inside_the_match() {
         )
         .unwrap();
     assert_eq!(alias_hit.hits[0].id, nickname.id);
+
+    // Only claims have a subject, so a subject miss counts claims alone,
+    // and a subject search over events has nothing to search.
+    let subject = SearchOptions {
+        field: SearchField::Subject,
+        ..Default::default()
+    };
+    assert_eq!(
+        store
+            .search_page("user", "tulip", 20, subject)
+            .unwrap()
+            .searchable,
+        Some(2)
+    );
+    let events = SearchOptions {
+        types: SearchTypes {
+            events: true,
+            ..Default::default()
+        },
+        ..subject
+    };
+    let nothing = store.search_page("user", "alice", 20, events).unwrap();
+    assert_eq!(nothing.searchable, Some(0));
+    assert!(nothing.next_action.unwrap().contains("--field"));
 }
 
 #[test]
@@ -327,6 +351,36 @@ fn bad_fts_syntax_is_an_invalid_search_query() {
 }
 
 #[test]
+fn resolve_tokens_tier_stays_fast_on_many_initials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = setup(&dir.path().join("memory.db"));
+    // Twenty words share one initial, so twelve initials fit them in
+    // 20!/8! orders; trying each order would not finish.
+    let words: Vec<String> = (0..20)
+        .map(|i| format!("a{}x", (b'a' + i) as char))
+        .collect();
+    let subject = format!("Zed {}", words.join(" "));
+    fact(&mut store, &subject, "role", "engineer", "c1");
+
+    let initials = ["A."; 12].join(" ");
+    let miss = store
+        .resolve_name("thread", &format!("Zed {initials} Q."))
+        .unwrap();
+    assert_eq!(miss.status, ResolveStatus::None);
+    let hit = store
+        .resolve_name("thread", &format!("Zed {initials}"))
+        .unwrap();
+    assert_eq!(
+        (hit.status, hit.tier, hit.candidates[0].subject.as_str()),
+        (
+            ResolveStatus::Probable,
+            Some(ResolveTier::Tokens),
+            subject.as_str()
+        )
+    );
+}
+
+#[test]
 fn resolve_walks_exact_name_contains_and_fuzzy_tiers() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = setup(&dir.path().join("memory.db"));
@@ -369,7 +423,8 @@ fn resolve_walks_exact_name_contains_and_fuzzy_tiers() {
     );
     let new = store.resolve_name("thread", "Zed Quinlan").unwrap();
     assert_eq!(new.status, ResolveStatus::None);
-    assert_eq!((new.considered_subjects, new.considered_aliases), (2, 2));
+    // The "unknown" alias is a placeholder, so it is not considered.
+    assert_eq!((new.considered_subjects, new.considered_aliases), (2, 1));
     assert_eq!(
         kind(store.resolve_name("thread", " N/A ").unwrap_err()),
         KernelErrorKind::InvalidInput

@@ -138,10 +138,8 @@ fn is_nickname(short: &str, formal: &str) -> bool {
 
 /// How a query word can stand for a known word in the tokens tier.
 fn word_matches(query: &str, known: &str) -> bool {
-    let query_chars = query.chars().count();
     query == known
-        || (query_chars == 1 && known.starts_with(query))
-        || (query_chars >= 2 && known.starts_with(query))
+        || known.starts_with(query)
         || (known.chars().count() >= MIN_LOOSE_CHARS && query.starts_with(known))
         || is_nickname(query, known)
         || is_nickname(known, query)
@@ -149,26 +147,64 @@ fn word_matches(query: &str, known: &str) -> bool {
 
 /// Every query word stands for a different known word, in any order, and at
 /// least one pair matches whole: "A. Moreau" or "Bob Novak", not "A. B.".
+///
+/// Each whole pair is tried as the anchor, and the other query words are
+/// paired by augmenting paths, so the cost stays polynomial in the word
+/// counts instead of trying every assignment.
 fn words_match(query: &[&str], known: &[&str]) -> bool {
-    fn assign(query: &[&str], known: &[&str], used: &mut Vec<bool>, anchored: bool) -> bool {
-        let Some((first, rest)) = query.split_first() else {
-            return anchored;
-        };
-        for (index, word) in known.iter().enumerate() {
-            if !used[index] && word_matches(first, word) {
-                used[index] = true;
-                let whole = first == word && first.chars().count() >= MIN_LOOSE_CHARS;
-                if assign(rest, known, used, anchored || whole) {
+    if query.len() < 2 || query.len() > known.len() {
+        return false;
+    }
+    let anchors: Vec<(usize, usize)> = query
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| word.chars().count() >= MIN_LOOSE_CHARS)
+        .flat_map(|(q, word)| {
+            known
+                .iter()
+                .enumerate()
+                .filter(move |(_, other)| *other == word)
+                .map(move |(k, _)| (q, k))
+        })
+        .collect();
+    if anchors.is_empty() {
+        return false;
+    }
+    let fits: Vec<Vec<bool>> = query
+        .iter()
+        .map(|q| known.iter().map(|k| word_matches(q, k)).collect())
+        .collect();
+    anchors
+        .into_iter()
+        .any(|(anchor_q, anchor_k)| pairs_rest(&fits, anchor_q, anchor_k))
+}
+
+/// Whether every query word except `anchor_q` fits its own known word other
+/// than `anchor_k`, by Kuhn's augmenting-path matching.
+fn pairs_rest(fits: &[Vec<bool>], anchor_q: usize, anchor_k: usize) -> bool {
+    fn augment(
+        q: usize,
+        fits: &[Vec<bool>],
+        owner: &mut [Option<usize>],
+        seen: &mut [bool],
+    ) -> bool {
+        for k in 0..owner.len() {
+            if fits[q][k] && !seen[k] {
+                seen[k] = true;
+                if owner[k].is_none_or(|other| augment(other, fits, owner, seen)) {
+                    owner[k] = Some(q);
                     return true;
                 }
-                used[index] = false;
             }
         }
         false
     }
-    query.len() >= 2
-        && query.len() <= known.len()
-        && assign(query, known, &mut vec![false; known.len()], false)
+    let mut owner = vec![None; fits[anchor_q].len()];
+    (0..fits.len()).filter(|q| *q != anchor_q).all(|q| {
+        let mut seen = vec![false; owner.len()];
+        seen[anchor_k] = true;
+        augment(q, fits, &mut owner, &mut seen)
+    })
 }
 
 fn is_placeholder(normalized: &str) -> bool {
@@ -274,12 +310,10 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
             ))
         },
     )?)?;
-    let mut alias_count = 0;
     for (id, subject, scope_id, value_json) in aliases {
         let Ok(Value::String(alias)) = serde_json::from_str::<Value>(&value_json) else {
             continue;
         };
-        alias_count += 1;
         let normalized = normalize_name(&alias);
         names.push(KnownName {
             key: word_key(&normalized),
@@ -291,13 +325,15 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
             scope_id,
         });
     }
+    // Placeholders never match, so they do not count as considered either.
+    names.retain(|known| !is_placeholder(&known.normalized));
     let subject_count = names
         .iter()
         .filter(|known| known.via == "subject")
         .map(|known| known.subject.as_str())
         .collect::<HashSet<_>>()
         .len();
-    names.retain(|known| !is_placeholder(&known.normalized));
+    let alias_count = names.iter().filter(|known| known.via == "alias").count();
     Ok((names, subject_count, alias_count))
 }
 
@@ -461,18 +497,21 @@ pub(super) fn resolve_name(
             candidates.len()
         ),
         ResolveStatus::None if considered_subjects == 0 => {
-            "no active claims in the visible scopes; check --scope, or treat the name as new"
+            "no active claims with a usable name in the visible scopes; check --scope, or treat the name as new"
                 .to_owned()
         }
         ResolveStatus::None => format!(
             "no match among {considered_subjects} subjects and {considered_aliases} aliases; treat {name:?} as new only if the source makes that clear, otherwise ask"
         ),
     };
+    let matched = candidates.len();
     candidates.truncate(MAX_CANDIDATES);
     Ok(Resolution {
         query: name.to_owned(),
         status,
         tier,
+        shown: candidates.len(),
+        matched,
         candidates,
         considered_subjects,
         considered_aliases,

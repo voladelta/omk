@@ -999,6 +999,16 @@ fn is_sqlite_contention(cause: &(dyn std::error::Error + 'static)) -> bool {
     )
 }
 
+/// Recovery hint for a schema mismatch, naming the schema this build opens.
+fn schema_mismatch_action() -> &'static str {
+    static ACTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ACTION.get_or_init(|| {
+        format!(
+            "restore a valid schema v{SCHEMA_VERSION} database from backup; do not delete existing data"
+        )
+    })
+}
+
 fn classify_error(
     error: &anyhow::Error,
     key_reusable_for_command: bool,
@@ -1025,7 +1035,7 @@ fn classify_error(
             "schema_mismatch",
             false,
             true,
-            Some("restore a valid schema v7 database from backup; do not delete existing data"),
+            Some(schema_mismatch_action()),
         ),
         KernelErrorKind::IdempotencyConflict => (
             "idempotency_conflict",
@@ -1233,7 +1243,8 @@ mod tests {
     fn schema_mismatch_recovery_names_the_current_schema() {
         let classified = classified(KernelErrorKind::SchemaMismatch, "schema mismatch", false);
         assert_eq!(classified.0, "schema_mismatch");
-        assert!(classified.3.is_some_and(|action| action.contains("v7")));
+        let schema = format!("schema v{} database", omk::SCHEMA_VERSION);
+        assert!(classified.3.is_some_and(|action| action.contains(&schema)));
     }
 
     #[test]

@@ -518,7 +518,7 @@ impl SearchPage {
     ) -> Self {
         let shown = hits.len();
         let next_action = if searchable == Some(0) {
-            Some("no searchable records in this scope with these filters; check --scope (siblings are not searched) and the type filters".to_owned())
+            Some("no searchable records in this scope with these filters; check --scope (siblings are not searched), the type filters, and --field (subject, predicate and value hold claims only)".to_owned())
         } else if let (0, Some(searchable)) = (matched, searchable) {
             Some(format!(
                 "no match among {searchable} searchable records; try --terms or fewer words before treating the fact as unknown"
@@ -632,6 +632,11 @@ pub struct Resolution {
     pub query: String,
     pub status: ResolveStatus,
     pub tier: Option<ResolveTier>,
+    /// Candidates returned, at most 20.
+    pub shown: usize,
+    /// Subjects that matched at the deciding tier; more than `shown` when
+    /// the candidate list was cut.
+    pub matched: usize,
     pub candidates: Vec<ResolveCandidate>,
     /// Distinct active subjects and alias names compared against the query.
     pub considered_subjects: usize,
