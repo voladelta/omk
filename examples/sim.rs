@@ -10,7 +10,10 @@
 //! HYGIENE is the share of open loops the agent later forgets. Writes
 //! month.jsonl (growth and latency every 30 days), snap.jsonl (the active
 //! claims context returns for project a each day) and ops.jsonl (operation
-//! log rows).
+//! log rows). cache.jsonl records, for consecutive compact contexts in one
+//! thread at CACHE_BUDGET tokens (default 16,000), how much of the serialized
+//! payload the second call shares with the first: the part a prompt cache
+//! could reuse.
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -93,6 +96,10 @@ struct Sim {
     conflicts: u64,
     // An early append, replayed at the end to check compacted keys.
     probe: Option<NewEvent>,
+    cache: BufWriter<File>,
+    cache_budget: i64,
+    // thread, serialized payload and claim ids of the last cache probe
+    last_context: Option<(String, String, Vec<String>)>,
 }
 
 impl Sim {
@@ -172,6 +179,49 @@ impl Sim {
         }
     }
 
+    fn cache_probe(&mut self, thread: &str, stream: &str, step: &str) {
+        let bundle = self
+            .s
+            .compose_compact_context(thread, stream, self.cache_budget, 2000, None)
+            .unwrap();
+        let payload = bundle.compact_model_payload();
+        let claims_len = payload["claims"].to_string().len();
+        let text = payload.to_string();
+        let ids: Vec<String> = bundle.claims.iter().map(|c| c.id.clone()).collect();
+        let omitted = bundle
+            .diagnostics
+            .omitted_items
+            .iter()
+            .filter(|item| item.reason == "active claim budget")
+            .count();
+        if let Some((last_thread, last_text, last_ids)) = &self.last_context
+            && last_thread == thread
+        {
+            let shared = last_text
+                .bytes()
+                .zip(text.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let first_diff = last_ids
+                .iter()
+                .zip(&ids)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let removed = last_ids.iter().filter(|id| !ids.contains(id)).count();
+            let added = ids.iter().filter(|id| !last_ids.contains(id)).count();
+            writeln!(
+                self.cache,
+                "{}",
+                json!({"day": self.day, "step": step, "prev": last_text.len(), "total": text.len(),
+                       "shared": shared, "claimsLen": claims_len, "claims": ids.len(),
+                       "firstDiff": first_diff, "removed": removed, "added": added,
+                       "omitted": omitted})
+            )
+            .unwrap();
+        }
+        self.last_context = Some((thread.to_owned(), text, ids));
+    }
+
     fn thread_day(&mut self, project: &str, hygiene: f64) -> (String, String, f64) {
         let thread = format!("thread:{project}:{}", self.day);
         let stream = format!("s:{project}:{}", self.day);
@@ -193,6 +243,7 @@ impl Sim {
             .filter(|e| e.sensitivity == Sensitivity::Normal)
             .map(|e| e.id.clone())
             .collect();
+        self.cache_probe(&thread, &stream, "events");
 
         let key = self.key("plan");
         let started = Instant::now();
@@ -254,6 +305,7 @@ impl Sim {
             )
             .unwrap()
             .data;
+        self.cache_probe(&thread, &stream, "commit");
         for claim in commit.claims {
             let roll = self.rng.f();
             if roll < 0.4 {
@@ -276,6 +328,7 @@ impl Sim {
             }
         }
 
+        self.cache_probe(&thread, &stream, "review");
         let scope = format!("project:{project}");
         self.single_fact(&scope, ClaimKind::Fact, 0.6, "fact");
         if self.rng.chance(0.3) {
@@ -299,6 +352,7 @@ impl Sim {
                 .then(|| self.day + self.rng.range(1, 21) as i64);
             self.loops.push((claim.id, resolve));
         }
+        self.cache_probe(&thread, &stream, "facts");
         (thread, stream, plan_ms)
     }
 }
@@ -321,6 +375,9 @@ fn main() {
         loops: Vec::new(),
         conflicts: 0,
         probe: None,
+        cache: BufWriter::new(File::create(out.join("cache.jsonl")).unwrap()),
+        cache_budget: std::env::var("CACHE_BUDGET").map_or(16_000, |v| v.parse().unwrap()),
+        last_context: None,
     };
     // Operations commit in real time, so each simulated day moves every saved
     // operation one day into the past. That lets 30-day compaction run.

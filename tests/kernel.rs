@@ -3509,35 +3509,53 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
         .map(|claim| serde_json::to_string(claim).unwrap().chars().count() as i64 / 4 + 2)
         .max()
         .unwrap();
-    // Room for ten claims: the pin share holds five user claims, and the
-    // newest five of the rest are project claims.
+    // Room for ten claims: the pin share fits the newest five user claims and
+    // the rest goes to the newest project claims. An overflowing pass ends at
+    // its oldest landmark, and pin room it leaves goes to the project pass.
     let claim_budget = largest * 10 + largest / 2;
     let context = fixture
         .store
         .compose_context("project", "stream", claim_budget * 2, 0, None)
         .unwrap();
-    let mut kept: Vec<&str> = context
+    let kept: Vec<String> = context
         .claims
         .iter()
-        .map(|claim| ids[&claim.id].as_str())
+        .map(|claim| ids[&claim.id].clone())
         .collect();
+    let subject_ids: std::collections::HashMap<&str, &str> = ids
+        .iter()
+        .map(|(id, subject)| (subject.as_str(), id.as_str()))
+        .collect();
+    for (prefix, most) in [("u", 5), ("p", 10)] {
+        // Each scope keeps a newest run, from index 9 down.
+        let run: Vec<usize> = (0..10)
+            .rev()
+            .take_while(|i| kept.contains(&format!("{prefix}{i}")))
+            .collect();
+        let count = kept.iter().filter(|s| s.starts_with(prefix)).count();
+        assert_eq!(run.len(), count, "{prefix} claims are not a newest run");
+        assert!((1..=most).contains(&count));
+        if count < 10 {
+            // An overflowing run ends at a landmark, or holds none.
+            let landmark =
+                |i: &usize| is_claim_landmark(subject_ids[format!("{prefix}{i}").as_str()]);
+            assert!(landmark(run.last().unwrap()) || !run.iter().any(landmark));
+        }
+    }
+    let mut kept = kept;
     kept.sort_unstable();
-    assert_eq!(
-        kept,
-        ["p5", "p6", "p7", "p8", "p9", "u5", "u6", "u7", "u8", "u9"]
-    );
-    let mut omitted: Vec<&str> = context
+    let mut omitted: Vec<String> = context
         .diagnostics
         .omitted_items
         .iter()
         .filter(|item| item.reason == "active claim budget")
-        .map(|item| ids[&item.id].as_str())
+        .map(|item| ids[&item.id].clone())
         .collect();
+    omitted.extend(kept);
     omitted.sort_unstable();
-    assert_eq!(
-        omitted,
-        ["p0", "p1", "p2", "p3", "p4", "u0", "u1", "u2", "u3", "u4"]
-    );
+    let mut every: Vec<String> = ids.values().cloned().collect();
+    every.sort_unstable();
+    assert_eq!(omitted, every);
 
     let plan = fixture
         .store
@@ -3546,7 +3564,73 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
         .data
         .into_plan()
         .unwrap();
-    assert_eq!(plan.active_claims.len(), 10);
+    assert_eq!(plan.active_claims.len(), context.claims.len());
+}
+
+/// The claim landmark rule from the store: FNV-1a of the id, one in four.
+fn is_claim_landmark(id: &str) -> bool {
+    let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    hash % 4 == 0
+}
+
+#[test]
+fn claim_budget_cutoff_holds_across_additions() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    fixture.scope("project", ScopeKind::Project, Some("user"));
+    fixture.event("project", "stream", "start", Sensitivity::Normal, "seed");
+    let add = |fixture: &mut Fixture, index: usize| {
+        fixture
+            .store
+            .remember_claim(
+                "project",
+                ClaimKind::Fact,
+                &format!("p{index:03}"),
+                "value",
+                json!("v".repeat(400)),
+                &[],
+                &format!("remember-{index}"),
+            )
+            .unwrap()
+            .data
+    };
+    let first = add(&mut fixture, 0);
+    let cost = serde_json::to_string(&first).unwrap().chars().count() as i64 / 4 + 2;
+    for index in 1..40 {
+        add(&mut fixture, index);
+    }
+    // Room for about 24 claims; every addition pushes the window forward.
+    let budget = cost * 24 * 2;
+    let oldest_kept = |fixture: &Fixture| {
+        let context = fixture
+            .store
+            .compose_context("project", "stream", budget, 0, None)
+            .unwrap();
+        assert!(!context.diagnostics.omitted_items.is_empty());
+        context.claims.first().unwrap().id.clone()
+    };
+    let mut cutoff = oldest_kept(&fixture);
+    let mut moves = 0;
+    for index in 40..80 {
+        let newest = add(&mut fixture, index);
+        let next = oldest_kept(&fixture);
+        assert!(
+            fixture
+                .store
+                .compose_context("project", "stream", budget, 0, None)
+                .unwrap()
+                .claims
+                .iter()
+                .any(|claim| claim.id == newest.id)
+        );
+        moves += usize::from(next != cutoff);
+        cutoff = next;
+    }
+    // Without landmarks the cutoff moves on all 40 additions; with one claim
+    // in four a landmark it moves about 10 times.
+    assert!(moves <= 22, "cutoff moved {moves} times in 40 additions");
 }
 
 #[test]
