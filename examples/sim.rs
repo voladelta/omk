@@ -15,7 +15,8 @@
 //! tokens (default 2,000), how much of the serialized payload the second call
 //! shares with the first: the part a prompt cache could reuse. It probes after
 //! every appended event and after each observer commit, review and fact step,
-//! and names the payload section where the shared prefix ends.
+//! names the payload section where the shared prefix ends and, for claims,
+//! whether a claim was added, evicted by the budget or retired there.
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -225,6 +226,28 @@ impl Sim {
             .filter(|(at, _)| *at <= shared)
             .max()
             .map_or("none", |(_, key)| key);
+            // Why the claim lists first differ, and the scope kind there.
+            let why = match (last_ids.get(first_diff), ids.get(first_diff)) {
+                (Some(old), _) if !ids.contains(old) => {
+                    let evicted = bundle
+                        .diagnostics
+                        .omitted_items
+                        .iter()
+                        .any(|item| &item.id == old && item.reason == "active claim budget");
+                    if evicted { "evicted" } else { "retired" }
+                }
+                (_, Some(new)) if !last_ids.contains(new) => "added",
+                (None, None) => "none",
+                _ => "moved",
+            };
+            let at = ids.get(first_diff).or(last_ids.get(first_diff));
+            let diff_scope = bundle
+                .claims
+                .iter()
+                .find(|claim| Some(&claim.id) == at)
+                .map_or("gone", |claim| {
+                    claim.scope_id.split(':').next().unwrap_or("")
+                });
             let removed = last_ids.iter().filter(|id| !ids.contains(id)).count();
             let added = ids.iter().filter(|id| !last_ids.contains(id)).count();
             writeln!(
@@ -233,7 +256,7 @@ impl Sim {
                 json!({"day": self.day, "step": step, "prev": last_text.len(), "total": text.len(),
                        "shared": shared, "claimsLen": claims_len, "claims": ids.len(),
                        "firstDiff": first_diff, "removed": removed, "added": added,
-                       "omitted": omitted, "section": section,
+                       "omitted": omitted, "section": section, "why": why, "diffScope": diff_scope,
                        "events": bundle.recent_events.len()})
             )
             .unwrap();
