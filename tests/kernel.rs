@@ -3634,6 +3634,57 @@ fn claim_budget_cutoff_holds_across_additions() {
 }
 
 #[test]
+fn raw_tail_start_holds_across_appends() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let content = "x".repeat(400);
+    let append = |fixture: &mut Fixture, index: usize| {
+        fixture.event(
+            "user",
+            "stream",
+            &content,
+            Sensitivity::Normal,
+            &format!("e{index}"),
+        )
+    };
+    append(&mut fixture, 0);
+    let tokens = |fixture: &Fixture, raw: i64| {
+        fixture
+            .store
+            .compose_context("user", "stream", 100_000, raw, None)
+            .unwrap()
+            .diagnostics
+            .estimated_tokens
+    };
+    let cost = tokens(&fixture, 100_000) - tokens(&fixture, 0);
+    for index in 1..40 {
+        append(&mut fixture, index);
+    }
+    // Room for 12 events; every append pushes the window forward.
+    let raw = cost * 12;
+    let tail = |fixture: &Fixture| {
+        fixture
+            .store
+            .compose_context("user", "stream", 100_000, raw, None)
+            .unwrap()
+            .recent_events
+    };
+    let mut start = tail(&fixture)[0].sequence;
+    let mut moves = 0;
+    for index in 40..80 {
+        let newest = append(&mut fixture, index);
+        let events = tail(&fixture);
+        assert_eq!(events.last().unwrap().id, newest.id);
+        assert!(events.len() >= 6, "kept {} of 12 events", events.len());
+        moves += usize::from(events[0].sequence != start);
+        start = events[0].sequence;
+    }
+    // A tail of the newest events that fit moves its start on all 40
+    // appends; an aligned start moves about once every 6.
+    assert!(moves <= 10, "tail start moved {moves} times in 40 appends");
+}
+
+#[test]
 fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);

@@ -472,7 +472,7 @@ impl MemoryStore {
             }
         }
 
-        let mut recent_events_reversed = Vec::new();
+        let mut recent_events_reversed: Vec<(MemoryEvent, i64)> = Vec::new();
         let raw_budget = recent_raw_tokens.min((max_tokens - diagnostics.estimated_tokens).max(0));
         let mut raw_tokens = 0;
         let mut cursor = i64::MAX;
@@ -487,21 +487,34 @@ impl MemoryStore {
                 let safe = redact_for_agent(event);
                 let cost = rendering.event_tokens(&safe);
                 if cost > raw_budget - raw_tokens {
-                    diagnostics.omitted_items.push(OmittedItem {
-                        id: safe.id,
-                        reason: "outside recent raw token budget".to_owned(),
-                    });
+                    let keep = aligned_tail_len(
+                        &recent_events_reversed
+                            .iter()
+                            .map(|(event, _)| event.sequence)
+                            .collect::<Vec<_>>(),
+                    );
+                    let dropped = recent_events_reversed.split_off(keep);
+                    raw_tokens -= dropped.iter().map(|(_, cost)| cost).sum::<i64>();
+                    for event in dropped.into_iter().map(|(event, _)| event).chain([safe]) {
+                        diagnostics.omitted_items.push(OmittedItem {
+                            id: event.id,
+                            reason: "outside recent raw token budget".to_owned(),
+                        });
+                    }
                     diagnostics.truncated = true;
                     break 'raw;
                 }
                 raw_tokens += cost;
-                recent_events_reversed.push(safe);
+                recent_events_reversed.push((safe, cost));
             }
             if page_len < 32 {
                 break;
             }
         }
-        let mut recent_events = recent_events_reversed;
+        let mut recent_events: Vec<MemoryEvent> = recent_events_reversed
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
         recent_events.reverse();
         diagnostics.estimated_tokens += raw_tokens;
         let mut recalled_evidence = Vec::new();

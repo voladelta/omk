@@ -1286,6 +1286,23 @@ fn is_landmark(id: &str) -> bool {
     hash % CLAIM_LANDMARK_SPACING == 0
 }
 
+/// How many of the newest events, given newest first, an overflowing raw tail
+/// keeps. The tail starts at the event in the older half of the run whose
+/// sequence number has the most trailing zero bits (the oldest on a tie), as
+/// in a binary counter. That start holds while new events arrive, then jumps
+/// forward by about half the run, so the tail grows from about half the budget
+/// to all of it and drops back at once. Between jumps consecutive contexts
+/// share the whole tail but the newest event, which prompt caches can reuse.
+pub(super) fn aligned_tail_len(newest_first: &[i64]) -> usize {
+    let half = newest_first.len() / 2;
+    newest_first
+        .iter()
+        .enumerate()
+        .skip(half)
+        .max_by_key(|&(index, sequence)| (sequence.trailing_zeros(), index))
+        .map_or(0, |(index, _)| index + 1)
+}
+
 /// Keep the newest eligible claims that fit `budget`, as one run in
 /// `newest_first` order. When some do not fit, the run ends at its oldest
 /// landmark, or where it stopped fitting if it holds none. Returns the
