@@ -11,9 +11,11 @@
 //! month.jsonl (growth and latency every 30 days), snap.jsonl (the active
 //! claims context returns for project a each day) and ops.jsonl (operation
 //! log rows). cache.jsonl records, for consecutive compact contexts in one
-//! thread at CACHE_BUDGET tokens (default 16,000), how much of the serialized
-//! payload the second call shares with the first: the part a prompt cache
-//! could reuse.
+//! thread at CACHE_BUDGET tokens (default 16,000) with CACHE_RAW recent raw
+//! tokens (default 2,000), how much of the serialized payload the second call
+//! shares with the first: the part a prompt cache could reuse. It probes after
+//! every appended event and after each observer commit, review and fact step,
+//! and names the payload section where the shared prefix ends.
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -98,6 +100,7 @@ struct Sim {
     probe: Option<NewEvent>,
     cache: BufWriter<File>,
     cache_budget: i64,
+    cache_raw: i64,
     // thread, serialized payload and claim ids of the last cache probe
     last_context: Option<(String, String, Vec<String>)>,
 }
@@ -182,7 +185,7 @@ impl Sim {
     fn cache_probe(&mut self, thread: &str, stream: &str, step: &str) {
         let bundle = self
             .s
-            .compose_compact_context(thread, stream, self.cache_budget, 2000, None)
+            .compose_compact_context(thread, stream, self.cache_budget, self.cache_raw, None)
             .unwrap();
         let payload = bundle.compact_model_payload();
         let claims_len = payload["claims"].to_string().len();
@@ -207,6 +210,21 @@ impl Sim {
                 .zip(&ids)
                 .take_while(|(a, b)| a == b)
                 .count();
+            // The top-level section holding the first differing byte.
+            let section = [
+                "claims",
+                "pendingClaims",
+                "continuation",
+                "continuityViews",
+                "observations",
+                "recentEvents",
+                "recalledEvidence",
+            ]
+            .into_iter()
+            .filter_map(|key| text.find(&format!("\"{key}\":")).map(|at| (at, key)))
+            .filter(|(at, _)| *at <= shared)
+            .max()
+            .map_or("none", |(_, key)| key);
             let removed = last_ids.iter().filter(|id| !ids.contains(id)).count();
             let added = ids.iter().filter(|id| !last_ids.contains(id)).count();
             writeln!(
@@ -215,7 +233,8 @@ impl Sim {
                 json!({"day": self.day, "step": step, "prev": last_text.len(), "total": text.len(),
                        "shared": shared, "claimsLen": claims_len, "claims": ids.len(),
                        "firstDiff": first_diff, "removed": removed, "added": added,
-                       "omitted": omitted})
+                       "omitted": omitted, "section": section,
+                       "events": bundle.recent_events.len()})
             )
             .unwrap();
         }
@@ -235,15 +254,16 @@ impl Sim {
                 &key,
             )
             .unwrap();
-        let events: Vec<MemoryEvent> = (0..30)
-            .map(|i| self.event(&thread, &stream, i == 7 && self.day % 10 == 0))
-            .collect();
+        let mut events = Vec::new();
+        for i in 0..30 {
+            events.push(self.event(&thread, &stream, i == 7 && self.day % 10 == 0));
+            self.cache_probe(&thread, &stream, "event");
+        }
         let normal: Vec<String> = events
             .iter()
             .filter(|e| e.sensitivity == Sensitivity::Normal)
             .map(|e| e.id.clone())
             .collect();
-        self.cache_probe(&thread, &stream, "events");
 
         let key = self.key("plan");
         let started = Instant::now();
@@ -377,6 +397,7 @@ fn main() {
         probe: None,
         cache: BufWriter::new(File::create(out.join("cache.jsonl")).unwrap()),
         cache_budget: std::env::var("CACHE_BUDGET").map_or(16_000, |v| v.parse().unwrap()),
+        cache_raw: std::env::var("CACHE_RAW").map_or(2_000, |v| v.parse().unwrap()),
         last_context: None,
     };
     // Operations commit in real time, so each simulated day moves every saved
