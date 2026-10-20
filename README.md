@@ -68,7 +68,7 @@ The binary is `target/release/omk`. It stores data in `.omk/memory.db` by defaul
 |---|---|
 | [Getting started](docs/getting-started.md) | build, scope tree, first events, secret evidence |
 | [CLI output and idempotency](docs/cli-output.md) | JSON envelopes, retries, replays, errors |
-| [Observation](docs/observation.md) | plan, commit, recovery, continuity views |
+| [Observation](docs/observation.md) | plan, commit, recovery, reflection views |
 | [Context](docs/context.md) | budgets, compact output, scope inheritance |
 | [Claims and recall](docs/claims-and-recall.md) | claim commands, exact recall, entity name resolution |
 | [Search](docs/search.md) | modes, filters, ranking, benchmarks |

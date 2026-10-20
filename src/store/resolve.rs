@@ -263,7 +263,7 @@ struct KnownName {
     normalized: String,
     key: String,
     subject: String,
-    via: &'static str,
+    via: NameSource,
     claim_id: Option<String>,
     scope_id: String,
 }
@@ -289,7 +289,7 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
             normalized,
             name: subject.clone(),
             subject,
-            via: "subject",
+            via: NameSource::Subject,
             claim_id: None,
             scope_id,
         });
@@ -320,7 +320,7 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
             normalized,
             name: alias,
             subject,
-            via: "alias",
+            via: NameSource::Alias,
             claim_id: Some(id),
             scope_id,
         });
@@ -329,11 +329,14 @@ fn known_names(conn: &Connection, scope_ids: &[String]) -> Result<(Vec<KnownName
     names.retain(|known| !is_placeholder(&known.normalized));
     let subject_count = names
         .iter()
-        .filter(|known| known.via == "subject")
+        .filter(|known| known.via == NameSource::Subject)
         .map(|known| known.subject.as_str())
         .collect::<HashSet<_>>()
         .len();
-    let alias_count = names.iter().filter(|known| known.via == "alias").count();
+    let alias_count = names
+        .iter()
+        .filter(|known| known.via == NameSource::Alias)
+        .count();
     Ok((names, subject_count, alias_count))
 }
 
@@ -467,7 +470,7 @@ pub(super) fn resolve_name(
     for (known, distance) in matched {
         let entry = ResolvedName {
             name: known.name.clone(),
-            via: known.via.to_owned(),
+            via: known.via,
             claim_id: known.claim_id.clone(),
             scope_id: known.scope_id.clone(),
         };

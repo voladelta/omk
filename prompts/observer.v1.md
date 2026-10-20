@@ -41,7 +41,7 @@ Return one JSON object matching this shape and no wrapper text:
 }
 ```
 
-Allowed observation kinds: `event`, `decision`, `outcome`, `failure`, `constraint`, `preference`, `open-loop`, `relationship`, `continuation`.
+Allowed observation kinds: `event`, `decision`, `outcome`, `failure`, `constraint`, `preference`, `open-loop`, `relationship`. Task state belongs in `continuation`, not in an observation.
 
 Allowed claim kinds: `fact`, `preference`, `decision`, `goal`, `commitment`, `constraint`, `open-loop`, `entity-alias`, `relationship`, `hypothesis`.
 

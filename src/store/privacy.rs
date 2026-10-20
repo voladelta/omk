@@ -162,7 +162,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         .collect();
     scrub_operations_referencing(conn, &record_ids)?;
     for claim_id in &closure.claim_ids {
-        delete_fts(conn, "claim", claim_id)?;
+        delete_fts(conn, RecordType::Claim, claim_id)?;
         conn.execute("DELETE FROM claims WHERE id=?1", [claim_id])?;
     }
     // A slot without any claim left forgets its cardinality.
@@ -170,13 +170,13 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         "DELETE FROM claim_slots
          WHERE NOT EXISTS (
              SELECT 1 FROM claims
-             WHERE claims.scope_id=claim_slots.scope_id AND claims.kind=claim_slots.kind
+             WHERE claims.scope_id=claim_slots.scope_id
                AND claims.subject=claim_slots.subject AND claims.predicate=claim_slots.predicate
          )",
         [],
     )?;
     for observation_id in &closure.observation_ids {
-        delete_fts(conn, "observation", observation_id)?;
+        delete_fts(conn, RecordType::Observation, observation_id)?;
         conn.execute("DELETE FROM observations WHERE id=?1", [observation_id])?;
     }
     for view_id in &closure.direct_view_ids {
@@ -197,7 +197,7 @@ fn apply_privacy_closure(conn: &Connection, closure: &PrivacyClosure) -> Result<
         )?;
     }
     for (event_id, _, _, _) in &closure.events {
-        delete_fts(conn, "event", event_id)?;
+        delete_fts(conn, RecordType::Event, event_id)?;
         conn.execute("DELETE FROM memory_events WHERE id=?1", [event_id])?;
     }
     Ok(())

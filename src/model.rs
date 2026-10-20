@@ -113,7 +113,6 @@ pub enum ObservationKind {
     Preference,
     OpenLoop,
     Relationship,
-    Continuation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -201,14 +200,6 @@ pub enum ClaimStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClaimAuthority {
-    ExplicitUser,
-    TrustedSource,
-    ModelInference,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Claim {
     pub id: String,
@@ -220,9 +211,9 @@ pub struct Claim {
     pub cardinality: ClaimCardinality,
     pub value: Value,
     pub value_hash: String,
+    /// What the source said, fixed at creation. Status records what was decided.
     pub modality: ClaimModality,
     pub status: ClaimStatus,
-    pub authority: ClaimAuthority,
     pub confidence: f64,
     pub supersedes_id: Option<String>,
     pub created_at: String,
@@ -241,10 +232,12 @@ impl Claim {
             "value": self.value,
             "modality": self.modality,
             "status": self.status,
-            "authority": self.authority,
             "confidence": self.confidence,
         });
 
+        if let Some(run) = &self.origin_run_id {
+            record["originRunId"] = json!(run);
+        }
         if let Some(supersedes) = &self.supersedes_id {
             record["supersedesId"] = json!(supersedes);
         }
@@ -253,10 +246,10 @@ impl Claim {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ViewKind {
-    Continuity,
+    Reflection,
     Continuation,
 }
 
@@ -442,7 +435,6 @@ pub enum ContinuationAction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconciliationSummary {
-    pub activated: Vec<String>,
     pub disputed: Vec<String>,
     pub duplicates_rejected: Vec<String>,
     pub left_pending: Vec<String>,
@@ -455,6 +447,12 @@ pub struct ContextDiagnostics {
     pub omitted_items: Vec<OmittedItem>,
     #[serde(default)]
     pub truncated: bool,
+    /// Pending and disputed claims in the visible scopes awaiting confirm or
+    /// reject, counted before any budget cut.
+    #[serde(default)]
+    pub unresolved_claims: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unresolved_claim_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -470,17 +468,36 @@ pub struct ContextBundle {
     pub claims: Vec<Claim>,
     pub pending_claims: Vec<Claim>,
     pub continuation: Option<ContinuationDraft>,
-    pub continuity_views: Vec<MemoryView>,
+    pub reflection_views: Vec<MemoryView>,
     pub observations: Vec<Observation>,
     pub recent_events: Vec<MemoryEvent>,
     pub recalled_evidence: Vec<MemoryEvent>,
     pub diagnostics: ContextDiagnostics,
 }
 
+/// A searchable record. Variants sort alphabetically, which breaks rank ties.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordType {
+    Claim,
+    Event,
+    Observation,
+}
+
+impl RecordType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Event => "event",
+            Self::Observation => "observation",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
-    pub record_type: String,
+    pub record_type: RecordType,
     pub id: String,
     pub scope_id: String,
     pub text: String,
@@ -606,12 +623,18 @@ pub enum ResolveTier {
     Fuzzy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NameSource {
+    Subject,
+    Alias,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedName {
     pub name: String,
-    /// `subject` or `alias`.
-    pub via: String,
+    pub via: NameSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
     pub scope_id: String,
@@ -654,7 +677,7 @@ pub struct ContextQuery<'a> {
 impl ContextBundle {
     pub fn model_payload(&self) -> Value {
         json!({"claims": self.claims, "pendingClaims": self.pending_claims,
-            "continuation": self.continuation, "continuityViews": self.continuity_views,
+            "continuation": self.continuation, "reflectionViews": self.reflection_views,
             "observations": self.observations, "recentEvents": self.recent_events,
             "recalledEvidence": self.recalled_evidence})
     }
@@ -665,7 +688,7 @@ impl ContextBundle {
             "claims": self.claims.iter().map(Claim::compact_model_record).collect::<Vec<_>>(),
             "pendingClaims": self.pending_claims.iter().map(Claim::compact_model_record).collect::<Vec<_>>(),
             "continuation": self.continuation,
-            "continuityViews": self.continuity_views.iter().map(MemoryView::compact_model_record).collect::<Vec<_>>(),
+            "reflectionViews": self.reflection_views.iter().map(MemoryView::compact_model_record).collect::<Vec<_>>(),
             "observations": self.observations.iter().map(Observation::compact_model_record).collect::<Vec<_>>(),
             "recentEvents": self.recent_events.iter().map(MemoryEvent::compact_model_record).collect::<Vec<_>>(),
             "recalledEvidence": self.recalled_evidence.iter().map(MemoryEvent::compact_model_record).collect::<Vec<_>>(),
@@ -716,7 +739,7 @@ pub struct ObservationRunInfo {
     pub cursor_at_plan: i64,
     pub from_sequence: i64,
     pub to_sequence: i64,
-    pub status: String,
+    pub status: RunStatus,
     pub source_integrity: SourceIntegrity,
     pub observer_model: String,
     pub prompt_version: String,
@@ -725,6 +748,15 @@ pub struct ObservationRunInfo {
     pub next_action: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunStatus {
+    Pending,
+    Committed,
+    Failed,
+    Stale,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

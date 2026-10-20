@@ -41,6 +41,7 @@ fn fact(store: &mut MemoryStore, subject: &str, predicate: &str, value: &str, ke
             ClaimKind::Fact,
             subject,
             predicate,
+            ClaimCardinality::Single,
             json!(value),
             &[],
             key,
@@ -51,7 +52,7 @@ fn fact(store: &mut MemoryStore, subject: &str, predicate: &str, value: &str, ke
 
 fn alias(store: &mut MemoryStore, subject: &str, name: &str, key: &str) -> Claim {
     store
-        .remember_claim_with_cardinality(
+        .remember_claim(
             "user",
             ClaimKind::EntityAlias,
             subject,
@@ -123,6 +124,7 @@ fn current_only_searchable_leaves_out_visible_inactive_claims() {
             ClaimKind::Fact,
             "Bob",
             "city",
+            ClaimCardinality::Single,
             json!("Oslo"),
             &[],
             "s1",
@@ -215,7 +217,12 @@ fn command_echoes_types_and_fields_filter_inside_the_match() {
     };
     let claims = store.search_page("user", "alice", 20, claims_only).unwrap();
     assert_eq!(claims.matched, 2);
-    assert!(claims.hits.iter().all(|hit| hit.record_type == "claim"));
+    assert!(
+        claims
+            .hits
+            .iter()
+            .all(|hit| hit.record_type == RecordType::Claim)
+    );
     assert_eq!(claims.hits[0].subject.as_deref(), Some("Alice Moreau"));
     assert_eq!(
         store
@@ -396,7 +403,7 @@ fn resolve_walks_exact_name_contains_and_fuzzy_tiers() {
     );
     let via_alias = store.resolve_name("thread", "amoreau").unwrap();
     assert_eq!(via_alias.candidates[0].subject, "Alice Moreau");
-    assert_eq!(via_alias.candidates[0].matched[0].via, "alias");
+    assert_eq!(via_alias.candidates[0].matched[0].via, NameSource::Alias);
     assert_eq!(
         via_alias.candidates[0].matched[0].claim_id.as_deref(),
         Some(handle.id.as_str())

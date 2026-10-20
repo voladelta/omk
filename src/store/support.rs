@@ -7,11 +7,11 @@ pub(super) struct ObservationRun {
     pub(super) cursor_at_plan: i64,
     pub(super) from_sequence: i64,
     pub(super) to_sequence: i64,
-    pub(super) status: String,
+    pub(super) status: RunStatus,
     pub(super) observer_model: String,
     pub(super) prompt_version: String,
     pub(super) truncated_event_ids: Vec<String>,
-    pub(super) source_integrity: String,
+    pub(super) source_integrity: SourceIntegrity,
 }
 
 pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
@@ -25,11 +25,11 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
                 cursor_at_plan: row.get(2)?,
                 from_sequence: row.get(3)?,
                 to_sequence: row.get(4)?,
-                status: row.get(5)?,
+                status: parse_enum(&row.get::<_, String>(5)?)?,
                 observer_model: row.get(6)?,
                 prompt_version: row.get(7)?,
                 truncated_event_ids: parse_json_column(row, 8)?,
-                source_integrity: row.get(9)?,
+                source_integrity: parse_enum(&row.get::<_, String>(9)?)?,
             })
         },
     )
@@ -38,18 +38,16 @@ pub(super) fn query_run(conn: &Connection, id: &str) -> Result<ObservationRun> {
 }
 
 pub(super) fn ensure_run_pending(run: &ObservationRun, id: &str) -> Result<()> {
-    if run.status == "pending" {
-        return Ok(());
-    }
-    if run.status == "stale" {
-        bail!(KernelError::stale_observation_run(format!(
+    match run.status {
+        RunStatus::Pending => Ok(()),
+        RunStatus::Stale => bail!(KernelError::stale_observation_run(format!(
             "observation run {id} is stale, not pending"
-        ),));
+        ))),
+        status => bail!(KernelError::invalid_input(format!(
+            "observation run {id} is {}, not pending",
+            enum_text(&status)
+        ))),
     }
-    bail!(KernelError::invalid_input(format!(
-        "observation run {id} is {}, not pending",
-        run.status
-    )))
 }
 
 pub(super) fn validate_observer_size(result: &ObserverResult) -> Result<()> {
@@ -203,27 +201,22 @@ pub(super) fn validate_claim_cardinalities(
     scope_id: &str,
     drafts: &[ClaimDraft],
 ) -> Result<()> {
-    let mut batch: HashMap<(String, String, String), String> = HashMap::new();
+    let mut batch: HashMap<(String, String), String> = HashMap::new();
     for (index, draft) in drafts.iter().enumerate() {
-        let kind = enum_text(&draft.kind);
         let subject = draft.subject.trim();
         let predicate = draft.predicate.trim();
         let wanted = enum_text(&draft.cardinality);
         let existing: Option<String> = conn
             .query_row(
                 "SELECT cardinality FROM claim_slots
-                 WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4",
-                params![scope_id, kind, subject, predicate],
+                 WHERE scope_id=?1 AND subject=?2 AND predicate=?3",
+                params![scope_id, subject, predicate],
                 |row| row.get(0),
             )
             .optional()?;
         // Drafts in one result must also agree with each other.
-        let existing = existing.or_else(|| {
-            batch.insert(
-                (kind, subject.to_owned(), predicate.to_owned()),
-                wanted.clone(),
-            )
-        });
+        let existing = existing
+            .or_else(|| batch.insert((subject.to_owned(), predicate.to_owned()), wanted.clone()));
         if let Some(existing) = existing.filter(|existing| existing != &wanted) {
             bail!(KernelError::invalid_input(format!(
                 "claim {index} uses {wanted} cardinality but its slot already uses {existing} cardinality"
@@ -569,7 +562,7 @@ pub(super) fn attach_command_event(
 /// `subject`, `predicate` and `value` so a search can skip a record's own
 /// subject when it looks for a name in values.
 pub(super) struct FtsRow<'a> {
-    pub record_type: &'a str,
+    pub record_type: RecordType,
     pub record_id: &'a str,
     pub scope_id: &'a str,
     pub kind: &'a str,
@@ -583,8 +576,8 @@ pub(super) struct FtsRow<'a> {
 /// narrow the FTS match itself instead of filtering its rows afterwards.
 /// unicode61 splits on punctuation, so each token is a prefix plus
 /// alphanumerics only.
-pub(super) fn facet_type_token(record_type: &str) -> String {
-    format!("rt{record_type}")
+pub(super) fn facet_type_token(record_type: RecordType) -> String {
+    format!("rt{}", record_type.as_str())
 }
 
 pub(super) fn facet_kind_token(kind: &str) -> String {
@@ -611,7 +604,7 @@ pub(super) fn insert_fts(conn: &Connection, row: &FtsRow<'_>) -> Result<()> {
         "INSERT INTO memory_fts(record_type,record_id,scope_id,text,subject,predicate,value,facet)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
-            row.record_type,
+            row.record_type.as_str(),
             row.record_id,
             row.scope_id,
             row.text,
@@ -625,16 +618,20 @@ pub(super) fn insert_fts(conn: &Connection, row: &FtsRow<'_>) -> Result<()> {
     // record_id is UNINDEXED, so remember the rowid for deletes by key.
     conn.execute(
         "INSERT INTO memory_fts_refs(record_type,record_id,fts_rowid) VALUES (?1,?2,?3)",
-        params![record_type, record_id, conn.last_insert_rowid()],
+        params![record_type.as_str(), record_id, conn.last_insert_rowid()],
     )?;
     Ok(())
 }
 
-pub(super) fn delete_fts(conn: &Connection, record_type: &str, record_id: &str) -> Result<()> {
+pub(super) fn delete_fts(
+    conn: &Connection,
+    record_type: RecordType,
+    record_id: &str,
+) -> Result<()> {
     let rowid: Option<i64> = conn
         .query_row(
             "SELECT fts_rowid FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
-            params![record_type, record_id],
+            params![record_type.as_str(), record_id],
             |row| row.get(0),
         )
         .optional()?;
@@ -642,7 +639,7 @@ pub(super) fn delete_fts(conn: &Connection, record_type: &str, record_id: &str) 
         conn.execute("DELETE FROM memory_fts WHERE rowid=?1", [rowid])?;
         conn.execute(
             "DELETE FROM memory_fts_refs WHERE record_type=?1 AND record_id=?2",
-            params![record_type, record_id],
+            params![record_type.as_str(), record_id],
         )?;
     }
     Ok(())
@@ -778,8 +775,8 @@ pub(super) fn insert_memory_command_event(
 
 pub(super) fn insert_claim(conn: &Connection, claim: &Claim) -> Result<()> {
     conn.execute(
-        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        "INSERT INTO claims(id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,confidence,supersedes_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             claim.id,
             claim.origin_run_id,
@@ -792,7 +789,6 @@ pub(super) fn insert_claim(conn: &Connection, claim: &Claim) -> Result<()> {
             claim.value_hash,
             enum_text(&claim.modality),
             enum_text(&claim.status),
-            enum_text(&claim.authority),
             claim.confidence,
             claim.supersedes_id,
             claim.created_at,
@@ -807,7 +803,7 @@ pub(super) fn index_claim(conn: &Connection, claim: &Claim) -> Result<()> {
     insert_fts(
         conn,
         &FtsRow {
-            record_type: "claim",
+            record_type: RecordType::Claim,
             record_id: &claim.id,
             scope_id: &claim.scope_id,
             kind: &enum_text(&claim.kind),
@@ -832,8 +828,7 @@ pub(super) fn insert_next_view(
     prompt_version: Option<&str>,
     token_count: i64,
 ) -> Result<MemoryView> {
-    let kind_text = enum_text(&kind);
-    let previous = latest_view(conn, stream_id, &kind_text)?;
+    let previous = latest_view(conn, stream_id, kind)?;
     let view = MemoryView {
         id: Uuid::new_v4().to_string(),
         scope_id: scope_id.to_owned(),
@@ -856,7 +851,7 @@ pub(super) fn insert_next_view(
             view.id,
             view.scope_id,
             view.stream_id,
-            kind_text,
+            enum_text(&kind),
             view.generation,
             view.content,
             view.source_from_sequence,
@@ -874,7 +869,7 @@ pub(super) fn insert_next_view(
 pub(super) fn latest_view(
     conn: &Connection,
     stream_id: &str,
-    kind: &str,
+    kind: ViewKind,
 ) -> Result<Option<MemoryView>> {
     Ok(conn
         .query_row(
@@ -882,7 +877,7 @@ pub(super) fn latest_view(
                 "SELECT {VIEW_COLUMNS}
                  FROM memory_views WHERE stream_id=?1 AND kind=?2 ORDER BY generation DESC LIMIT 1"
             ),
-            params![stream_id, kind],
+            params![stream_id, enum_text(&kind)],
             row_view,
         )
         .optional()?)
@@ -931,13 +926,12 @@ pub(super) fn query_active_claim_member(conn: &Connection, claim: &Claim) -> Res
         .query_row(
             &format!(
                 "SELECT {CLAIM_COLUMNS}
-                 FROM claims WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4
-                   AND cardinality=?5 AND (cardinality='single' OR value_hash=?6) AND status='active'
+                 FROM claims WHERE scope_id=?1 AND subject=?2 AND predicate=?3
+                   AND cardinality=?4 AND (cardinality='single' OR value_hash=?5) AND status='active'
                  ORDER BY updated_at DESC LIMIT 1"
             ),
             params![
                 claim.scope_id,
-                enum_text(&claim.kind),
                 claim.subject,
                 claim.predicate,
                 enum_text(&claim.cardinality),
@@ -958,12 +952,11 @@ pub(super) fn supersede_other_active_claims(
     }
     conn.execute(
         "UPDATE claims SET status='superseded',updated_at=?1
-         WHERE scope_id=?2 AND kind=?3 AND subject=?4 AND predicate=?5 AND status='active'
-           AND (?6 IS NULL OR id != ?6)",
+         WHERE scope_id=?2 AND subject=?3 AND predicate=?4 AND status='active'
+           AND (?5 IS NULL OR id != ?5)",
         params![
             now(),
             claim.scope_id,
-            enum_text(&claim.kind),
             claim.subject,
             claim.predicate,
             excluded_id,
@@ -974,11 +967,10 @@ pub(super) fn supersede_other_active_claims(
 
 pub(super) fn ensure_claim_slot(conn: &Connection, claim: &Claim) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO claim_slots(scope_id,kind,subject,predicate,cardinality)
-         VALUES (?1,?2,?3,?4,?5)",
+        "INSERT OR IGNORE INTO claim_slots(scope_id,subject,predicate,cardinality)
+         VALUES (?1,?2,?3,?4)",
         params![
             claim.scope_id,
-            enum_text(&claim.kind),
             claim.subject,
             claim.predicate,
             enum_text(&claim.cardinality),
@@ -986,13 +978,8 @@ pub(super) fn ensure_claim_slot(conn: &Connection, claim: &Claim) -> Result<()> 
     )?;
     let cardinality: String = conn.query_row(
         "SELECT cardinality FROM claim_slots
-         WHERE scope_id=?1 AND kind=?2 AND subject=?3 AND predicate=?4",
-        params![
-            claim.scope_id,
-            enum_text(&claim.kind),
-            claim.subject,
-            claim.predicate,
-        ],
+         WHERE scope_id=?1 AND subject=?2 AND predicate=?3",
+        params![claim.scope_id, claim.subject, claim.predicate,],
         |row| row.get(0),
     )?;
     ensure!(
@@ -1140,13 +1127,13 @@ pub(super) fn observation_has_events(
 
 pub(super) fn context_source_ids(
     conn: &Connection,
-    record_type: &str,
+    record_type: RecordType,
     id: &str,
 ) -> Result<Vec<String>> {
     let (table, column) = match record_type {
-        "observation" => ("observation_sources", "observation_id"),
-        "claim" => ("claim_sources", "claim_id"),
-        _ => bail!("unsupported full-text record type"),
+        RecordType::Observation => ("observation_sources", "observation_id"),
+        RecordType::Claim => ("claim_sources", "claim_id"),
+        RecordType::Event => return Ok(vec![id.to_owned()]),
     };
     query_strings(
         conn,
@@ -1190,14 +1177,8 @@ pub(super) fn split_shadowed_claims(
             .position(|scope_id| scope_id == &claim.scope_id)
             .unwrap_or(0)
     };
-    let key = |claim: &Claim| {
-        (
-            enum_text(&claim.kind),
-            claim.subject.clone(),
-            claim.predicate.clone(),
-        )
-    };
-    let mut deepest: HashMap<(String, String, String), usize> = HashMap::new();
+    let key = |claim: &Claim| (claim.subject.clone(), claim.predicate.clone());
+    let mut deepest: HashMap<(String, String), usize> = HashMap::new();
     for claim in &claims {
         let entry = deepest.entry(key(claim)).or_insert(0);
         *entry = (*entry).max(depth(claim));
@@ -1401,9 +1382,9 @@ fn facet_match(query: &str, scope: &ScopeFilter, options: &SearchOptions) -> Str
     let mut expression = format!("({query})");
     if !all {
         let types: Vec<String> = [
-            ("claim", claims),
-            ("observation", observations),
-            ("event", events),
+            (RecordType::Claim, claims),
+            (RecordType::Observation, observations),
+            (RecordType::Event, events),
         ]
         .into_iter()
         .filter(|(_, wanted)| *wanted)
@@ -1429,13 +1410,13 @@ fn facet_match(query: &str, scope: &ScopeFilter, options: &SearchOptions) -> Str
 
 /// Score multiplier per record: current claims first, then pending state and
 /// observations, then raw events, with replaced claims last.
-fn search_boost(record_type: &str, status: Option<&ClaimStatus>) -> f64 {
+fn search_boost(record_type: RecordType, status: Option<&ClaimStatus>) -> f64 {
     match (record_type, status) {
-        ("claim", Some(ClaimStatus::Active)) => MAX_BOOST,
-        ("claim", Some(ClaimStatus::Pending | ClaimStatus::Disputed)) => 1.25,
-        ("claim", _) => 0.5,
-        ("observation", _) => 1.25,
-        _ => 1.0,
+        (RecordType::Claim, Some(ClaimStatus::Active)) => MAX_BOOST,
+        (RecordType::Claim, Some(ClaimStatus::Pending | ClaimStatus::Disputed)) => 1.25,
+        (RecordType::Claim, _) => 0.5,
+        (RecordType::Observation, _) => 1.25,
+        (RecordType::Event, _) => 1.0,
     }
 }
 
@@ -1509,7 +1490,10 @@ pub(super) fn search_fts(
         // Under --current-only, claims that are not active are counted
         // separately and subtracted.
         if options.current_only {
-            let claims = format!("({expression}) AND (facet : {})", facet_type_token("claim"));
+            let claims = format!(
+                "({expression}) AND (facet : {})",
+                facet_type_token(RecordType::Claim)
+            );
             let inactive: i64 = conn
                 .query_row(
                     &format!(
@@ -1558,13 +1542,13 @@ pub(super) fn search_fts(
         events,
     } = options.types;
     let all = !(claims || observations || events);
-    let plans: Vec<Option<&str>> = if selective {
+    let plans: Vec<Option<RecordType>> = if selective {
         vec![None]
     } else {
         [
-            ("event", events),
-            ("observation", observations),
-            ("claim", claims),
+            (RecordType::Event, events),
+            (RecordType::Observation, observations),
+            (RecordType::Claim, claims),
         ]
         .into_iter()
         .filter(|(_, wanted)| all || *wanted)
@@ -1574,8 +1558,8 @@ pub(super) fn search_fts(
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut qualified = 0;
     for class in plans {
-        let limited = matches!(class, Some("event" | "observation"));
-        let bounded = class == Some("claim");
+        let limited = matches!(class, Some(RecordType::Event | RecordType::Observation));
+        let bounded = class == Some(RecordType::Claim);
         let expression = match class {
             Some(class) => format!("({full}) AND (facet : {})", facet_type_token(class)),
             None => full.clone(),
@@ -1607,7 +1591,7 @@ pub(super) fn search_fts(
             {
                 break;
             }
-            let record_type: String = row.get(0)?;
+            let record_type: RecordType = parse_enum(&row.get::<_, String>(0)?)?;
             let scope_id: String = row.get(2)?;
             if !visible.contains(scope_id.as_str()) {
                 continue;
@@ -1625,7 +1609,7 @@ pub(super) fn search_fts(
             }
             qualified += 1;
             let hit = SearchHit {
-                rank: rank * search_boost(&record_type, status.as_ref()),
+                rank: rank * search_boost(record_type, status.as_ref()),
                 record_type,
                 id,
                 scope_id,
@@ -1661,15 +1645,19 @@ pub(super) fn search_fts(
     let searchable = if matched == 0 {
         // Only claims fill the subject, predicate and value fields, so a
         // field search has only claims to search.
-        let record_types: &[&str] = match options.field {
-            SearchField::Text => &["claim", "observation", "event"],
-            _ => &["claim"],
+        let record_types: &[RecordType] = match options.field {
+            SearchField::Text => &[
+                RecordType::Claim,
+                RecordType::Observation,
+                RecordType::Event,
+            ],
+            _ => &[RecordType::Claim],
         };
         let any_record = format!(
             "facet : ({})",
             record_types
                 .iter()
-                .map(|record_type| facet_type_token(record_type))
+                .map(|record_type| facet_type_token(*record_type))
                 .collect::<Vec<_>>()
                 .join(" OR ")
         );

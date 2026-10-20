@@ -40,6 +40,7 @@ fn claim(store: &mut MemoryStore, scope: &str, value: &str, key: &str) -> Claim 
             ClaimKind::Fact,
             "Atlas",
             "launch",
+            ClaimCardinality::Single,
             json!(value),
             &[],
             key,
@@ -65,7 +66,7 @@ fn run_listing_filters_scope_before_decoding_unrelated_rows() {
     let mut store = setup(&path);
     event(&mut store, "visible", "visible");
     let visible = store
-        .plan_observation("thread", "stream", 1000, "test", "v1", "visible-plan")
+        .plan_observation("thread", "stream", 1000, "test", "v1", Some("visible-plan"))
         .unwrap()
         .data
         .into_plan()
@@ -88,7 +89,14 @@ fn run_listing_filters_scope_before_decoding_unrelated_rows() {
         })
         .unwrap();
     let unrelated = store
-        .plan_observation("other", "other-stream", 1000, "test", "v1", "other-plan")
+        .plan_observation(
+            "other",
+            "other-stream",
+            1000,
+            "test",
+            "v1",
+            Some("other-plan"),
+        )
         .unwrap()
         .data
         .into_plan()
@@ -102,7 +110,7 @@ fn run_listing_filters_scope_before_decoding_unrelated_rows() {
     .unwrap();
     for scope in ["thread", "project"] {
         let runs = store
-            .list_observation_runs(&ReadAccess::agent(scope), None, Some("pending"))
+            .list_observation_runs(&ReadAccess::agent(scope), None, Some(RunStatus::Pending))
             .unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, visible.run_id);
@@ -228,6 +236,7 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
                 ClaimKind::Fact,
                 subject,
                 "value",
+                ClaimCardinality::Single,
                 json!("accepted"),
                 std::slice::from_ref(&source.id),
                 key,
@@ -238,7 +247,14 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
     for key in ["committed-plan", "pending-plan", "failed-plan"] {
         plans.push(
             store
-                .plan_observation("thread", "memory-commands:thread", 6000, "test", "v1", key)
+                .plan_observation(
+                    "thread",
+                    "memory-commands:thread",
+                    6000,
+                    "test",
+                    "v1",
+                    Some(key),
+                )
                 .unwrap()
                 .data
                 .into_plan()
@@ -260,7 +276,11 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
     let purge = store.purge_event(&source.id, "purge").unwrap();
     assert_eq!(purge["purgedCommandEvents"], 2);
     assert_eq!(purge["affectedRunIds"].as_array().unwrap().len(), 3);
-    for (plan, status) in plans.iter().zip(["committed", "stale", "failed"]) {
+    for (plan, status) in
+        plans
+            .iter()
+            .zip([RunStatus::Committed, RunStatus::Stale, RunStatus::Failed])
+    {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM run_updates WHERE id=?1",
@@ -275,10 +295,10 @@ fn purge_updates_shared_runs_once_and_preserves_unrelated_replays() {
         assert_eq!(run.status, status);
         assert_eq!(run.source_integrity, SourceIntegrity::PrivacyPurged);
         assert!(run.ambiguities.is_empty());
-        if status == "failed" {
+        if status == RunStatus::Failed {
             assert_eq!(run.error.as_deref(), Some("observer failure"));
         }
-        if status == "stale" {
+        if status == RunStatus::Stale {
             assert_eq!(run.error.as_deref(), Some("source evidence privacy-purged"));
         }
     }
@@ -312,7 +332,7 @@ fn legacy_observer_replay_precedes_new_admission_limits() {
     let mut store = setup(&path);
     event(&mut store, "source", "source");
     let plan = store
-        .plan_observation("thread", "stream", 1000, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 1000, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -512,7 +532,7 @@ fn required_model_state_and_continuation_are_budgeted() {
     claim(&mut store, "project", &"x".repeat(2000), "large");
     event(&mut store, "small", "event");
     let error = store
-        .plan_observation("thread", "stream", 100, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 100, "test", "v1", Some("plan"))
         .unwrap_err();
     assert_eq!(
         error.downcast_ref::<KernelError>().unwrap().kind(),
@@ -543,7 +563,7 @@ fn required_model_state_and_continuation_are_budgeted() {
     assert_eq!(error_json["error"]["code"], "budget_exceeded");
     assert_eq!(error_json["error"]["sameKeyReusable"], true);
     let plan = store
-        .plan_observation("thread", "stream", 2000, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 2000, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -557,7 +577,7 @@ fn required_model_state_and_continuation_are_budgeted() {
     event(&mut store, "next", "next");
     assert!(
         store
-            .plan_observation("thread", "stream", 2000, "test", "v1", "next-plan")
+            .plan_observation("thread", "stream", 2000, "test", "v1", Some("next-plan"))
             .is_err()
     );
     let bundle = store
@@ -632,7 +652,7 @@ fn history_pages_do_not_decode_distant_invalid_rows() {
     // An eager full-history read fails when it parses this distant JSON value.
     conn.execute("UPDATE memory_events SET content_json='invalid-json' WHERE stream_id='stream' AND sequence=100", []).unwrap();
     let plan = store
-        .plan_observation("thread", "stream", 500, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 500, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -671,14 +691,14 @@ fn extreme_token_hints_fail_without_integer_overflow() {
         .unwrap();
     // The inflated hint cannot fit, so the first event is planned as a stub.
     let plan = store
-        .plan_observation("thread", "stream", i64::MAX, "test", "v1", "plan")
+        .plan_observation("thread", "stream", i64::MAX, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
         .unwrap();
     assert_eq!(plan.events[0].content["truncated"], json!(true));
     let error = store
-        .plan_observation("thread", "stream", 1, "test", "v1", "tiny-plan")
+        .plan_observation("thread", "stream", 1, "test", "v1", Some("tiny-plan"))
         .unwrap_err();
     assert_eq!(
         error.downcast_ref::<KernelError>().unwrap().kind(),
@@ -813,7 +833,7 @@ fn observer_limits_reject_before_commit_or_json_parse() {
     let mut store = setup(&path);
     let source = event(&mut store, "source", "event");
     let plan = store
-        .plan_observation("thread", "stream", 1000, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 1000, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -873,7 +893,7 @@ fn context_caps_legacy_candidates_and_sources_but_exact_recall_is_complete() {
     let mut store = setup(&path);
     let first = event(&mut store, "source detail", "first");
     let plan = store
-        .plan_observation("thread", "stream", 1000, "test", "v1", "plan")
+        .plan_observation("thread", "stream", 1000, "test", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()

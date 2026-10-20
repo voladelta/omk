@@ -16,15 +16,17 @@ omk claim purge      Delete a claim and its provenance links.
 omk event purge      Delete an event and dependent records.
 ```
 
-Correct accepts only an active, pending or disputed claim; correcting a superseded, rejected or expired claim returns `invalid_input`. Rescope keeps a disputed claim disputed and a pending claim pending; only an active claim stays active. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
+Correct and rescope accept only an active, pending or disputed claim; a superseded, rejected or expired claim returns `invalid_input`, so neither can bring an ended claim back. Rescope keeps the claim's status. Rescope merges with an active destination only when the values are equal. A different active value returns `claim_conflict` and leaves claims, provenance, command events, and the operation key unchanged. Resolve that conflict with an explicitly authorized confirmation or correction before retrying.
 
 Direct claim commands create a `memory-command` event. This keeps commands source-backed when you omit `--source-event`. The `--source-event` value must be an event UUID, not a stream sequence.
 
-Claims default to `--cardinality single`. This allows one active value for each scope, kind, subject and predicate.
+Claims default to `--cardinality single`. This allows one active value for each scope, subject and predicate. The claim kind is a label, not part of the key: the same subject and predicate filed under two kinds share one slot.
 
 Use `--cardinality set` when distinct values can be active at the same time. A claim slot cannot switch cardinality by accident. Observation commit applies the same rule: it returns `invalid_input` before any write when an observer claim uses a different cardinality from its existing slot, so the same key stays reusable.
 
 Observer-produced claims stay pending, even if the model labels one as an accepted decision. Use a claim command to confirm it. You can promote it only to an ancestor scope.
+
+A claim's `modality` records what the source said and never changes; `status` records what was decided. Confirming a proposal leaves its modality `proposal` and makes its status `active`. `originRunId` is set on claims an observer produced, including their rescoped copies.
 
 ## Recall interpretations and exact evidence
 

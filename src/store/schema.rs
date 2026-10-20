@@ -123,7 +123,6 @@ CREATE TABLE IF NOT EXISTS claims (
     value_hash TEXT NOT NULL,
     modality TEXT NOT NULL,
     status TEXT NOT NULL,
-    authority TEXT NOT NULL,
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
     supersedes_id TEXT REFERENCES claims(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
@@ -132,22 +131,21 @@ CREATE TABLE IF NOT EXISTS claims (
 
 CREATE TABLE IF NOT EXISTS claim_slots (
     scope_id TEXT NOT NULL REFERENCES memory_scopes(id),
-    kind TEXT NOT NULL,
     subject TEXT NOT NULL,
     predicate TEXT NOT NULL,
     cardinality TEXT NOT NULL CHECK (cardinality IN ('single','set')),
-    PRIMARY KEY(scope_id, kind, subject, predicate)
+    PRIMARY KEY(scope_id, subject, predicate)
 );
 
 CREATE INDEX IF NOT EXISTS claims_logical_key
-ON claims(scope_id, kind, subject, predicate, status);
+ON claims(scope_id, subject, predicate, status);
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_single_claim_per_logical_key
-ON claims(scope_id, kind, subject, predicate)
+ON claims(scope_id, subject, predicate)
 WHERE status = 'active' AND cardinality = 'single';
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_set_claim_per_value
-ON claims(scope_id, kind, subject, predicate, value_hash)
+ON claims(scope_id, subject, predicate, value_hash)
 WHERE status = 'active' AND cardinality = 'set';
 
 CREATE TABLE IF NOT EXISTS claim_sources (

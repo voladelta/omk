@@ -1,31 +1,10 @@
 use super::*;
 
 impl MemoryStore {
+    /// Store explicit current state. A different active value in the same
+    /// slot makes the new claim disputed instead of replacing it.
     #[allow(clippy::too_many_arguments)]
     pub fn remember_claim(
-        &mut self,
-        scope_id: &str,
-        kind: ClaimKind,
-        subject: &str,
-        predicate: &str,
-        value: Value,
-        source_event_ids: &[String],
-        idempotency_key: &str,
-    ) -> Result<MutationResult<Claim>> {
-        self.remember_claim_with_cardinality(
-            scope_id,
-            kind,
-            subject,
-            predicate,
-            ClaimCardinality::Single,
-            value,
-            source_event_ids,
-            idempotency_key,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn remember_claim_with_cardinality(
         &mut self,
         scope_id: &str,
         kind: ClaimKind,
@@ -45,38 +24,15 @@ impl MemoryStore {
             value,
             ClaimModality::ExplicitAssertion,
             ClaimStatus::Active,
-            ClaimAuthority::ExplicitUser,
             source_event_ids,
             idempotency_key,
             "claim.remember",
         )
     }
 
+    /// Store a proposal. It stays pending until confirmed.
     #[allow(clippy::too_many_arguments)]
     pub fn propose_claim(
-        &mut self,
-        scope_id: &str,
-        kind: ClaimKind,
-        subject: &str,
-        predicate: &str,
-        value: Value,
-        source_event_ids: &[String],
-        idempotency_key: &str,
-    ) -> Result<MutationResult<Claim>> {
-        self.propose_claim_with_cardinality(
-            scope_id,
-            kind,
-            subject,
-            predicate,
-            ClaimCardinality::Single,
-            value,
-            source_event_ids,
-            idempotency_key,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn propose_claim_with_cardinality(
         &mut self,
         scope_id: &str,
         kind: ClaimKind,
@@ -96,7 +52,6 @@ impl MemoryStore {
             value,
             ClaimModality::Proposal,
             ClaimStatus::Pending,
-            ClaimAuthority::ExplicitUser,
             source_event_ids,
             idempotency_key,
             "claim.propose",
@@ -114,7 +69,6 @@ impl MemoryStore {
         value: Value,
         modality: ClaimModality,
         requested_status: ClaimStatus,
-        authority: ClaimAuthority,
         source_event_ids: &[String],
         idempotency_key: &str,
         operation: &str,
@@ -132,7 +86,6 @@ impl MemoryStore {
             "value": value,
             "modality": modality,
             "requestedStatus": requested_status,
-            "authority": authority,
             "sourceEventIds": source_event_ids
         });
         self.mutate(operation, idempotency_key, &request, |tx| {
@@ -142,7 +95,6 @@ impl MemoryStore {
             let mut claim = new_claim(scope_id, kind, subject, predicate, cardinality, value);
             claim.modality = modality;
             claim.status = requested_status;
-            claim.authority = authority;
             if claim.status == ClaimStatus::Active
                 && let Some(existing) = query_active_claim_member(tx, &claim)?
             {
@@ -189,14 +141,8 @@ impl MemoryStore {
                 return Ok(existing);
             }
             supersede_other_active_claims(tx, &claim, Some(&claim.id))?;
+            claim.updated_at = set_claim_status(tx, &claim.id, ClaimStatus::Active)?;
             claim.status = ClaimStatus::Active;
-            claim.modality = ClaimModality::AcceptedDecision;
-            claim.authority = ClaimAuthority::ExplicitUser;
-            claim.updated_at = now();
-            tx.execute(
-                "UPDATE claims SET status='active',modality='accepted-decision',authority='explicit-user',updated_at=?2 WHERE id=?1",
-                params![claim.id, claim.updated_at],
-            )?;
             attach_command_event(tx, &command_event, &claim.id)?;
             Ok(claim)
         })
@@ -264,6 +210,13 @@ impl MemoryStore {
             ensure_scope_exists(tx, new_scope_id)?;
             let old = query_claim(tx, claim_id)?;
             ensure!(
+                matches!(
+                    old.status,
+                    ClaimStatus::Active | ClaimStatus::Pending | ClaimStatus::Disputed
+                ),
+                KernelError::invalid_input("claim must be active, pending, or disputed to rescope")
+            );
+            ensure!(
                 visible_scope_ids(tx, &old.scope_id)?
                     .iter()
                     .any(|scope| scope == new_scope_id),
@@ -279,13 +232,8 @@ impl MemoryStore {
             let claim = Claim {
                 id: Uuid::new_v4().to_string(),
                 scope_id: new_scope_id.to_owned(),
-                // Only active state stays active. Disputed claims stay disputed, so a
-                // rescope cannot launder a conflict into something reconcile accepts.
-                status: match old.status {
-                    ClaimStatus::Active => ClaimStatus::Active,
-                    ClaimStatus::Disputed => ClaimStatus::Disputed,
-                    _ => ClaimStatus::Pending,
-                },
+                // The status carries over, so a rescope cannot launder a conflict.
+                status: old.status.clone(),
                 supersedes_id: Some(old.id.clone()),
                 created_at: timestamp.clone(),
                 updated_at: timestamp,
@@ -389,6 +337,9 @@ impl MemoryStore {
         query_claims_for_scopes(&self.conn, &scope_ids, status_text.as_deref(), None)
     }
 
+    /// Classify pending claims against active state. Never activates: an
+    /// equal active value absorbs the pending claim's sources and rejects it as
+    /// a duplicate; a different active value in a `single` slot disputes it.
     pub fn reconcile(
         &mut self,
         scope_id: &str,
@@ -399,34 +350,13 @@ impl MemoryStore {
             let pending =
                 query_claims_for_scopes(tx, &[scope_id.to_owned()], Some("pending"), None)?;
             let mut summary = ReconciliationSummary {
-                activated: Vec::new(),
                 disputed: Vec::new(),
                 duplicates_rejected: Vec::new(),
                 left_pending: Vec::new(),
             };
             for claim in pending {
-                // Only a trusted ingestion path may activate state here. Claims
-                // that carry user or model authority need an explicit claim command.
-                if claim.origin_run_id.is_some()
-                    || matches!(
-                        claim.modality,
-                        ClaimModality::Proposal
-                            | ClaimModality::Inference
-                            | ClaimModality::Observation
-                    )
-                {
-                    summary.left_pending.push(claim.id);
-                    continue;
-                }
                 match query_active_claim_member(tx, &claim)? {
-                    None if !matches!(claim.authority, ClaimAuthority::TrustedSource) => {
-                        summary.left_pending.push(claim.id);
-                    }
-                    None => {
-                        ensure_claim_slot(tx, &claim)?;
-                        set_claim_status(tx, &claim.id, ClaimStatus::Active)?;
-                        summary.activated.push(claim.id);
-                    }
+                    None => summary.left_pending.push(claim.id),
                     Some(existing) if existing.value == claim.value => {
                         copy_claim_sources(tx, &claim.id, &existing.id)?;
                         set_claim_status(tx, &claim.id, ClaimStatus::Rejected)?;
@@ -443,7 +373,7 @@ impl MemoryStore {
     }
 }
 
-/// A new active, explicit-user claim with full confidence.
+/// A new active, explicit-assertion claim with full confidence.
 fn new_claim(
     scope_id: &str,
     kind: ClaimKind,
@@ -465,7 +395,6 @@ fn new_claim(
         value,
         modality: ClaimModality::ExplicitAssertion,
         status: ClaimStatus::Active,
-        authority: ClaimAuthority::ExplicitUser,
         confidence: 1.0,
         supersedes_id: None,
         created_at: timestamp.clone(),

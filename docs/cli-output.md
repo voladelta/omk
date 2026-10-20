@@ -19,7 +19,7 @@ The operation fields tell you how to recover:
 
 ## Retries and replays
 
-Every write needs a stable, globally unique idempotency key. Reuse a key only when you retry an identical command.
+Every write needs a stable, globally unique idempotency key, except `observe plan`, which can use the stream position instead (see [Observation](observation.md)). Reuse a key only when you retry an identical command.
 
 An identical retry returns the original data with `replayed: true`. If another process holds the database past the five second busy timeout, OMK returns code `busy` with `retryable` and `sameKeyReusable` both true. Retry the identical request with the same key. OMK rejects a reused key if any input changes.
 

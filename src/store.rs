@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::KernelError;
 use crate::model::*;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 mod claim;
 mod context;
@@ -122,7 +122,7 @@ fn insert_event(conn: &Connection, input: EventInsert) -> Result<MemoryEvent> {
         insert_fts(
             conn,
             &FtsRow {
-                record_type: "event",
+                record_type: RecordType::Event,
                 record_id: &event.id,
                 scope_id: &event.scope_id,
                 kind: &enum_text(&event.kind),

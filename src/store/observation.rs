@@ -1,6 +1,9 @@
 use super::*;
 
 impl MemoryStore {
+    /// Plan the next batch of unobserved events. Without an idempotency key,
+    /// the stream position is the key: a pending run at the current cursor for
+    /// the same model and prompt is returned again instead of a new one.
     pub fn plan_observation(
         &mut self,
         scope_id: &str,
@@ -8,7 +11,7 @@ impl MemoryStore {
         max_tokens: i64,
         observer_model: &str,
         prompt_version: &str,
-        idempotency_key: &str,
+        idempotency_key: Option<&str>,
     ) -> Result<MutationResult<ObservationPlanOutcome>> {
         ensure!(
             max_tokens > 0,
@@ -16,7 +19,9 @@ impl MemoryStore {
         );
         validate_nonempty("observer model", observer_model)?;
         validate_nonempty("prompt version", prompt_version)?;
-        validate_nonempty("idempotency key", idempotency_key)?;
+        if let Some(key) = idempotency_key {
+            validate_nonempty("idempotency key", key)?;
+        }
         let request_hash = operation_request_hash(
             "observation.plan",
             &json!({
@@ -28,8 +33,9 @@ impl MemoryStore {
             }),
         )?;
         let tx = self.immediate()?;
-        if let Some(prior) =
-            prior_result::<SavedPlan>(&tx, idempotency_key, "observation.plan", &request_hash)?
+        if let Some(key) = idempotency_key
+            && let Some(prior) =
+                prior_result::<SavedPlan>(&tx, key, "observation.plan", &request_hash)?
         {
             let outcome = match prior {
                 SavedPlan::Outcome(outcome) => outcome,
@@ -56,16 +62,27 @@ impl MemoryStore {
             ))
         );
 
+        // Keyless: the stream position is the key. An open run planned under a
+        // larger budget than this call allows is not reused.
+        if idempotency_key.is_none()
+            && let Some(open_run) =
+                open_run_at_cursor(&tx, stream_id, cursor, observer_model, prompt_version)?
+        {
+            let plan = render_planned_run(&tx, &open_run, max_tokens)?;
+            if estimate_tokens(&plan.model_payload().to_string()) <= max_tokens {
+                tx.commit()?;
+                return Ok(MutationResult::replayed(ObservationPlanOutcome::ready(
+                    plan,
+                )));
+            }
+        }
+
         let mut page = query_event_page(&tx, stream_id, cursor, false)?;
         if page.is_empty() {
             let outcome = ObservationPlanOutcome::caught_up(scope_id, stream_id, cursor);
-            save_operation(
-                &tx,
-                idempotency_key,
-                "observation.plan",
-                &request_hash,
-                &outcome,
-            )?;
+            if let Some(key) = idempotency_key {
+                save_operation(&tx, key, "observation.plan", &request_hash, &outcome)?;
+            }
             tx.commit()?;
             return Ok(MutationResult::created(outcome));
         }
@@ -132,15 +149,17 @@ impl MemoryStore {
         )?;
         // Save only the run: a stored plan copied every active claim and grew
         // the log by hundreds of kilobytes per plan. Replay rebuilds it.
-        save_operation(
-            &tx,
-            idempotency_key,
-            "observation.plan",
-            &request_hash,
-            &SavedPlan::Run {
-                planned_run_id: run_id.clone(),
-            },
-        )?;
+        if let Some(key) = idempotency_key {
+            save_operation(
+                &tx,
+                key,
+                "observation.plan",
+                &request_hash,
+                &SavedPlan::Run {
+                    planned_run_id: run_id.clone(),
+                },
+            )?;
+        }
         tx.commit()?;
         Ok(MutationResult::created(ObservationPlanOutcome::ready(plan)))
     }
@@ -229,7 +248,7 @@ impl MemoryStore {
             insert_fts(
                 &tx,
                 &FtsRow {
-                    record_type: "observation",
+                    record_type: RecordType::Observation,
                     record_id: &observation.id,
                     scope_id: &observation.scope_id,
                     kind: &enum_text(&observation.kind),
@@ -256,7 +275,6 @@ impl MemoryStore {
                 value_hash: hash_json(&draft.value),
                 modality: draft.modality.clone(),
                 status: ClaimStatus::Pending,
-                authority: ClaimAuthority::ModelInference,
                 confidence: draft.confidence,
                 supersedes_id: None,
                 created_at: timestamp.clone(),
@@ -275,7 +293,7 @@ impl MemoryStore {
 
         let preserve_continuation = observer_result_is_completely_empty(&result);
         let previous_continuation = if preserve_continuation {
-            latest_view(&tx, &run.stream_id, "continuation")?
+            latest_view(&tx, &run.stream_id, ViewKind::Continuation)?
         } else {
             None
         };
@@ -400,14 +418,9 @@ impl MemoryStore {
         &self,
         access: &ReadAccess,
         stream_id: Option<&str>,
-        status: Option<&str>,
+        status: Option<RunStatus>,
     ) -> Result<Vec<ObservationRunInfo>> {
-        if let Some(status) = status {
-            ensure!(
-                matches!(status, "pending" | "committed" | "failed" | "stale"),
-                KernelError::invalid_input(format!("invalid observation run status {status}"))
-            );
-        }
+        let status = status.as_ref().map(enum_text);
         let mut statement = self.conn.prepare(&format!(
             "SELECT {RUN_INFO_COLUMNS} FROM observation_runs
              WHERE (?1 IS NULL OR stream_id=?1)
@@ -477,15 +490,39 @@ fn plan_required_state(
         percent_of(max_tokens, CLAIM_BUDGET_PERCENT),
         serialized_item_tokens,
     )?;
-    Ok((active_claims, latest_view(conn, stream_id, "continuation")?))
+    Ok((
+        active_claims,
+        latest_view(conn, stream_id, ViewKind::Continuation)?,
+    ))
 }
 
 /// Rebuild a replayed plan from its run. Events are the run's exact range;
 /// active claims and continuation reflect the store at replay time.
+/// The newest pending, intact run planned from this cursor for the same
+/// observer, if any.
+fn open_run_at_cursor(
+    conn: &Connection,
+    stream_id: &str,
+    cursor: i64,
+    observer_model: &str,
+    prompt_version: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM observation_runs
+             WHERE stream_id=?1 AND cursor_at_plan=?2 AND observer_model=?3 AND prompt_version=?4
+               AND status='pending' AND source_integrity='intact'
+             ORDER BY created_at DESC LIMIT 1",
+            params![stream_id, cursor, observer_model, prompt_version],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn render_planned_run(conn: &Connection, run_id: &str, max_tokens: i64) -> Result<ObservationPlan> {
     let run = query_run(conn, run_id)?;
     ensure!(
-        run.source_integrity == "intact",
+        run.source_integrity == SourceIntegrity::Intact,
         KernelError::privacy_purged(format!(
             "observation run {run_id} lost source evidence to a privacy purge"
         ))

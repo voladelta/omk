@@ -156,7 +156,7 @@ impl Sim {
         let value = json!(sentence(&mut self.rng, 4, 14));
         let claim = self
             .s
-            .remember_claim_with_cardinality(scope, kind, subject, "value", card, value, &[], &key)
+            .remember_claim(scope, kind, subject, "value", card, value, &[], &key)
             .unwrap()
             .data;
         self.track(&claim.id);
@@ -216,7 +216,7 @@ impl Sim {
                 "claims",
                 "pendingClaims",
                 "continuation",
-                "continuityViews",
+                "reflectionViews",
                 "observations",
                 "recentEvents",
                 "recalledEvidence",
@@ -292,7 +292,7 @@ impl Sim {
         let started = Instant::now();
         let plan = self
             .s
-            .plan_observation(&thread, &stream, 1_000_000, "sim", "v1", &key)
+            .plan_observation(&thread, &stream, 1_000_000, "sim", "v1", Some(&key))
             .unwrap()
             .data
             .into_plan()

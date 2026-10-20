@@ -14,10 +14,10 @@ The integration tests cover:
 - request-bound retries and sequence order through purge
 - privacy and strict observer validation
 - concurrency and recovery
-- command provenance and claim authority
+- command provenance and claim origin
 - scope retrieval, per-source recall checks and full-text search modes
 - search page counts, index-level filters, ranking boosts and name resolution tiers
-- hard context budgets and deduplication through inherited continuity views
+- hard context budgets and deduplication through inherited reflection views
 - overlapping purge dependencies and preservation of unrelated replays
 - structured CLI errors and exact evidence recall
 

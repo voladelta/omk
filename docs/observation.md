@@ -19,6 +19,8 @@ jq '.data' observation-plan.json > observer-input.json
 
 The `jq` commands are optional examples. Agents can parse the JSON directly.
 
+`--idempotency-key` is optional for `observe plan`. Without it, the stream position is the key: if a pending run already starts at the stream's cursor for the same `--model` and `--prompt-version`, OMK returns that run again with `operation.replayed: true` instead of planning a new one. An open run is reused only if it still fits the requested `--max-tokens`; otherwise OMK plans a new run within the budget. After a run fails or commits, the next keyless plan starts a new run. Keyless plans save no replay record. Pass an explicit key when you want separate competing plans.
+
 A ready plan provides stable paths for the run and source event IDs:
 
 ```json
@@ -67,7 +69,7 @@ omk claim confirm --id CLAIM_ID --idempotency-key codex-thread-1-confirm-1
 omk claim reject --id CLAIM_ID --idempotency-key codex-thread-1-reject-1
 ```
 
-`claim reconcile` can classify pending state as duplicate or disputed, but it never activates a claim unless a trusted ingestion path has already given it `trusted-source` authority. OMK has no such path today, so every activation needs an explicit claim command. It never promotes observer-origin claims.
+`claim reconcile` classifies pending claims against active state and never activates one. A pending claim whose value equals an active value in its slot is rejected as a duplicate, and its sources are added to the active claim. A pending claim that conflicts with the active value of a `single` slot becomes disputed. Everything else stays pending, so every activation needs an explicit claim command.
 
 ## Observer input limits
 
@@ -96,9 +98,9 @@ Each run records `cursorAtPlan`. This lets OMK recover across privacy-purged seq
 
 Run inspection also returns `sourceIntegrity`. A committed run changes from `intact` to `privacy-purged` when a purge removes its sources. OMK removes dependent records and returns a recovery action. Affected pending runs become stale.
 
-## Create continuity views
+## Create reflection views
 
-Run an external reflector with the [reflector prompt](../prompts/reflector.v1.md). Commit the result with `omk view create --kind continuity --stream STREAM --expected-previous-view VIEW_ID`.
+Run an external reflector with the [reflector prompt](../prompts/reflector.v1.md). Commit the result with `omk view create --kind reflection --stream STREAM --expected-previous-view VIEW_ID`.
 
 Omit `--expected-previous-view` only for generation 1.
 

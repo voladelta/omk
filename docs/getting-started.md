@@ -37,7 +37,7 @@ omk event append \
   --idempotency-key codex-thread-1-message-1
 ```
 
-Every write needs a stable, globally unique idempotency key. Reuse a key only when you retry an identical command.
+Every write needs a stable, globally unique idempotency key, except `observe plan`, which can use the stream position instead (see [Observation](observation.md)). Reuse a key only when you retry an identical command.
 
 ## Add secret evidence safely
 

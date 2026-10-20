@@ -38,7 +38,7 @@ Use claims for structured state, with `subject` and `predicate` stable across co
 
 - `claim remember` records current state explicitly authored or approved by the user.
 - `claim propose` records a possibility explicitly authored by the user without replacing current state.
-- Keep assistant and tool suggestions as source events. Direct claim commands label their authority `explicit-user`, so use the observer cycle when those sources merit pending model-inference claims.
+- Keep assistant and tool suggestions as source events. Direct claim commands record the claim as stated by the caller, so use the observer cycle when those sources merit pending observer claims (they carry `originRunId`).
 - `claim correct`, `forget`, `purge`, and `rescope` require the corresponding user intent; inspect their help before use.
 - Observer-origin claims remain pending. Confirm or reject them only after an explicit user decision about that claim.
 
@@ -58,12 +58,12 @@ OMK does not enforce any of this; the alias and relationship kinds carry no spec
 
 ## Maintain and retrieve memory
 
-- For new unobserved history or continuity maintenance, follow [observe and reflect](references/observe-and-reflect.md).
+- For new unobserved history or reflection maintenance, follow [observe and reflect](references/observe-and-reflect.md).
 - Use `recall search` for a literal phrase by default. Use `--terms` for separated literal words, or `--fts-query` for intentional FTS5 syntax. Read `claimStatus`; use `--current-only` when only active claims apply. Narrow with `--type claim|observation|event` and `--field subject|predicate|value`; `memory-command` echoes of claim writes are left out unless you pass `--include-commands`. Search text is a preview of at most 512 characters.
 - A search returns `hits`, `shown` and `matched`, plus `searchable` when nothing matched. Read them before concluding: `matched > shown` means more hits exist past `--limit`; `matched: 0` with `searchable > 0` is a real miss; `searchable: 0` means the scope or filters hold nothing, so check `--scope` (sibling scopes are not searched) before calling the fact unknown.
 - For query evidence in `context`, add `--query` and choose the same phrase, `--terms`, or `--fts-query` mode. The two mode flags require `--query` and cannot be combined. They also work with `--compact`.
 - Use `event get`, `recall explain-claim`, `recall observation`, or `recall event-range` with the intended `--scope` when a conclusion needs source verification. Exact reads include the anchor scope, its ancestors and its descendants, and check every source event. Handle `scope_violation` through [recovery](references/recovery.md); knowing a record ID does not grant access. Secrets stay redacted unless you pass `--reveal-secret`.
-- Rebuild bounded context after accepted state or continuity changes. Active claims use at most half of the budget; claims listed in `omittedItems` with reason `active claim budget` stay active, so raise the budget or use `recall search --current-only` when one matters. On `budget_exceeded`, raise the budget to at least `minimumRequiredTokens`.
+- Rebuild bounded context after accepted state or reflection changes. Active claims use at most half of the budget; claims listed in `omittedItems` with reason `active claim budget` stay active, so raise the budget or use `recall search --current-only` when one matters. On `budget_exceeded`, raise the budget to at least `minimumRequiredTokens`.
 - Check the final rendered model input with its tokenizer. OMK estimates the JSON fields for the selected full or compact format, excludes diagnostics and command envelopes, and does not count your prompt or rendering overhead. Use default context output to inspect `diagnostics.truncated` and `omittedItems`; `--compact` omits diagnostics. Use exact recall when bounded context needs more evidence.
 
 Before `observe commit`, apply this provenance gate to every proposed observation, claim, ambiguity, and continuation item:

@@ -1,10 +1,10 @@
 # Observe and reflect
 
-Read this branch when compacting an OMK stream or creating a continuity view.
+Read this branch when compacting an OMK stream or creating a reflection view.
 
 ## Observe
 
-1. Run `omk observe plan` with the owning leaf scope, stream, observer model label, prompt version, and a stable plan idempotency key.
+1. Run `omk observe plan` with the owning leaf scope, stream, observer model label, and prompt version. Omit `--idempotency-key` to get back the open run at the stream's cursor on a retry.
 2. Branch on `.data.status`:
    - `caught-up`: stop; there is no run to commit.
    - `ready`: capture `.data.runId` for commit routing. Use the returned `scope`, `events`, `activeClaims`, and `previousContinuation` as model input. These are the fields covered by OMK's estimate; check your prompt and final rendered input with the model tokenizer.
@@ -27,10 +27,10 @@ Pass the intended `--scope` to run inspection. `observe list` includes runs from
 Reflection is optional and never replaces evidence or canonical claims.
 
 1. Inspect the active stream view and the new observations not represented in it.
-2. Create compact continuity text that preserves decisions, outcomes, failures, reasons, dates, state changes, and unresolved work. Remove duplicated procedure, keep proposals distinct from decisions, omit the requested recent raw range and active claims, never guess redacted content, and cite every newly incorporated observation ID.
-3. Create the next continuity view with the exact previous view ID. Omit `--expected-previous-view` only for generation 1.
+2. Create compact reflection text that preserves decisions, outcomes, failures, reasons, dates, state changes, and unresolved work. Remove duplicated procedure, keep proposals distinct from decisions, omit the requested recent raw range and active claims, never guess redacted content, and cite every newly incorporated observation ID.
+3. Create the next reflection view with the exact previous view ID. Omit `--expected-previous-view` only for generation 1.
 4. If the commit is stale, inspect the new active view and regenerate from current inputs; never reuse text derived from the stale base as though it were current.
 
 Reflection is complete when the new append-only generation cites its source observations and exact predecessor, while canonical claims remain separate.
 
-When checking the resulting context, account for observations inherited through the view's predecessor chain. Full and compact context omit an observation if a selected continuity view represents it, or if any source event is already present in the selected raw tail or query evidence. A view that cannot fit the budget does not suppress observations. Use exact recall to verify sources; absence from bounded context does not prove deletion.
+When checking the resulting context, account for observations inherited through the view's predecessor chain. Full and compact context omit an observation if a selected reflection view represents it, or if any source event is already present in the selected raw tail or query evidence. A view that cannot fit the budget does not suppress observations. Use exact recall to verify sources; absence from bounded context does not prove deletion.

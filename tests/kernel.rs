@@ -105,7 +105,7 @@ fn observer_result(event_id: &str, value: &str) -> ObserverResult {
 }
 
 #[test]
-fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content() {
+fn compact_context_keeps_claim_origin_and_recall_ids_without_secret_content() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
     let source = fixture.event(
@@ -117,7 +117,7 @@ fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content()
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -145,13 +145,18 @@ fn compact_context_keeps_claim_authority_and_recall_ids_without_secret_content()
     let payload = compact.compact_model_payload();
 
     assert!(payload.to_string().len() < full.model_payload().to_string().len());
+    assert_eq!(full.diagnostics.unresolved_claims, 1);
+    assert_eq!(
+        full.diagnostics.oldest_unresolved_claim_at.as_deref(),
+        Some(commit.claims[0].created_at.as_str())
+    );
     assert_eq!(payload["pendingClaims"][0]["id"], commit.claims[0].id);
     assert_eq!(payload["pendingClaims"][0]["status"], "pending");
     assert_eq!(
         payload["pendingClaims"][0]["modality"],
         "explicit-assertion"
     );
-    assert_eq!(payload["pendingClaims"][0]["authority"], "model-inference");
+    assert_eq!(payload["pendingClaims"][0]["originRunId"], plan.run_id);
     assert_eq!(payload["pendingClaims"][0]["value"], "ETH");
     assert_eq!(payload["recentEvents"][0]["id"], source.id);
     assert_eq!(payload["recentEvents"][1]["id"], secret.id);
@@ -240,6 +245,7 @@ fn compact_context_budget_prices_compact_records_and_reports_claims_over_budget(
             ClaimKind::Decision,
             "release",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember",
@@ -249,7 +255,7 @@ fn compact_context_budget_prices_compact_records_and_reports_claims_over_budget(
         "claims": [],
         "pendingClaims": [],
         "continuation": null,
-        "continuityViews": [],
+        "reflectionViews": [],
         "observations": [],
         "recentEvents": [],
         "recalledEvidence": [],
@@ -323,7 +329,7 @@ fn append_is_idempotent_and_privacy_boundaries_are_safe() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "thread", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -444,6 +450,7 @@ fn generated_command_events_reject_cross_scope_stream_collisions() {
             ClaimKind::Fact,
             "private",
             "note",
+            ClaimCardinality::Single,
             json!("sibling-data"),
             &[],
             "remember-project-b",
@@ -469,7 +476,7 @@ fn generated_command_events_reject_cross_scope_stream_collisions() {
             10_000,
             "fake",
             "v1",
-            "plan-project-a",
+            Some("plan-project-a"),
         )
         .unwrap()
         .data
@@ -486,7 +493,7 @@ fn set_claims_keep_distinct_members_and_lock_slot_cardinality() {
     fixture.scope("user", ScopeKind::User, None);
     let first = fixture
         .store
-        .remember_claim_with_cardinality(
+        .remember_claim(
             "user",
             ClaimKind::Constraint,
             "project",
@@ -499,7 +506,7 @@ fn set_claims_keep_distinct_members_and_lock_slot_cardinality() {
         .unwrap();
     fixture
         .store
-        .remember_claim_with_cardinality(
+        .remember_claim(
             "user",
             ClaimKind::Constraint,
             "project",
@@ -512,7 +519,7 @@ fn set_claims_keep_distinct_members_and_lock_slot_cardinality() {
         .unwrap();
     let duplicate = fixture
         .store
-        .remember_claim_with_cardinality(
+        .remember_claim(
             "user",
             ClaimKind::Constraint,
             "project",
@@ -538,6 +545,7 @@ fn set_claims_keep_distinct_members_and_lock_slot_cardinality() {
         ClaimKind::Constraint,
         "project",
         "requirement",
+        ClaimCardinality::Single,
         json!("one value"),
         &[],
         "single-mismatch",
@@ -558,7 +566,7 @@ fn observation_commit_is_atomic_idempotent_and_source_backed() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "thread", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -584,14 +592,13 @@ fn observation_commit_is_atomic_idempotent_and_source_backed() {
     assert!(matches!(
         fixture
             .store
-            .plan_observation("user", "thread", 10_000, "fake", "v1", "plan-2")
+            .plan_observation("user", "thread", 10_000, "fake", "v1", Some("plan-2"))
             .unwrap()
             .data,
         ObservationPlanOutcome::CaughtUp { .. }
     ));
 
     let summary = fixture.store.reconcile("user", "reconcile-1").unwrap();
-    assert!(summary.activated.is_empty());
     assert_eq!(summary.left_pending, vec![commit.claims[0].id.clone()]);
     let explanation = fixture
         .store
@@ -627,7 +634,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
     );
     let first_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -654,7 +661,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
     );
     let second_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-2"))
         .unwrap()
         .data
         .into_plan()
@@ -688,7 +695,7 @@ fn empty_observer_acknowledgements_preserve_existing_continuation() {
 
     let caught_up = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-3")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-3"))
         .unwrap();
     assert!(matches!(
         &caught_up.data,
@@ -713,14 +720,14 @@ fn invalid_and_stale_observation_commits_never_advance_twice() {
     );
     let first = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
         .unwrap();
     let stale = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-2"))
         .unwrap()
         .data
         .into_plan()
@@ -746,7 +753,7 @@ fn invalid_and_stale_observation_commits_never_advance_twice() {
     assert!(matches!(
         fixture
             .store
-            .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-3")
+            .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-3"))
             .unwrap()
             .data,
         ObservationPlanOutcome::CaughtUp { .. }
@@ -760,7 +767,7 @@ fn observer_failure_is_recorded_without_advancing_the_cursor() {
     let event = fixture.event("user", "stream", "retry me", Sensitivity::Normal, "event-1");
     let failed = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -771,7 +778,7 @@ fn observer_failure_is_recorded_without_advancing_the_cursor() {
         .unwrap();
     let retry = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-2"))
         .unwrap()
         .data
         .into_plan()
@@ -794,6 +801,7 @@ fn proposals_do_not_replace_state_but_explicit_corrections_do() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember-1",
@@ -806,13 +814,15 @@ fn proposals_do_not_replace_state_but_explicit_corrections_do() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!(["ETH", "USDG"]),
             &[],
             "proposal-1",
         )
         .unwrap();
     let summary = fixture.store.reconcile("user", "reconcile-1").unwrap();
-    assert_eq!(summary.left_pending, vec![proposal.id.clone()]);
+    // A proposal that conflicts with active state is labelled, never applied.
+    assert_eq!(summary.disputed, vec![proposal.id.clone()]);
     assert_eq!(
         fixture
             .store
@@ -849,6 +859,7 @@ fn confirming_a_conflicting_single_claim_supersedes_active_state() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember",
@@ -861,6 +872,7 @@ fn confirming_a_conflicting_single_claim_supersedes_active_state() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("USDG"),
             &[],
             "propose",
@@ -870,7 +882,8 @@ fn confirming_a_conflicting_single_claim_supersedes_active_state() {
     let confirmed = fixture.store.confirm_claim(&pending.id, "confirm").unwrap();
     assert_eq!(confirmed.id, pending.id);
     assert_eq!(confirmed.status, ClaimStatus::Active);
-    assert_eq!(confirmed.modality, ClaimModality::AcceptedDecision);
+    // Modality records what the source said; confirmation changes only status.
+    assert_eq!(confirmed.modality, ClaimModality::Proposal);
     assert_eq!(
         fixture
             .store
@@ -892,6 +905,7 @@ fn claim_logical_keys_are_normalized_before_lookup() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember-1",
@@ -904,6 +918,7 @@ fn claim_logical_keys_are_normalized_before_lookup() {
             ClaimKind::Decision,
             " launch ",
             " asset ",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember-2",
@@ -932,6 +947,7 @@ fn claim_commands_enforce_lifecycle_transitions() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember",
@@ -944,6 +960,7 @@ fn claim_commands_enforce_lifecycle_transitions() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("USDG"),
             &[],
             "proposal",
@@ -1004,6 +1021,7 @@ fn scope_inheritance_does_not_leak_between_projects() {
             ClaimKind::Constraint,
             "settlement",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "claim-a",
@@ -1016,6 +1034,7 @@ fn scope_inheritance_does_not_leak_between_projects() {
             ClaimKind::Preference,
             "user",
             "plan-style",
+            ClaimCardinality::Single,
             json!("complete"),
             &[],
             "claim-user",
@@ -1053,7 +1072,14 @@ fn project_context_includes_observations_from_its_selected_descendant_stream() {
     );
     let plan = fixture
         .store
-        .plan_observation("thread", "thread-stream", 10_000, "fake", "v1", "plan")
+        .plan_observation(
+            "thread",
+            "thread-stream",
+            10_000,
+            "fake",
+            "v1",
+            Some("plan"),
+        )
         .unwrap()
         .data
         .into_plan()
@@ -1072,7 +1098,7 @@ fn project_context_includes_observations_from_its_selected_descendant_stream() {
 }
 
 #[test]
-fn rescoping_an_observer_claim_does_not_grant_activation_authority() {
+fn rescoping_an_observer_claim_keeps_it_pending() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
     fixture.scope("thread", ScopeKind::Thread, Some("user"));
@@ -1085,7 +1111,14 @@ fn rescoping_an_observer_claim_does_not_grant_activation_authority() {
     );
     let plan = fixture
         .store
-        .plan_observation("thread", "thread-stream", 10_000, "fake", "v1", "plan")
+        .plan_observation(
+            "thread",
+            "thread-stream",
+            10_000,
+            "fake",
+            "v1",
+            Some("plan"),
+        )
         .unwrap()
         .data
         .into_plan()
@@ -1105,7 +1138,6 @@ fn rescoping_an_observer_claim_does_not_grant_activation_authority() {
         Some(plan.run_id.as_str())
     );
     let reconciliation = fixture.store.reconcile("user", "reconcile").unwrap();
-    assert!(reconciliation.activated.is_empty());
     assert_eq!(reconciliation.left_pending, vec![promoted.id.clone()]);
 }
 
@@ -1116,7 +1148,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
     let event = fixture.event("user", "stream", "Use ETH", Sensitivity::Normal, "event-1");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -1137,7 +1169,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "ETH is the launch asset".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -1157,7 +1189,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
             ..CreateView {
                 scope_id: "user".to_owned(),
                 stream_id: "stream".to_owned(),
-                kind: ViewKind::Continuity,
+                kind: ViewKind::Reflection,
                 content: String::new(),
                 source_from_sequence: 1,
                 source_through_sequence: 1,
@@ -1178,7 +1210,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "No new reflected observations".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -1205,8 +1237,8 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
-            content: "large continuity text ".repeat(1000),
+            kind: ViewKind::Reflection,
+            content: "large reflection text ".repeat(1000),
             source_from_sequence: 1,
             source_through_sequence: 1,
             source_observation_ids: vec![],
@@ -1228,7 +1260,7 @@ fn context_deduplicates_observations_and_views_never_destroy_raw_evidence() {
                 .compose_context("user", "stream", 1000, 0, None)
         }
         .unwrap();
-        assert!(context.continuity_views.is_empty());
+        assert!(context.reflection_views.is_empty());
         assert_eq!(context.observations[0].id, commit.observations[0].id);
     }
     assert_eq!(
@@ -1261,7 +1293,7 @@ fn context_deduplicates_only_exact_source_events() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream-b", 10_000, "fake", "v1", "plan-b")
+        .plan_observation("user", "stream-b", 10_000, "fake", "v1", Some("plan-b"))
         .unwrap()
         .data
         .into_plan()
@@ -1306,7 +1338,7 @@ fn context_prioritizes_continuation_over_pending_claims() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -1333,6 +1365,7 @@ fn context_prioritizes_continuation_over_pending_claims() {
             ClaimKind::Decision,
             "p",
             "q",
+            ClaimCardinality::Single,
             json!("v"),
             &[],
             "proposal",
@@ -1349,7 +1382,7 @@ fn context_prioritizes_continuation_over_pending_claims() {
         serde_json::to_value(&context.continuation).unwrap(),
         serde_json::from_str::<Value>(&commit.continuation_view.content).unwrap()
     );
-    assert!(context.continuity_views.is_empty());
+    assert!(context.reflection_views.is_empty());
 }
 
 #[test]
@@ -1359,7 +1392,7 @@ fn full_text_search_does_not_index_views() {
     let event = fixture.event("user", "stream", "source", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -1373,7 +1406,7 @@ fn full_text_search_does_not_index_views() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "view-only-search-marker".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -1445,7 +1478,7 @@ fn redacted_secret_evidence_cannot_activate_a_model_claim() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -1481,7 +1514,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -1495,7 +1528,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "Derived from erase this".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -1517,7 +1550,7 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
         .store
         .get_observation_run(&access("user"), &plan.run_id)
         .unwrap();
-    assert_eq!(invalidated_run.status, "committed");
+    assert_eq!(invalidated_run.status, RunStatus::Committed);
     assert_eq!(
         invalidated_run.source_integrity,
         SourceIntegrity::PrivacyPurged
@@ -1567,7 +1600,14 @@ fn privacy_purge_removes_dependents_and_prevents_idempotent_replay() {
     assert_eq!(replacement.sequence, 2);
     let retry_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-after-purge")
+        .plan_observation(
+            "user",
+            "stream",
+            10_000,
+            "fake",
+            "v1",
+            Some("plan-after-purge"),
+        )
         .unwrap()
         .data
         .into_plan()
@@ -1588,7 +1628,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
     );
     let stale_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -1600,7 +1640,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
             .get_observation_run(&access("user"), &stale_plan.run_id)
             .unwrap()
             .status,
-        "stale"
+        RunStatus::Stale
     );
 
     let replacement = fixture.event(
@@ -1613,7 +1653,7 @@ fn observation_recovery_commits_across_purged_sequence_gaps() {
     assert_eq!(replacement.sequence, 2);
     let recovery_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-2"))
         .unwrap()
         .data
         .into_plan()
@@ -1730,7 +1770,7 @@ fn privacy_covers_metadata_and_observer_envelopes_are_strict() {
         .data;
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -1783,6 +1823,7 @@ fn direct_claims_are_command_sourced_and_pending_state_reaches_context() {
             ClaimKind::Preference,
             "user",
             "editor",
+            ClaimCardinality::Single,
             json!("vim"),
             &[],
             "remember",
@@ -1795,6 +1836,7 @@ fn direct_claims_are_command_sourced_and_pending_state_reaches_context() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("USDG"),
             &[],
             "proposal",
@@ -1826,6 +1868,7 @@ fn purging_a_direct_claim_removes_orphaned_command_evidence() {
             ClaimKind::Preference,
             "user",
             "editor",
+            ClaimCardinality::Single,
             json!("purge-only-value"),
             &[],
             "remember",
@@ -1862,6 +1905,7 @@ fn purging_a_direct_claim_removes_orphaned_command_evidence() {
                 ClaimKind::Preference,
                 "user",
                 "editor",
+                ClaimCardinality::Single,
                 json!("purge-only-value"),
                 &[],
                 "remember",
@@ -1883,6 +1927,7 @@ fn claim_purge_removes_empty_slot_and_allows_new_cardinality() {
             ClaimKind::Preference,
             "private subject",
             "private predicate",
+            ClaimCardinality::Single,
             json!("one"),
             &[],
             "remember",
@@ -1892,7 +1937,7 @@ fn claim_purge_removes_empty_slot_and_allows_new_cardinality() {
 
     let replacement = fixture
         .store
-        .remember_claim_with_cardinality(
+        .remember_claim(
             "user",
             ClaimKind::Preference,
             "private subject",
@@ -1918,6 +1963,7 @@ fn claim_purge_keeps_a_shared_command_owned_by_another_claim() {
             ClaimKind::Fact,
             "owner",
             "value",
+            ClaimCardinality::Single,
             json!("A"),
             &[],
             "owner",
@@ -1938,6 +1984,7 @@ fn claim_purge_keeps_a_shared_command_owned_by_another_claim() {
             ClaimKind::Fact,
             "borrower",
             "value",
+            ClaimCardinality::Single,
             json!("B"),
             std::slice::from_ref(&owner_command.id),
             "borrower",
@@ -1985,6 +2032,7 @@ fn event_purge_recurses_through_observed_generated_commands() {
             ClaimKind::Fact,
             "canary",
             "value",
+            ClaimCardinality::Single,
             json!("transitive-purge-canary"),
             std::slice::from_ref(&source.id),
             "remember",
@@ -2006,7 +2054,7 @@ fn event_purge_recurses_through_observed_generated_commands() {
             1_000,
             "fake",
             "v1",
-            "plan-command",
+            Some("plan-command"),
         )
         .unwrap()
         .data
@@ -2084,7 +2132,7 @@ fn budgets_are_hard_and_literal_search_includes_descendants() {
         .unwrap();
     let plan_error = fixture
         .store
-        .plan_observation("thread", "stream", 1, "fake", "v1", "small-plan")
+        .plan_observation("thread", "stream", 1, "fake", "v1", Some("small-plan"))
         .unwrap_err();
     assert!(plan_error.to_string().contains("minimumRequiredTokens="));
     assert!(
@@ -2129,7 +2177,7 @@ fn budgets_are_hard_and_literal_search_includes_descendants() {
             10,
             "fake",
             "v1",
-            "understated-plan",
+            Some("understated-plan"),
         )
         .unwrap_err();
     assert!(
@@ -2143,7 +2191,7 @@ fn budgets_are_hard_and_literal_search_includes_descendants() {
         .create_view(CreateView {
             scope_id: "thread".to_owned(),
             stream_id: "understated".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "v".repeat(400),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -2164,6 +2212,7 @@ fn budgets_are_hard_and_literal_search_includes_descendants() {
             ClaimKind::Constraint,
             "release",
             "channel",
+            ClaimCardinality::Single,
             json!("stable"),
             &[],
             "claim",
@@ -2183,7 +2232,7 @@ fn observation_and_stream_inspection_are_complete() {
     let event = fixture.event("user", "stream", "inspect", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -2204,13 +2253,7 @@ fn observation_and_stream_inspection_are_complete() {
         .unwrap();
     assert_eq!(status.observed_through_sequence, 1);
     assert_eq!(status.next_sequence, 2);
-    assert_eq!(status.runs[0].status, "committed");
-    assert!(
-        fixture
-            .store
-            .list_observation_runs(&access("user"), None, Some("running"))
-            .is_err()
-    );
+    assert_eq!(status.runs[0].status, RunStatus::Committed);
 }
 
 #[test]
@@ -2383,7 +2426,7 @@ fn context_omits_an_observation_when_raw_sources_partially_overlap() {
     );
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -2422,13 +2465,13 @@ fn context_omits_an_observation_when_raw_sources_partially_overlap() {
 }
 
 #[test]
-fn continuity_view_commits_compare_and_swap_per_stream() {
+fn reflection_view_commits_compare_and_swap_per_stream() {
     let mut fixture = Fixture::new();
     fixture.scope("user", ScopeKind::User, None);
     let event = fixture.event("user", "stream", "source", Sensitivity::Normal, "event");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -2442,7 +2485,7 @@ fn continuity_view_commits_compare_and_swap_per_stream() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "generation one".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -2457,7 +2500,7 @@ fn continuity_view_commits_compare_and_swap_per_stream() {
     let stale = fixture.store.create_view(CreateView {
         scope_id: "user".to_owned(),
         stream_id: "stream".to_owned(),
-        kind: ViewKind::Continuity,
+        kind: ViewKind::Reflection,
         content: "stale generation two".to_owned(),
         source_from_sequence: 1,
         source_through_sequence: 1,
@@ -2475,7 +2518,7 @@ fn continuity_view_commits_compare_and_swap_per_stream() {
             .list_views("user")
             .unwrap()
             .iter()
-            .filter(|view| { view.kind == ViewKind::Continuity })
+            .filter(|view| { view.kind == ViewKind::Reflection })
             .count(),
         1
     );
@@ -2485,7 +2528,7 @@ fn continuity_view_commits_compare_and_swap_per_stream() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "generation two".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -2528,7 +2571,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
     let first_event = fixture.event("user", "stream", "first", Sensitivity::Normal, "event-1");
     let first_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-1")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-1"))
         .unwrap()
         .data
         .into_plan()
@@ -2546,7 +2589,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "first generation".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 1,
@@ -2562,7 +2605,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
     let second_event = fixture.event("user", "stream", "second", Sensitivity::Normal, "event-2");
     let second_plan = fixture
         .store
-        .plan_observation("user", "stream", 10_000, "fake", "v1", "plan-2")
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan-2"))
         .unwrap()
         .data
         .into_plan()
@@ -2580,7 +2623,7 @@ fn purging_a_view_source_removes_all_successor_generations() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "second generation".to_owned(),
             source_from_sequence: 2,
             source_through_sequence: 2,
@@ -2696,7 +2739,7 @@ fn observations_only(event_id: &str, label: &str, count: usize, importance: f64)
 fn plan_run(fixture: &mut Fixture, scope: &str, stream: &str, key: &str) -> ObservationPlan {
     fixture
         .store
-        .plan_observation(scope, stream, 100_000, "fake", "v1", key)
+        .plan_observation(scope, stream, 100_000, "fake", "v1", Some(key))
         .unwrap()
         .data
         .into_plan()
@@ -2732,7 +2775,7 @@ fn reflected_observations_do_not_starve_new_unreflected_observations() {
         .create_view(CreateView {
             scope_id: "user".to_owned(),
             stream_id: "stream".to_owned(),
-            kind: ViewKind::Continuity,
+            kind: ViewKind::Reflection,
             content: "everything so far".to_owned(),
             source_from_sequence: 1,
             source_through_sequence: 2,
@@ -2802,6 +2845,7 @@ fn pending_claim_backlog_keeps_the_newest_claims_in_context() {
                 ClaimKind::Decision,
                 "backlog",
                 &format!("item-{index}"),
+                ClaimCardinality::Single,
                 json!(index),
                 &[],
                 &format!("propose-{index}"),
@@ -2838,6 +2882,7 @@ fn observer_claims_cannot_contradict_an_existing_slot_cardinality() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember",
@@ -2893,6 +2938,7 @@ fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
                 ClaimKind::Decision,
                 "launch",
                 "asset",
+                ClaimCardinality::Single,
                 json!(value),
                 &[],
                 key,
@@ -2909,8 +2955,7 @@ fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
         .rescope_claim(&disputed.id, "user", "rescope")
         .unwrap();
     assert_eq!(rescoped.status, ClaimStatus::Disputed);
-    let summary = fixture.store.reconcile("user", "reconcile").unwrap();
-    assert!(summary.activated.is_empty());
+    fixture.store.reconcile("user", "reconcile").unwrap();
     assert!(
         fixture
             .store
@@ -2919,22 +2964,23 @@ fn rescoping_a_disputed_claim_cannot_launder_it_into_active_state() {
             .is_empty()
     );
 
-    // A rejected claim that returns as pending still needs an explicit command.
+    // Ended claims cannot be rescoped back to life.
     fixture.store.reject_claim(&rescoped.id, "reject").unwrap();
-    let revived = fixture
+    let error = fixture
         .store
         .rescope_claim(&rescoped.id, "user", "rescope-rejected")
-        .unwrap();
-    assert_eq!(revived.status, ClaimStatus::Pending);
-    let summary = fixture.store.reconcile("user", "reconcile-2").unwrap();
-    assert!(summary.activated.is_empty());
-    assert_eq!(summary.left_pending, vec![revived.id.clone()]);
-    assert!(
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<KernelError>().map(KernelError::kind),
+        Some(KernelErrorKind::InvalidInput)
+    );
+    assert_eq!(
         fixture
             .store
-            .list_claims("user", false, Some(ClaimStatus::Active))
+            .list_claims("user", false, Some(ClaimStatus::Pending))
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -2946,7 +2992,7 @@ fn deeper_scope_single_claims_shadow_ancestors_in_context_and_plans() {
     let mut remember = |scope: &str, predicate: &str, cardinality, value: &str, key: &str| {
         fixture
             .store
-            .remember_claim_with_cardinality(
+            .remember_claim(
                 scope,
                 ClaimKind::Decision,
                 "launch",
@@ -3061,7 +3107,7 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
     let small = fixture.event("user", "stream", "small", Sensitivity::Normal, "small");
     let plan = fixture
         .store
-        .plan_observation("user", "stream", 400, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 400, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -3077,7 +3123,7 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
     assert_eq!(stub.metadata, json!({}));
     let replayed = fixture
         .store
-        .plan_observation("user", "stream", 400, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 400, "fake", "v1", Some("plan"))
         .unwrap();
     assert!(replayed.operation.replayed);
     assert_eq!(
@@ -3115,7 +3161,7 @@ fn oversized_first_event_becomes_an_uncitable_stub_so_the_cursor_can_advance() {
     assert!(
         fixture
             .store
-            .plan_observation("user", "stream", 400, "fake", "v1", "next-plan")
+            .plan_observation("user", "stream", 400, "fake", "v1", Some("next-plan"))
             .unwrap()
             .data
             .into_plan()
@@ -3251,6 +3297,7 @@ fn purges_find_operations_and_search_rows_through_side_tables() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             std::slice::from_ref(&kept.id),
             "claim",
@@ -3317,6 +3364,7 @@ fn purges_find_operations_and_search_rows_through_side_tables() {
                 ClaimKind::Decision,
                 "launch",
                 "asset",
+                ClaimCardinality::Single,
                 json!("ETH"),
                 std::slice::from_ref(&kept.id),
                 "claim",
@@ -3350,6 +3398,7 @@ fn only_live_claims_can_be_corrected() {
             ClaimKind::Decision,
             "launch",
             "asset",
+            ClaimCardinality::Single,
             json!("ETH"),
             &[],
             "remember",
@@ -3366,6 +3415,7 @@ fn only_live_claims_can_be_corrected() {
             ClaimKind::Decision,
             "launch",
             "chain",
+            ClaimCardinality::Single,
             json!("L1"),
             &[],
             "propose",
@@ -3379,6 +3429,7 @@ fn only_live_claims_can_be_corrected() {
             ClaimKind::Decision,
             "launch",
             "venue",
+            ClaimCardinality::Single,
             json!("DEX"),
             &[],
             "propose-2",
@@ -3413,6 +3464,7 @@ fn only_live_claims_can_be_corrected() {
             ClaimKind::Decision,
             "launch",
             "region",
+            ClaimCardinality::Single,
             json!("EU"),
             &[],
             "propose-3",
@@ -3489,6 +3541,7 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
                     ClaimKind::Fact,
                     &subject,
                     "value",
+                    ClaimCardinality::Single,
                     json!("v".repeat(400)),
                     &[],
                     &format!("remember-{subject}"),
@@ -3559,7 +3612,14 @@ fn claim_budget_pins_user_claims_then_keeps_the_newest_claims() {
 
     let plan = fixture
         .store
-        .plan_observation("project", "stream", claim_budget * 2, "test", "v1", "plan")
+        .plan_observation(
+            "project",
+            "stream",
+            claim_budget * 2,
+            "test",
+            "v1",
+            Some("plan"),
+        )
         .unwrap()
         .data
         .into_plan()
@@ -3589,6 +3649,7 @@ fn claim_budget_cutoff_holds_across_additions() {
                 ClaimKind::Fact,
                 &format!("p{index:03}"),
                 "value",
+                ClaimCardinality::Single,
                 json!("v".repeat(400)),
                 &[],
                 &format!("remember-{index}"),
@@ -3695,6 +3756,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
             ClaimKind::Preference,
             "editor",
             "value",
+            ClaimCardinality::Single,
             json!("vim"),
             &[],
             "remember-before",
@@ -3727,6 +3789,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
             ClaimKind::Preference,
             "shell",
             "value",
+            ClaimCardinality::Single,
             json!("zsh"),
             &[],
             "remember-after",
@@ -3735,7 +3798,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
         .data;
     let replay = fixture
         .store
-        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 100_000, "fake", "v1", Some("plan"))
         .unwrap();
     assert!(replay.operation.replayed);
     let replayed = replay.data.into_plan().unwrap();
@@ -3765,7 +3828,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
         .unwrap();
     let after_purge = fixture
         .store
-        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 100_000, "fake", "v1", Some("plan"))
         .unwrap()
         .data
         .into_plan()
@@ -3776,7 +3839,7 @@ fn saved_plans_hold_only_their_run_and_replay_from_current_state() {
     fixture.store.purge_event(&first.id, "purge-event").unwrap();
     let error = fixture
         .store
-        .plan_observation("user", "stream", 100_000, "fake", "v1", "plan")
+        .plan_observation("user", "stream", 100_000, "fake", "v1", Some("plan"))
         .unwrap_err();
     assert_eq!(
         error.downcast_ref::<KernelError>().unwrap().kind(),
@@ -3859,4 +3922,156 @@ fn old_results_compact_to_keys_that_still_block_duplicates() {
         error.downcast_ref::<KernelError>().unwrap().kind(),
         KernelErrorKind::PrivacyPurged
     );
+}
+
+#[test]
+fn claim_kind_is_a_label_not_part_of_the_slot() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let fact = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Fact,
+            "alice",
+            "employer",
+            ClaimCardinality::Single,
+            json!("Acme"),
+            &[],
+            "remember-fact",
+        )
+        .unwrap();
+    let decision = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "alice",
+            "employer",
+            ClaimCardinality::Single,
+            json!("Globex"),
+            &[],
+            "remember-decision",
+        )
+        .unwrap();
+    assert_eq!(fact.status, ClaimStatus::Active);
+    // The same slot under another kind conflicts instead of coexisting.
+    assert_eq!(decision.status, ClaimStatus::Disputed);
+    assert_eq!(
+        fixture
+            .store
+            .list_claims("user", false, Some(ClaimStatus::Active))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn reconcile_absorbs_observer_duplicates_without_activating() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let event = fixture.event("user", "stream", "Use ETH", Sensitivity::Normal, "event");
+    let active = fixture
+        .store
+        .remember_claim(
+            "user",
+            ClaimKind::Decision,
+            "launch",
+            "asset",
+            ClaimCardinality::Single,
+            json!("ETH"),
+            &[],
+            "remember",
+        )
+        .unwrap();
+    let plan = fixture
+        .store
+        .plan_observation("user", "stream", 10_000, "fake", "v1", Some("plan"))
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    let commit = fixture
+        .store
+        .commit_observation(&plan.run_id, observer_result(&event.id, "ETH"), "commit")
+        .unwrap();
+
+    let summary = fixture.store.reconcile("user", "reconcile").unwrap();
+    assert_eq!(
+        summary.duplicates_rejected,
+        vec![commit.claims[0].id.clone()]
+    );
+    let explanation = fixture
+        .store
+        .explain_claim(&ReadAccess::agent("user"), &active.id)
+        .unwrap();
+    assert!(
+        explanation
+            .source_events
+            .iter()
+            .any(|source| source.id == event.id)
+    );
+}
+
+#[test]
+fn keyless_plans_reuse_the_open_run_at_the_cursor() {
+    let mut fixture = Fixture::new();
+    fixture.scope("user", ScopeKind::User, None);
+    let long = "Use ETH for settlement. ".repeat(20);
+    fixture.event("user", "stream", &long, Sensitivity::Normal, "event-1");
+    fixture.event("user", "stream", &long, Sensitivity::Normal, "event-2");
+    let plan = |fixture: &mut Fixture| {
+        fixture
+            .store
+            .plan_observation("user", "stream", 10_000, "fake", "v1", None)
+            .unwrap()
+    };
+    let first = plan(&mut fixture);
+    let again = plan(&mut fixture);
+    assert!(!first.operation.replayed);
+    assert!(again.operation.replayed);
+    let first_id = first.data.clone().into_plan().unwrap().run_id;
+    assert_eq!(again.data.clone().into_plan().unwrap().run_id, first_id);
+
+    // A failed run is closed, so the next keyless plan retries the range.
+    fixture
+        .store
+        .fail_observation(&first_id, "timeout", "fail")
+        .unwrap();
+    let retry = plan(&mut fixture).data.into_plan().unwrap();
+    assert_ne!(retry.run_id, first_id);
+    assert_eq!(retry.from_sequence, 1);
+
+    // A budget too small for the open run plans afresh instead of overrunning.
+    let operations_before: i64 = Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM memory_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let small = fixture
+        .store
+        .plan_observation("user", "stream", 300, "fake", "v1", None)
+        .unwrap();
+    assert!(!small.operation.replayed);
+    assert_ne!(small.data.into_plan().unwrap().run_id, retry.run_id);
+    let operations_after: i64 = Connection::open(fixture._directory.path().join("memory.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM memory_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    // Keyless plans save no replay record: nothing could ever replay it.
+    assert_eq!(operations_after, operations_before);
+
+    // A different observer does not take over another observer's open run.
+    let other = fixture
+        .store
+        .plan_observation("user", "stream", 10_000, "other", "v1", None)
+        .unwrap()
+        .data
+        .into_plan()
+        .unwrap();
+    assert_ne!(other.run_id, retry.run_id);
 }

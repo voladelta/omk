@@ -58,7 +58,7 @@ impl MemoryStore {
     pub fn create_view(&mut self, input: CreateView) -> Result<MutationResult<MemoryView>> {
         validate_nonempty("view content", &input.content)?;
         ensure!(
-            input.kind == ViewKind::Continuity,
+            input.kind == ViewKind::Reflection,
             KernelError::invalid_input("continuation views are created only by observation commit")
         );
         ensure!(
@@ -76,7 +76,7 @@ impl MemoryStore {
                     input.stream_id, input.scope_id
                 ))
             );
-            let latest = latest_view(tx, &input.stream_id, "continuity")?;
+            let latest = latest_view(tx, &input.stream_id, ViewKind::Reflection)?;
             let latest_id = latest.as_ref().map(|view| view.id.as_str());
             ensure!(
                 latest_id == input.expected_previous_view_id.as_deref(),
@@ -131,7 +131,7 @@ impl MemoryStore {
                 tx,
                 &input.scope_id,
                 &input.stream_id,
-                input.kind.clone(),
+                input.kind,
                 &input.content,
                 input.source_from_sequence,
                 input.source_through_sequence,
@@ -405,6 +405,14 @@ impl MemoryStore {
             Some(257),
         )?);
         let pending_truncated = pending_claims.len() > 256;
+        let (unresolved_claims, oldest_unresolved_claim_at): (i64, Option<String>) =
+            self.conn.query_row(
+                "SELECT count(*),min(created_at) FROM claims
+                 WHERE status IN ('pending','disputed')
+                   AND scope_id IN (SELECT value FROM json_each(?1))",
+                [serde_json::to_string(&visible)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
         pending_claims.sort_by(|left, right| {
             right
                 .created_at
@@ -419,7 +427,7 @@ impl MemoryStore {
         });
         sort_claims_by_scope(&mut pending_claims, &visible);
         let empty_payload = json!({"claims": [], "pendingClaims": [], "continuation": null,
-            "continuityViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
+            "reflectionViews": [], "observations": [], "recentEvents": [], "recalledEvidence": []});
         let overhead_tokens = estimate_tokens(&empty_payload.to_string());
         ensure!(
             overhead_tokens <= max_tokens,
@@ -452,11 +460,13 @@ impl MemoryStore {
                 }))
                 .collect(),
             truncated: pending_truncated,
+            unresolved_claims,
+            oldest_unresolved_claim_at,
         };
 
-        let mut continuity_views = Vec::new();
+        let mut reflection_views = Vec::new();
         let mut continuation = None;
-        if let Some(view) = latest_view(&self.conn, stream_id, "continuation")? {
+        if let Some(view) = latest_view(&self.conn, stream_id, ViewKind::Continuation)? {
             let draft: ContinuationDraft = serde_json::from_str(&view.content)
                 .context("reading structured continuation view")?;
             let cost = serialized_item_tokens(&draft).saturating_add(view_hint_extra(&view));
@@ -524,11 +534,7 @@ impl MemoryStore {
             let access = ResolvedReadAccess::resolve(&self.conn, &read_access)?;
             let mut recalled_ids = HashSet::new();
             for hit in hits {
-                let mut ids = if hit.record_type == "event" {
-                    vec![hit.id]
-                } else {
-                    context_source_ids(&self.conn, &hit.record_type, &hit.id)?
-                };
+                let mut ids = context_source_ids(&self.conn, hit.record_type, &hit.id)?;
                 if ids.len() > MAX_SOURCE_IDS {
                     diagnostics.truncated = true;
                     ids.truncate(MAX_SOURCE_IDS);
@@ -552,12 +558,12 @@ impl MemoryStore {
             .collect();
         let represented_event_ids = serde_json::to_string(&represented_event_ids)?;
 
-        if let Some(view) = latest_view(&self.conn, stream_id, "continuity")?
+        if let Some(view) = latest_view(&self.conn, stream_id, ViewKind::Reflection)?
             && diagnostics.admit(max_tokens, rendering.view_tokens(&view), &view.id)
         {
-            continuity_views.push(view);
+            reflection_views.push(view);
         }
-        let continuity_ids: Vec<String> = continuity_views.iter().map(|v| v.id.clone()).collect();
+        let reflection_ids: Vec<String> = reflection_views.iter().map(|v| v.id.clone()).collect();
 
         let mut observation_scopes = visible.clone();
         if !observation_scopes.contains(&stream_scope) {
@@ -565,7 +571,7 @@ impl MemoryStore {
         }
         // Newest first, so a backlog of older observations cannot hide new ones.
         let mut candidates =
-            query_observations_for_scopes(&self.conn, &observation_scopes, &continuity_ids)?;
+            query_observations_for_scopes(&self.conn, &observation_scopes, &reflection_ids)?;
         if candidates.len() > 256 {
             diagnostics.truncated = true;
             candidates.truncate(256);
@@ -593,7 +599,7 @@ impl MemoryStore {
             claims,
             pending_claims: selected_pending_claims,
             continuation,
-            continuity_views,
+            reflection_views,
             observations,
             recent_events,
             recalled_evidence,

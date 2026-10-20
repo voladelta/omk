@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use omk::{
     ClaimCardinality, ClaimKind, ClaimStatus, ContextQuery, EventKind, KernelError,
     KernelErrorKind, MAX_OBSERVER_BYTES, MemoryStore, MutationResult, NewEvent, ObserverResult,
-    ReadAccess, SCHEMA_VERSION, ScopeKind, SearchField, SearchMode, SearchOptions, SearchTypes,
-    Sensitivity, ViewKind, store::CreateView,
+    ReadAccess, RunStatus, SCHEMA_VERSION, ScopeKind, SearchField, SearchMode, SearchOptions,
+    SearchTypes, Sensitivity, ViewKind, store::CreateView,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -170,12 +170,14 @@ enum ObserveCommand {
         model: String,
         #[arg(long, default_value = "observer.v1")]
         prompt_version: String,
+        /// Optional. Without it, a pending run at the stream's current
+        /// position for the same model and prompt is returned again.
         #[arg(long)]
-        idempotency_key: String,
+        idempotency_key: Option<String>,
     },
     /// Validate and atomically commit a strict ObserverResult JSON object.
     #[command(
-        after_help = "Read the run UUID from observe plan output at .data.runId. The input is this exact JSON shape; do not include runId in the object:\n\n  {\n    \"observations\": [{\n      \"kind\": \"decision\",\n      \"content\": \"Concrete source-backed statement\",\n      \"importance\": 0.9,\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"],\n      \"eventTimeFrom\": null,\n      \"eventTimeTo\": null\n    }],\n    \"claims\": [{\n      \"kind\": \"decision\",\n      \"subject\": \"subject\",\n      \"predicate\": \"predicate\",\n      \"cardinality\": \"single\",\n      \"value\": \"any JSON value\",\n      \"modality\": \"explicit-assertion\",\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"]\n    }],\n    \"continuation\": {\n      \"currentTask\": null,\n      \"completed\": [],\n      \"blockers\": [],\n      \"nextActions\": [],\n      \"unresolvedQuestions\": []\n    },\n    \"ambiguities\": [],\n    \"emptyReason\": null\n  }\n\nAllowed observation kinds: event, decision, outcome, failure, constraint, preference, open-loop, relationship, continuation.\nAllowed claim kinds: fact, preference, decision, goal, commitment, constraint, open-loop, entity-alias, relationship, hypothesis.\nAllowed claim cardinalities: single, set.\nAllowed modalities: explicit-assertion, accepted-decision, proposal, inference, observation.\n\nEvery observation, claim, and ambiguity must cite one or more event UUIDs from the plan. Observer claims always remain pending until an explicit claim command changes them. For a non-empty result, continuation completely replaces the previous snapshot. If observations, claims, and ambiguities are all empty, send the empty continuation shown above and a concrete non-empty emptyReason; the kernel then preserves the previous continuation."
+        after_help = "Read the run UUID from observe plan output at .data.runId. The input is this exact JSON shape; do not include runId in the object:\n\n  {\n    \"observations\": [{\n      \"kind\": \"decision\",\n      \"content\": \"Concrete source-backed statement\",\n      \"importance\": 0.9,\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"],\n      \"eventTimeFrom\": null,\n      \"eventTimeTo\": null\n    }],\n    \"claims\": [{\n      \"kind\": \"decision\",\n      \"subject\": \"subject\",\n      \"predicate\": \"predicate\",\n      \"cardinality\": \"single\",\n      \"value\": \"any JSON value\",\n      \"modality\": \"explicit-assertion\",\n      \"confidence\": 1.0,\n      \"sourceEventIds\": [\"event-uuid-from-plan\"]\n    }],\n    \"continuation\": {\n      \"currentTask\": null,\n      \"completed\": [],\n      \"blockers\": [],\n      \"nextActions\": [],\n      \"unresolvedQuestions\": []\n    },\n    \"ambiguities\": [],\n    \"emptyReason\": null\n  }\n\nAllowed observation kinds: event, decision, outcome, failure, constraint, preference, open-loop, relationship.\nAllowed claim kinds: fact, preference, decision, goal, commitment, constraint, open-loop, entity-alias, relationship, hypothesis.\nAllowed claim cardinalities: single, set.\nAllowed modalities: explicit-assertion, accepted-decision, proposal, inference, observation.\n\nEvery observation, claim, and ambiguity must cite one or more event UUIDs from the plan. Observer claims always remain pending until an explicit claim command changes them. For a non-empty result, continuation completely replaces the previous snapshot. If observations, claims, and ambiguities are all empty, send the empty continuation shown above and a concrete non-empty emptyReason; the kernel then preserves the previous continuation."
     )]
     Commit {
         #[arg(long)]
@@ -210,7 +212,7 @@ enum ObserveCommand {
         #[arg(long)]
         stream: Option<String>,
         #[arg(long)]
-        status: Option<String>,
+        status: Option<RunStatus>,
     },
     /// Inspect a stream cursor, sequence allocator, and its observation runs.
     Status {
@@ -304,7 +306,7 @@ enum ClaimCommand {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Classify pending claims as duplicates or conflicts; only trusted-source claims activate.
+    /// Classify pending claims as duplicates or conflicts; never activates.
     Reconcile {
         #[arg(long)]
         scope: String,
@@ -352,7 +354,7 @@ struct ViewCreateArgs {
     through: i64,
     #[arg(long = "source-observation")]
     source_observations: Vec<String>,
-    /// Latest continuity view used to produce this result; omit only for generation one.
+    /// Latest reflection view used to produce this result; omit only for generation one.
     #[arg(long)]
     expected_previous_view: Option<String>,
     #[arg(long)]
@@ -645,7 +647,7 @@ fn run(cli: Cli) -> Result<()> {
                 max_tokens,
                 &model,
                 &prompt_version,
-                &idempotency_key,
+                idempotency_key.as_deref(),
             )?)?,
             ObserveCommand::Commit {
                 run,
@@ -675,14 +677,14 @@ fn run(cli: Cli) -> Result<()> {
             } => print_json(&store.list_observation_runs(
                 &ReadAccess::agent(scope),
                 stream.as_deref(),
-                status.as_deref(),
+                status,
             )?)?,
             ObserveCommand::Status { scope, stream } => {
                 print_json(&store.stream_status(&ReadAccess::agent(scope), &stream)?)?;
             }
         },
         Command::Claim { command } => match command {
-            ClaimCommand::Remember(args) => print_json(&store.remember_claim_with_cardinality(
+            ClaimCommand::Remember(args) => print_json(&store.remember_claim(
                 &args.scope,
                 args.kind,
                 &args.subject,
@@ -692,7 +694,7 @@ fn run(cli: Cli) -> Result<()> {
                 &args.source_events,
                 &args.idempotency_key,
             )?)?,
-            ClaimCommand::Propose(args) => print_json(&store.propose_claim_with_cardinality(
+            ClaimCommand::Propose(args) => print_json(&store.propose_claim(
                 &args.scope,
                 args.kind,
                 &args.subject,
@@ -1014,7 +1016,7 @@ fn classify_error(
             false,
             key_reusable_for_command,
             Some(
-                "read the latest continuity view, rerun reflection from it, and retry with the same key",
+                "read the latest reflection view, rerun reflection from it, and retry with the same key",
             ),
         ),
         KernelErrorKind::StaleObservationRun => (
@@ -1126,7 +1128,7 @@ mod tests {
         assert!(
             classified
                 .3
-                .is_some_and(|action| action.contains("continuity view"))
+                .is_some_and(|action| action.contains("reflection view"))
         );
     }
 

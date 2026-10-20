@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const EVENT_COLUMNS: &str = "id,stream_id,sequence,scope_id,kind,actor_id,occurred_at,recorded_at,content_json,content_hash,token_count,sensitivity,metadata_json";
 pub(super) const OBSERVATION_COLUMNS: &str = "id,run_id,scope_id,kind,content,importance,confidence,event_time_from,event_time_to,source_start_sequence,source_end_sequence,observer_model,prompt_version,created_at";
-pub(super) const CLAIM_COLUMNS: &str = "id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,authority,confidence,supersedes_id,created_at,updated_at";
+pub(super) const CLAIM_COLUMNS: &str = "id,origin_run_id,scope_id,kind,subject,predicate,cardinality,value_json,value_hash,modality,status,confidence,supersedes_id,created_at,updated_at";
 pub(super) const VIEW_COLUMNS: &str = "id,scope_id,stream_id,kind,generation,content,source_from_sequence,source_through_sequence,previous_view_id,model,prompt_version,token_count,created_at";
 pub(super) const RUN_INFO_COLUMNS: &str = "id,scope_id,stream_id,cursor_at_plan,from_sequence,to_sequence,status,source_integrity,observer_model,prompt_version,ambiguities_json,error,created_at,updated_at";
 
@@ -78,11 +78,10 @@ pub(super) fn row_claim(row: &Row<'_>) -> rusqlite::Result<Claim> {
         value_hash: row.get(8)?,
         modality: parse_enum(&row.get::<_, String>(9)?)?,
         status: parse_enum(&row.get::<_, String>(10)?)?,
-        authority: parse_enum(&row.get::<_, String>(11)?)?,
-        confidence: row.get(12)?,
-        supersedes_id: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        confidence: row.get(11)?,
+        supersedes_id: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -105,18 +104,18 @@ pub(super) fn row_view(row: &Row<'_>) -> rusqlite::Result<MemoryView> {
 }
 
 pub(super) fn row_observation_run_info(row: &Row<'_>) -> rusqlite::Result<ObservationRunInfo> {
-    let status: String = row.get(6)?;
+    let status: RunStatus = parse_enum(&row.get::<_, String>(6)?)?;
     let source_integrity: SourceIntegrity = parse_enum(&row.get::<_, String>(7)?)?;
     let error: Option<String> = row.get(11)?;
-    let next_action = match (&source_integrity, status.as_str()) {
-        (SourceIntegrity::PrivacyPurged, "committed") => Some(
+    let next_action = match (&source_integrity, status) {
+        (SourceIntegrity::PrivacyPurged, RunStatus::Committed) => Some(
             "derived records depending on purged evidence were removed; append replacement evidence if needed"
                 .to_owned(),
         ),
-        (SourceIntegrity::PrivacyPurged, _) | (_, "stale") => {
+        (SourceIntegrity::PrivacyPurged, _) | (_, RunStatus::Stale) => {
             Some("request a new observation plan".to_owned())
         }
-        (_, "failed") => Some("inspect the error and request a new observation plan".to_owned()),
+        (_, RunStatus::Failed) => Some("inspect the error and request a new observation plan".to_owned()),
         _ => None,
     };
     Ok(ObservationRunInfo {
