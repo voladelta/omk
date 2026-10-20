@@ -15,6 +15,7 @@ use crate::model::*;
 
 pub const SCHEMA_VERSION: i64 = 9;
 
+mod budget;
 mod claim;
 mod context;
 mod observation;
@@ -22,12 +23,17 @@ mod privacy;
 mod resolve;
 mod rows;
 mod schema;
+mod search;
 mod support;
+mod validate;
 
+use budget::*;
 use resolve::*;
 use rows::*;
 use schema::SCHEMA;
+use search::*;
 use support::*;
+use validate::*;
 pub struct MemoryStore {
     conn: Connection,
 }

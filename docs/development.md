@@ -24,4 +24,4 @@ The integration tests cover:
 ## Examples
 
 - `examples/sim.rs` simulates agent use to evaluate the [claim budget](context.md#claim-budget), the [recent raw tail](context.md#recent-raw-tail) and how much of consecutive contexts a prompt cache could reuse
-- `examples/search_bench.rs` benchmarks [name resolution and search](search.md#measure-search)
+- `examples/search_bench/` benchmarks [name resolution and search](search.md#measure-search)

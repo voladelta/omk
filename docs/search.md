@@ -38,7 +38,7 @@ Results sort by BM25 multiplied by a record boost, then record type and record I
 
 ## Measure search
 
-`examples/search_bench.rs` drives `omk` binaries only through the CLI, so one run compares versions on an identical synthetic world: 120 people with recorded aliases and corrected facts, some with accented surnames, plus 4,000 chat events that mention them on a Zipf curve. Each world yields about 600 name mentions in 16 categories, including reordered names, initials, dropped accents, typos, titles, nicknames, and new people who share a surname or initial with someone recorded. Run `cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency] [--seed N]`; each run writes every miss to `OUT_DIR`.
+`examples/search_bench/` drives `omk` binaries only through the CLI, so one run compares versions on an identical synthetic world: 120 people with recorded aliases and corrected facts, some with accented surnames, plus 4,000 chat events that mention them on a Zipf curve. Each world yields about 600 name mentions in 16 categories, including reordered names, initials, dropped accents, typos, titles, nicknames, and new people who share a surname or initial with someone recorded. Run `cargo run --release --example search_bench -- OUT_DIR BIN [BIN...] [--latency] [--seed N]`; each run writes every miss to `OUT_DIR`.
 
 These results compare OMK 0.7 with OMK 0.8 over six seeds. The resolver was tuned while reading misses from seeds 0–2; seeds 3–5 were run once after the code was frozen.
 
